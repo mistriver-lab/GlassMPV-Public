@@ -1,0 +1,53 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build GlassMPV (iOS 26+)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift Package dependencies (MPVKit)
+        run: xcodebuild -resolvePackageDependencies -project GlassMPV.xcodeproj -scheme GlassMPV
+
+      - name: Build unsigned Release app
+        run: |
+          xcodebuild \
+            -project GlassMPV.xcodeproj \
+            -scheme GlassMPV \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            SYMROOT="$PWD/build"
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Release-iphoneos/GlassMPV.app Payload/
+          zip -qry GlassMPV-unsigned.ipa Payload
+
+      - name: Upload GlassMPV-unsigned.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlassMPV-unsigned-ipa
+          path: GlassMPV-unsigned.ipa
+          retention-days: 30
