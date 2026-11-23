@@ -22,11 +22,16 @@ final class MPVMetalLayer: CAMetalLayer, @unchecked Sendable {
             if Thread.isMainThread {
                 super.wantsExtendedDynamicRangeContent = newValue
             } else {
+                let layer = self
                 DispatchQueue.main.sync {
-                    super.wantsExtendedDynamicRangeContent = newValue
+                    layer.setSuperWantsEDR(newValue)
                 }
             }
         }
+    }
+
+    private func setSuperWantsEDR(_ value: Bool) {
+        super.wantsExtendedDynamicRangeContent = value
     }
 }
 
