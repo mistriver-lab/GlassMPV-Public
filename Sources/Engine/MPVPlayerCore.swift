@@ -6,7 +6,7 @@ import SwiftUI
 import UIKit
 
 /// 防止 MoltenVK 将 drawableSize 临时设为 1x1 引起闪烁，并保证 EDR 在主线程更新
-final class MPVMetalLayer: CAMetalLayer {
+final class MPVMetalLayer: CAMetalLayer, @unchecked Sendable {
     override var drawableSize: CGSize {
         get { super.drawableSize }
         set {
