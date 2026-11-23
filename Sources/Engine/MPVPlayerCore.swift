@@ -5,8 +5,12 @@ import QuartzCore
 import SwiftUI
 import UIKit
 
+private struct UnsafeSendableBox<T>: @unchecked Sendable {
+    let value: T
+}
+
 /// 防止 MoltenVK 将 drawableSize 临时设为 1x1 引起闪烁，并保证 EDR 在主线程更新
-final class MPVMetalLayer: CAMetalLayer, @unchecked Sendable {
+final class MPVMetalLayer: CAMetalLayer {
     override var drawableSize: CGSize {
         get { super.drawableSize }
         set {
@@ -22,9 +26,9 @@ final class MPVMetalLayer: CAMetalLayer, @unchecked Sendable {
             if Thread.isMainThread {
                 super.wantsExtendedDynamicRangeContent = newValue
             } else {
-                let layer = self
+                let box = UnsafeSendableBox(value: self)
                 DispatchQueue.main.sync {
-                    layer.setSuperWantsEDR(newValue)
+                    box.value.setSuperWantsEDR(newValue)
                 }
             }
         }
