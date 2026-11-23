@@ -41,7 +41,7 @@ final class MPVMetalContainerView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
-        metalLayer.contentsScale = UIScreen.main.nativeScale
+        metalLayer.contentsScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
         metalLayer.framebufferOnly = true
         metalLayer.backgroundColor = UIColor.black.cgColor
     }
@@ -53,7 +53,8 @@ final class MPVMetalContainerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        metalLayer.contentsScale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
+        let fallbackScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
+        metalLayer.contentsScale = window?.screen.nativeScale ?? fallbackScale
     }
 }
 

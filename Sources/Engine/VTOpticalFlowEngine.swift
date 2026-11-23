@@ -27,10 +27,6 @@ final class SampleBufferDisplayContainerView: UIView {
     }
 }
 
-private final class OpticalFlowErrorBox: @unchecked Sendable {
-    var error: Error?
-}
-
 /// Apple Silicon ANE 硬件光流真补帧播放控制器（基于 VideoToolbox VTFrameProcessor）
 final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isPaused: Bool = true
@@ -358,16 +354,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                interpolationPhase: [0.5],
                                destinationFrames: [destFrame]
                            ) {
-                            let sem = DispatchSemaphore(value: 0)
-                            let errorBox = OpticalFlowErrorBox()
-                            processor.process(parameters: params) { _, err in
-                                errorBox.error = err
-                                sem.signal()
-                            }
-                            sem.wait()
-
-                            if errorBox.error == nil {
+                            do {
+                                _ = try await processor.process(parameters: params)
                                 enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
+                            } catch {
+                                // 单帧光流跳过，仍保留原帧播放
                             }
                         }
                     }
