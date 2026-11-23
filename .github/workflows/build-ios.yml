@@ -43,6 +43,15 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Release-iphoneos/GlassMPV.app Payload/
+          if otool -L Payload/GlassMPV.app/GlassMPV | grep -qE '@rpath|@executable_path/Frameworks'; then
+            echo "Keeping dynamic frameworks required by binary"
+          else
+            rm -rf Payload/GlassMPV.app/Frameworks
+          fi
+          test -d Payload/GlassMPV.app/Shaders
+          test "$(ls -1 Payload/GlassMPV.app/Shaders/*.glsl | wc -l | tr -d ' ')" -eq 58
+          plutil -p Payload/GlassMPV.app/Info.plist | grep -q CADisableMinimumFrameDurationOnPhone
+          plutil -p Payload/GlassMPV.app/Info.plist | grep -q UILaunchScreen
           zip -qry GlassMPV-unsigned.ipa Payload
 
       - name: Upload GlassMPV-unsigned.ipa

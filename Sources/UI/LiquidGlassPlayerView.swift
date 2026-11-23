@@ -181,19 +181,21 @@ struct LiquidGlassPlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // 双核视频渲染底图
-            Group {
-                if coordinator.engineMode == .mpv {
-                    MPVVideoSurface(controller: mpv)
-                } else {
-                    OpticalFlowVideoSurface(controller: optical)
+            // 双核视频渲染底图（仅在打开视频后挂载，避免空状态启动触发 MoltenVK）
+            if coordinator.currentURL != nil {
+                Group {
+                    if coordinator.engineMode == .mpv {
+                        MPVVideoSurface(controller: mpv)
+                    } else {
+                        OpticalFlowVideoSurface(controller: optical)
+                    }
                 }
-            }
-            .ignoresSafeArea()
-            .contentShape(Rectangle())
-            .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.22)) {
-                    showHUD.toggle()
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        showHUD.toggle()
+                    }
                 }
             }
 

@@ -1,4 +1,6 @@
+import AVFoundation
 import Combine
+import Darwin
 import Foundation
 import Libmpv
 import QuartzCore
@@ -42,6 +44,9 @@ final class MPVMetalLayer: CAMetalLayer {
 final class MPVMetalContainerView: UIView {
     override class var layerClass: AnyClass { MPVMetalLayer.self }
 
+    var onLayerReady: (@MainActor (MPVMetalLayer) -> Void)?
+    private var didNotifyReady = false
+
     var metalLayer: MPVMetalLayer {
         // swiftlint:disable:next force_cast
         layer as! MPVMetalLayer
@@ -60,10 +65,22 @@ final class MPVMetalContainerView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil && !didNotifyReady {
+            setNeedsLayout()
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         let fallbackScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
         metalLayer.contentsScale = window?.screen.nativeScale ?? fallbackScale
+        if !didNotifyReady, window != nil, bounds.width > 1, bounds.height > 1 {
+            didNotifyReady = true
+            metalLayer.frame = bounds
+            onLayerReady?(metalLayer)
+        }
     }
 }
 
@@ -80,6 +97,8 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var statusMessage: String = ""
 
     private var mpv: OpaquePointer?
+    private var attachedLayer: MPVMetalLayer?
+    private var lifecycleObservers: [NSObjectProtocol] = []
     private let eventQueue = DispatchQueue(label: "com.glassmpv.mpv.events", qos: .userInitiated)
     private let stateLock = NSLock()
 
@@ -87,19 +106,29 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     private var currentPreset: ShaderPreset = .off
     private var currentExtras: Set<String> = []
     private var currentInterpolation: InterpolationMode = .mpvSmooth120Hz
+    private var currentSpeed: Double = 1.0
 
     @MainActor
     func attach(to metalLayer: MPVMetalLayer) {
         stateLock.lock()
         let alreadyInitialized = (mpv != nil)
+        let sameLayer = (attachedLayer === metalLayer)
         stateLock.unlock()
-        guard !alreadyInitialized else { return }
+        if alreadyInitialized {
+            if sameLayer { return }
+            shutdown()
+        }
+
+        _ = setlocale(LC_NUMERIC, "C")
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
 
         guard let handle = mpv_create() else {
             statusMessage = "mpv_create 初始化失败"
             return
         }
 
+        attachedLayer = metalLayer
         var wid = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
         checkError(mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &wid))
 
@@ -116,7 +145,13 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         checkError(mpv_set_option_string(handle, "subs-fallback", "yes"))
         checkError(mpv_set_option_string(handle, "demuxer-max-bytes", "150MiB"))
 
-        checkError(mpv_initialize(handle))
+        let initStatus = mpv_initialize(handle)
+        if initStatus < 0 {
+            checkError(initStatus)
+            mpv_terminate_destroy(handle)
+            attachedLayer = nil
+            return
+        }
 
         mpv_observe_property(handle, 0, "time-pos", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
@@ -133,14 +168,37 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             controller.readEvents()
         }, context)
 
+        let bgObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.pause()
+            self.setVideoTrackOption("no")
+        }
+
+        let fgObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.setVideoTrackOption("auto")
+        }
+
         stateLock.lock()
         self.mpv = handle
+        self.lifecycleObservers = [bgObserver, fgObserver]
         let queuedURL = self.pendingURL
         self.pendingURL = nil
         stateLock.unlock()
 
         applyInterpolation(currentInterpolation)
         applyShaders(preset: currentPreset, extras: currentExtras)
+        if abs(currentSpeed - 1.0) > 0.001 {
+            setSpeed(currentSpeed)
+        }
 
         if let queuedURL {
             load(url: queuedURL)
@@ -203,6 +261,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     func setSpeed(_ speed: Double) {
+        currentSpeed = speed
         stateLock.lock()
         guard let handle = mpv else {
             stateLock.unlock()
@@ -261,15 +320,35 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
 
     func shutdown() {
         stateLock.lock()
+        let observers = lifecycleObservers
+        lifecycleObservers.removeAll()
+        guard let handle = mpv else {
+            attachedLayer = nil
+            stateLock.unlock()
+            for observer in observers {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            return
+        }
+        mpv = nil
+        attachedLayer = nil
+        stateLock.unlock()
+
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        mpv_set_wakeup_callback(handle, nil, nil)
+        mpv_terminate_destroy(handle)
+    }
+
+    private func setVideoTrackOption(_ value: String) {
+        stateLock.lock()
         guard let handle = mpv else {
             stateLock.unlock()
             return
         }
-        mpv = nil
         stateLock.unlock()
-
-        mpv_set_wakeup_callback(handle, nil, nil)
-        mpv_terminate_destroy(handle)
+        checkError(mpv_set_option_string(handle, "vid", value))
     }
 
     deinit {
@@ -398,9 +477,15 @@ struct MPVVideoSurface: UIViewRepresentable {
 
     func makeUIView(context: Context) -> MPVMetalContainerView {
         let view = MPVMetalContainerView(frame: .zero)
-        controller.attach(to: view.metalLayer)
+        view.onLayerReady = { [controller] layer in
+            controller.attach(to: layer)
+        }
         return view
     }
 
     func updateUIView(_ uiView: MPVMetalContainerView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: MPVMetalContainerView, coordinator: ()) {
+        uiView.onLayerReady = nil
+    }
 }

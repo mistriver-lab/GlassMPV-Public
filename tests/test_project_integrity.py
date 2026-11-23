@@ -33,7 +33,14 @@ def test_project_yml_and_github_workflow_valid():
     assert project_cfg["options"]["deploymentTarget"]["iOS"] == "26.0"
     assert project_cfg["packages"]["MPVKit"]["url"] == "https://github.com/mpvkit/MPVKit.git"
     assert project_cfg["packages"]["MPVKit"]["from"] == "1.0.0"
-    assert project_cfg["targets"]["GlassMPV"]["settings"]["base"]["SWIFT_VERSION"] == "6.0"
+    target_cfg = project_cfg["targets"]["GlassMPV"]
+    assert "resources" not in target_cfg
+    assert "info" not in target_cfg
+    assert target_cfg["settings"]["base"]["SWIFT_VERSION"] == "6.0"
+    assert target_cfg["settings"]["base"]["INFOPLIST_FILE"] == "Sources/Info.plist"
+    assert target_cfg["settings"]["base"]["GENERATE_INFOPLIST_FILE"] in (False, "NO")
+    shader_sources = [s for s in target_cfg["sources"] if isinstance(s, dict) and s.get("path") == "Resources/Shaders"]
+    assert len(shader_sources) == 1 and shader_sources[0].get("buildPhase") == "resources"
 
     workflow_raw = (ROOT / ".github" / "workflows" / "build-ios.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(workflow_raw)
@@ -144,3 +151,4 @@ def test_swift_sources_non_empty_and_balanced():
     mpv_core = (ROOT / "Sources" / "Engine" / "MPVPlayerCore.swift").read_text(encoding="utf-8")
     assert 'joined(separator: ":")' in mpv_core
     assert 'joined(separator: ";")' not in mpv_core
+    assert 'setlocale(LC_NUMERIC, "C")' in mpv_core

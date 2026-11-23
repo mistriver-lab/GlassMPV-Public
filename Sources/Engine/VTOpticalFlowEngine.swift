@@ -35,7 +35,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var sourceFPS: Double = 0
     @Published @MainActor var interpolatedFPS: Double = 0
     @Published @MainActor var errorMessage: String?
-    @Published @MainActor var isHardwareSupported: Bool = VTLowLatencyFrameInterpolationConfiguration.isSupported
+    @Published @MainActor var isHardwareSupported: Bool = false
     @Published @MainActor var enableSpatial2xUpscale: Bool = false
 
     private let bufferLock = NSLock()
@@ -64,10 +64,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         enableSpatial2xUpscale = spatial2x
         errorMessage = nil
 
-        guard VTLowLatencyFrameInterpolationConfiguration.isSupported else {
+        let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
+        isHardwareSupported = supported
+        guard supported else {
             errorMessage = "当前设备不支持 VTLowLatencyFrameInterpolation，请切换回「MPV 超分核」。"
             return
         }
+
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
 
         let item = AVPlayerItem(url: url)
         let player = AVPlayer(playerItem: item)
