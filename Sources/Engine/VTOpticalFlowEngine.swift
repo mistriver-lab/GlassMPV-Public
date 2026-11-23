@@ -42,7 +42,6 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isHardwareSupported: Bool = VTLowLatencyFrameInterpolationConfiguration.isSupported
     @Published @MainActor var enableSpatial2xUpscale: Bool = false
 
-    private let decodeQueue = DispatchQueue(label: "com.glassmpv.opticalflow.decode", qos: .userInitiated)
     private let bufferLock = NSLock()
     private let tokenLock = NSLock()
     private var frameQueue: [(pts: Double, buffer: CVPixelBuffer)] = []
@@ -106,9 +105,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     return
                 }
 
-                // 仅让 AVPlayer 负责音轨播放与主时钟同步，画面由光流插帧管线送显
-                let playerTracks = try await item.load(.tracks)
-                for pTrack in playerTracks where pTrack.assetTrack?.mediaType == .video {
+                // 仅保留音频时钟输出，关闭 AVPlayer 默认视频解码轨道
+                for pTrack in item.tracks where pTrack.assetTrack?.mediaType == .video {
                     pTrack.isEnabled = false
                 }
 
@@ -119,8 +117,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.interpolatedFPS = srcFps * 2.0
 
                 self.startPipeline(
-                    asset: asset,
-                    videoTrack: videoTrack,
+                    url: url,
                     width: Int(abs(naturalSize.width)),
                     height: Int(abs(naturalSize.height)),
                     startSeconds: 0,
@@ -180,8 +177,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                   let videoTrack = tracks.first else { return }
             let naturalSize = (try? await videoTrack.load(.naturalSize)) ?? .zero
             self.startPipeline(
-                asset: asset,
-                videoTrack: videoTrack,
+                url: url,
                 width: Int(abs(naturalSize.width)),
                 height: Int(abs(naturalSize.height)),
                 startSeconds: clamped,
@@ -224,20 +220,21 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     private func startPipeline(
-        asset: AVURLAsset,
-        videoTrack: AVAssetTrack,
+        url: URL,
         width: Int,
         height: Int,
         startSeconds: Double,
         spatial2x: Bool,
         token: UUID
     ) {
-        decodeQueue.async { [weak self] in
-            self?.runOpticalFlowLoop(
-                asset: asset,
-                videoTrack: videoTrack,
-                width: max(width, 2),
-                height: max(height, 2),
+        let safeW = max(width, 2)
+        let safeH = max(height, 2)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            await self.runOpticalFlowTask(
+                url: url,
+                width: safeW,
+                height: safeH,
                 startSeconds: startSeconds,
                 spatial2x: spatial2x,
                 token: token
@@ -245,23 +242,30 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func runOpticalFlowLoop(
-        asset: AVURLAsset,
-        videoTrack: AVAssetTrack,
+    private func runOpticalFlowTask(
+        url: URL,
         width: Int,
         height: Int,
         startSeconds: Double,
         spatial2x: Bool,
         token: UUID
-    ) {
+    ) async {
         do {
+            let asset = AVURLAsset(url: url)
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let videoTrack = tracks.first else {
+                Task { @MainActor [weak self] in
+                    self?.errorMessage = "未找到视频轨道，请切换回「MPV 超分核」。"
+                }
+                return
+            }
+
             let configuration: VTLowLatencyFrameInterpolationConfiguration
             if spatial2x,
                let scaledConfig = VTLowLatencyFrameInterpolationConfiguration(
                    frameWidth: width,
                    frameHeight: height,
-                   spatialScaleFactor: 2,
-                   numberOfInterpolatedFrames: 1
+                   spatialScaleFactor: 2
                ) {
                 configuration = scaledConfig
             } else if let frcConfig = VTLowLatencyFrameInterpolationConfiguration(
@@ -281,8 +285,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             try processor.startSession(configuration: configuration)
             defer { processor.endSession() }
 
-            let pixelFormat: OSType = configuration.frameSupportedPixelFormats.first?.uint32Value
-                ?? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            let pixelFormat = resolveSourcePixelFormat(from: configuration)
 
             let reader = try AVAssetReader(asset: asset)
             if startSeconds > 0 {
@@ -323,13 +326,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     return
                 }
 
-                // 背压控制，避免预先解码过多帧撑爆 iOS 内存
                 while queuedCount() >= maxQueuedFrames {
                     if !isTokenValid(token) {
                         reader.cancelReading()
                         return
                     }
-                    Thread.sleep(forTimeInterval: 0.008)
+                    try? await Task.sleep(for: .milliseconds(8))
                 }
 
                 guard let sample = trackOutput.copyNextSampleBuffer(),
@@ -386,6 +388,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor
     @objc private func onDisplayTick() {
         guard let layer = displayLayer, let audioPlayer else { return }
+        if let item = audioPlayer.currentItem {
+            for pTrack in item.tracks where pTrack.isEnabled && pTrack.assetTrack?.mediaType == .video {
+                pTrack.isEnabled = false
+            }
+        }
+
         let now = audioPlayer.currentTime().seconds
         guard now.isFinite else { return }
 
@@ -434,6 +442,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.lock()
         frameQueue.append((pts: pts, buffer: buffer))
         bufferLock.unlock()
+    }
+
+    private func resolveSourcePixelFormat(from configuration: VTLowLatencyFrameInterpolationConfiguration) -> OSType {
+        let raw = configuration.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String]
+        if let num = raw as? NSNumber {
+            return num.uint32Value
+        }
+        if let arr = raw as? [NSNumber], let first = arr.first {
+            return first.uint32Value
+        }
+        return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     }
 
     private func makeDestinationPool(
