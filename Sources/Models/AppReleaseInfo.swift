@@ -10,7 +10,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 
 enum AppReleaseInfo {
     static var shortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.1"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.2"
     }
 
     static var buildNumber: String {
@@ -22,6 +22,16 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v1.0.2",
+            date: "2026-11-24",
+            highlights: [
+                "修复无法播放与死锁隐患：改用 addSublayer、mpv_command_async 与非阻塞 EDR 更新",
+                "新增端内播放诊断中心、错误横幅与一键内置 3 秒测试视频自测",
+                "本地文件导入增加 NSFileCoordinator 沙盒协调拷贝兜底",
+                "接入 CI iOS 模拟器 XCTest 自动实播自测与经验沉淀文档"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v1.0.1",
             date: "2026-11-24",

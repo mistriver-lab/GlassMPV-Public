@@ -1,15 +1,17 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 @MainActor
 final class PlayerCoordinator: ObservableObject {
     @Published var engineMode: PlayerEngineMode = .mpv
-    @Published var selectedPreset: ShaderPreset = ShaderPreset.allPresets[1] // 默认 Anime4K Mode A (FAST)
+    @Published var selectedPreset: ShaderPreset = .off // 保守默认原画直出，确保首次 100% 起播后再按需开启超分
     @Published var selectedExtras: Set<String> = []
-    @Published var interpolationMode: InterpolationMode = .mpvSmooth120Hz
+    @Published var interpolationMode: InterpolationMode = .off
     @Published var vtSpatial2x: Bool = false
     @Published var speed: Double = 1.0
     @Published var currentURL: URL?
+    @Published var isGeneratingSample: Bool = false
 
     let mpvController = MPVPlayerController()
     let opticalFlowController = OpticalFlowPlayerController()
@@ -17,16 +19,104 @@ final class PlayerCoordinator: ObservableObject {
     private var securityScopedURL: URL?
 
     func open(url: URL, isSecurityScoped: Bool = false) {
-        if isSecurityScoped {
-            if let old = securityScopedURL, old != url {
-                old.stopAccessingSecurityScopedResource()
+        var resolvedURL = url
+
+        if url.isFileURL {
+            if isSecurityScoped {
+                if let old = securityScopedURL, old != url {
+                    old.stopAccessingSecurityScopedResource()
+                }
+                if url.startAccessingSecurityScopedResource() {
+                    securityScopedURL = url
+                    mpvController.appendLog("[file] 已获取 Security-Scoped 访问权限")
+                } else {
+                    mpvController.appendLog("[file] startAccessingSecurityScopedResource 返回 false，尝试直接/协调读取")
+                }
             }
-            if url.startAccessingSecurityScopedResource() {
-                securityScopedURL = url
+
+            if !FileManager.default.isReadableFile(atPath: url.path) {
+                mpvController.appendLog("[file] 路径暂不可直读，尝试 NSFileCoordinator 协调拷贝到沙盒临时区")
+                do {
+                    resolvedURL = try copyToPlayableTemporaryURL(sourceURL: url)
+                    mpvController.appendLog("[file] 已拷贝到可播放副本: \(resolvedURL.lastPathComponent)")
+                } catch {
+                    mpvController.recordExternalError("无法读取本地文件（\(url.lastPathComponent)）：\(error.localizedDescription)")
+                    return
+                }
             }
         }
-        currentURL = url
+
+        currentURL = resolvedURL
         startPlaybackForCurrentEngine()
+    }
+
+    func playBuiltInSampleVideo() {
+        guard !isGeneratingSample else { return }
+        isGeneratingSample = true
+        mpvController.clearError()
+        mpvController.appendLog("[sample] 开始生成内置 3 秒自测视频...")
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let sampleURL = try await TestVideoGenerator.generateSampleMP4()
+                self.isGeneratingSample = false
+                self.open(url: sampleURL, isSecurityScoped: false)
+            } catch {
+                self.isGeneratingSample = false
+                self.mpvController.recordExternalError("内置测试视频生成失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func retryWithoutShaders() {
+        selectedPreset = .off
+        selectedExtras = []
+        interpolationMode = .off
+        mpvController.clearError()
+        mpvController.applyShaders(preset: .off, extras: [])
+        mpvController.applyInterpolation(.off)
+        if currentURL != nil {
+            startPlaybackForCurrentEngine()
+        }
+    }
+
+    private func copyToPlayableTemporaryURL(sourceURL: URL) throws -> URL {
+        let importDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GlassMPV_Imports", isDirectory: true)
+        try FileManager.default.createDirectory(at: importDir, withIntermediateDirectories: true)
+
+        let filename = sourceURL.lastPathComponent.isEmpty ? "imported_video.mp4" : sourceURL.lastPathComponent
+        let destURL = importDir.appendingPathComponent(filename)
+
+        var coordinatorError: NSError?
+        var copyError: Error?
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
+            do {
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.copyItem(at: readableURL, to: destURL)
+            } catch {
+                copyError = error
+            }
+        }
+
+        if let coordinatorError {
+            throw coordinatorError
+        }
+        if let copyError {
+            throw copyError
+        }
+        guard FileManager.default.isReadableFile(atPath: destURL.path) else {
+            throw NSError(
+                domain: "GlassMPV.FileAccess",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "拷贝后的副本不可读"]
+            )
+        }
+        return destURL
     }
 
     func switchEngine(to target: PlayerEngineMode) {
@@ -169,6 +259,7 @@ struct LiquidGlassPlayerView: View {
     @State private var streamURLInput: String = ""
     @State private var showEnhancementSheet: Bool = false
     @State private var showChangelogSheet: Bool = false
+    @State private var showDiagnosticSheet: Bool = false
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
 
@@ -202,12 +293,23 @@ struct LiquidGlassPlayerView: View {
 
             if coordinator.currentURL == nil {
                 welcomeOverlay
-            } else if showHUD {
-                playerHUDOverlay
-                    .transition(.opacity)
+            } else {
+                if coordinator.engineMode == .mpv,
+                   mpv.lastErrorMessage == nil,
+                   mpv.videoWidth == 0,
+                   !mpv.playbackState.isEmpty {
+                    loadingStatusPill(mpv.playbackState)
+                }
+
+                if showHUD {
+                    playerHUDOverlay
+                        .transition(.opacity)
+                }
             }
 
-            if coordinator.engineMode == .opticalFlow, let error = optical.errorMessage {
+            if coordinator.engineMode == .mpv, let mpvError = mpv.lastErrorMessage {
+                mpvErrorBanner(mpvError)
+            } else if coordinator.engineMode == .opticalFlow, let error = optical.errorMessage {
                 opticalFlowErrorBanner(error)
             }
         }
@@ -216,8 +318,13 @@ struct LiquidGlassPlayerView: View {
             allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
             allowsMultipleSelection: false
         ) { result in
-            if case .success(let urls) = result, let first = urls.first {
-                coordinator.open(url: first, isSecurityScoped: true)
+            switch result {
+            case .success(let urls):
+                if let first = urls.first {
+                    coordinator.open(url: first, isSecurityScoped: true)
+                }
+            case .failure(let error):
+                coordinator.mpvController.recordExternalError("文件选择器返回错误：\(error.localizedDescription)")
             }
         }
         .alert("打开网络视频流", isPresented: $showURLPrompt) {
@@ -239,6 +346,11 @@ struct LiquidGlassPlayerView: View {
         }
         .sheet(isPresented: $showChangelogSheet) {
             ReleaseNotesSheet()
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showDiagnosticSheet) {
+            DiagnosticLogSheet(mpv: mpv, coordinator: coordinator)
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.ultraThinMaterial)
         }
@@ -288,15 +400,48 @@ struct LiquidGlassPlayerView: View {
                 }
 
                 Button {
-                    showEnhancementSheet = true
+                    coordinator.playBuiltInSampleVideo()
                 } label: {
-                    Label("预设超分：\(coordinator.selectedPreset.title)", systemImage: "wand.and.stars")
-                        .font(.footnote.weight(.medium))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
+                    HStack(spacing: 8) {
+                        if coordinator.isGeneratingSample {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "play.circle.fill")
+                        }
+                        Text(coordinator.isGeneratingSample ? "正在生成内置测试视频..." : "一键自测（内置 3 秒测试视频）")
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 11)
                 }
                 .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .capsule)
+                .disabled(coordinator.isGeneratingSample)
+                .glassEffect(.regular.tint(.green).interactive(), in: .capsule)
+
+                HStack(spacing: 10) {
+                    Button {
+                        showEnhancementSheet = true
+                    } label: {
+                        Label("预设：\(coordinator.selectedPreset.title)", systemImage: "wand.and.stars")
+                            .font(.footnote.weight(.medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+
+                    Button {
+                        showDiagnosticSheet = true
+                    } label: {
+                        Label("诊断日志", systemImage: "stethoscope")
+                            .font(.footnote.weight(.medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                }
 
                 Button {
                     showChangelogSheet = true
@@ -335,6 +480,16 @@ struct LiquidGlassPlayerView: View {
                         showURLPrompt = true
                     } label: {
                         Image(systemName: "link")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 40, height: 40)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .circle)
+
+                    Button {
+                        showDiagnosticSheet = true
+                    } label: {
+                        Image(systemName: "stethoscope")
                             .font(.body.weight(.semibold))
                             .frame(width: 40, height: 40)
                     }
@@ -483,6 +638,56 @@ struct LiquidGlassPlayerView: View {
                 .padding(.bottom, 10)
             }
         }
+    }
+
+    private func loadingStatusPill(_ state: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(state)
+                .font(.caption.weight(.medium))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private func mpvErrorBanner(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Label("MPV 播放遇到异常", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack(spacing: 10) {
+                Button {
+                    coordinator.retryWithoutShaders()
+                } label: {
+                    Text("关闭超分重试")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+
+                Button {
+                    showDiagnosticSheet = true
+                } label: {
+                    Text("查看诊断日志")
+                        .font(.subheadline.weight(.medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
+            }
+        }
+        .padding(20)
+        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+        .padding()
     }
 
     private func opticalFlowErrorBanner(_ message: String) -> some View {
@@ -713,6 +918,91 @@ struct ReleaseNotesSheet: View {
                 }
             }
             .navigationTitle("版本与更新日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+struct DiagnosticLogSheet: View {
+    @ObservedObject var mpv: MPVPlayerController
+    @ObservedObject var coordinator: PlayerCoordinator
+    @Environment(\.dismiss) private var dismiss
+    @State private var copiedFeedback: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("内核与播放状态") {
+                    LabeledContent("当前引擎", value: coordinator.engineMode.rawValue)
+                    LabeledContent("初始化状态", value: mpv.isInitialized ? "已就绪" : "未初始化")
+                    LabeledContent("运行阶段", value: mpv.playbackState)
+                    LabeledContent("视频分辨率", value: mpv.videoWidth > 0 ? "\(mpv.videoWidth)×\(mpv.videoHeight)" : "暂无")
+                    LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", mpv.sourceFPS)) / \(String(format: "%.1f", mpv.outputFPS)) fps")
+                    LabeledContent("启用着色器数", value: "\(mpv.activeShaderCount)")
+                    if let currentURL = coordinator.currentURL {
+                        LabeledContent("当前片源", value: currentURL.lastPathComponent)
+                    }
+                    if let err = mpv.lastErrorMessage {
+                        Text("最近错误：\(err)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section("快捷排查动作") {
+                    Button {
+                        coordinator.playBuiltInSampleVideo()
+                        dismiss()
+                    } label: {
+                        Label("一键生成并播放内置 3 秒测试视频", systemImage: "play.circle.fill")
+                    }
+
+                    Button {
+                        coordinator.retryWithoutShaders()
+                        dismiss()
+                    } label: {
+                        Label("关闭全部超分/补帧并重新播放", systemImage: "arrow.counterclockwise")
+                    }
+
+                    Button {
+                        let summary = [
+                            "GlassMPV \(AppReleaseInfo.displayVersion)",
+                            "Engine: \(coordinator.engineMode.rawValue)",
+                            "State: \(mpv.playbackState)",
+                            "Video: \(mpv.videoWidth)x\(mpv.videoHeight) @ \(mpv.sourceFPS)fps",
+                            "Error: \(mpv.lastErrorMessage ?? "none")",
+                            "--- Logs ---"
+                        ] + mpv.diagnosticLogs
+                        UIPasteboard.general.string = summary.joined(separator: "\n")
+                        copiedFeedback = true
+                    } label: {
+                        Label(
+                            copiedFeedback ? "已复制全部诊断日志" : "一键复制全部诊断日志",
+                            systemImage: copiedFeedback ? "checkmark.circle.fill" : "doc.on.doc"
+                        )
+                    }
+                }
+
+                Section("libmpv 事件与警告日志（最近 \(mpv.diagnosticLogs.count) 条）") {
+                    if mpv.diagnosticLogs.isEmpty {
+                        Text("暂无日志（打开视频或触发测试视频后将自动采集）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(mpv.diagnosticLogs.reversed().enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("播放诊断中心")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

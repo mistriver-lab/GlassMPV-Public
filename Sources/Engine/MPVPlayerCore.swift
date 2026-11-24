@@ -11,7 +11,7 @@ private struct UnsafeSendableBox<T>: @unchecked Sendable {
     let value: T
 }
 
-/// 防止 MoltenVK 将 drawableSize 临时设为 1x1 引起闪烁，并保证 EDR 在主线程更新
+/// 防止 MoltenVK 将 drawableSize 临时设为 1x1 引起闪烁，并避免非主线程同步切主线程造成死锁
 final class MPVMetalLayer: CAMetalLayer {
     override var drawableSize: CGSize {
         get { super.drawableSize }
@@ -29,7 +29,7 @@ final class MPVMetalLayer: CAMetalLayer {
                 super.wantsExtendedDynamicRangeContent = newValue
             } else {
                 let box = UnsafeSendableBox(value: self)
-                DispatchQueue.main.sync {
+                DispatchQueue.main.async {
                     box.value.setSuperWantsEDR(newValue)
                 }
             }
@@ -41,23 +41,20 @@ final class MPVMetalLayer: CAMetalLayer {
     }
 }
 
+/// 对齐 MPVKit 官方 iOS 示例：使用独立 addSublayer 宿主 MPVMetalLayer，而非覆盖 layerClass
 final class MPVMetalContainerView: UIView {
-    override class var layerClass: AnyClass { MPVMetalLayer.self }
-
+    let metalLayer = MPVMetalLayer()
     var onLayerReady: (@MainActor (MPVMetalLayer) -> Void)?
     private var didNotifyReady = false
-
-    var metalLayer: MPVMetalLayer {
-        // swiftlint:disable:next force_cast
-        layer as! MPVMetalLayer
-    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
-        metalLayer.contentsScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
+        let initialScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
+        metalLayer.contentsScale = initialScale
         metalLayer.framebufferOnly = true
         metalLayer.backgroundColor = UIColor.black.cgColor
+        layer.addSublayer(metalLayer)
     }
 
     @available(*, unavailable)
@@ -67,7 +64,7 @@ final class MPVMetalContainerView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window != nil && !didNotifyReady {
+        if window != nil {
             setNeedsLayout()
         }
     }
@@ -75,16 +72,28 @@ final class MPVMetalContainerView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let fallbackScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 3.0
-        metalLayer.contentsScale = window?.screen.nativeScale ?? fallbackScale
+        let scale = window?.screen.nativeScale ?? fallbackScale
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.frame = bounds
+        metalLayer.contentsScale = scale
+        if bounds.width > 1, bounds.height > 1 {
+            metalLayer.drawableSize = CGSize(
+                width: bounds.width * scale,
+                height: bounds.height * scale
+            )
+        }
+        CATransaction.commit()
+
         if !didNotifyReady, window != nil, bounds.width > 1, bounds.height > 1 {
             didNotifyReady = true
-            metalLayer.frame = bounds
             onLayerReady?(metalLayer)
         }
     }
 }
 
-/// libmpv 播放核心控制器（支持 GLSL 超分 + 时域插值）
+/// libmpv 播放核心控制器（支持 GLSL 超分 + 时域插值 + 端内诊断与无头测试模式）
 final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isPaused: Bool = true
     @Published @MainActor var currentTime: Double = 0
@@ -95,6 +104,17 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var videoHeight: Int = 0
     @Published @MainActor var activeShaderCount: Int = 0
     @Published @MainActor var statusMessage: String = ""
+    @Published @MainActor var playbackState: String = "待机"
+    @Published @MainActor var lastErrorMessage: String?
+    @Published @MainActor var diagnosticLogs: [String] = []
+    @Published @MainActor var isInitialized: Bool = false
+
+    @MainActor
+    private static let logTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     private var mpv: OpaquePointer?
     private var attachedLayer: MPVMetalLayer?
@@ -105,49 +125,92 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     private var pendingURL: URL?
     private var currentPreset: ShaderPreset = .off
     private var currentExtras: Set<String> = []
-    private var currentInterpolation: InterpolationMode = .mpvSmooth120Hz
+    private var currentInterpolation: InterpolationMode = .off
     private var currentSpeed: Double = 1.0
+    private var isHeadlessMode: Bool = false
 
     @MainActor
     func attach(to metalLayer: MPVMetalLayer) {
         stateLock.lock()
         let alreadyInitialized = (mpv != nil)
-        let sameLayer = (attachedLayer === metalLayer)
+        let sameLayer = (!isHeadlessMode && attachedLayer === metalLayer)
         stateLock.unlock()
         if alreadyInitialized {
             if sameLayer { return }
             shutdown()
         }
 
+        configureAndInitialize(metalLayer: metalLayer, headless: false)
+    }
+
+    /// 供 XCTest 在无窗口 iOS Simulator 中运行真实解码与播放验证
+    @MainActor
+    func attachHeadlessForTesting() {
+        stateLock.lock()
+        let alreadyInitialized = (mpv != nil && isHeadlessMode)
+        stateLock.unlock()
+        if alreadyInitialized { return }
+        if mpv != nil {
+            shutdown()
+        }
+        configureAndInitialize(metalLayer: nil, headless: true)
+    }
+
+    @MainActor
+    private func configureAndInitialize(metalLayer: MPVMetalLayer?, headless: Bool) {
         _ = setlocale(LC_NUMERIC, "C")
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
+        if !headless {
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
+        }
+
+        lastErrorMessage = nil
+        playbackState = "正在初始化 MPV..."
+        appendLog(headless ? "[init] 启动 Headless 测试模式" : "[init] 绑定 MPVMetalLayer(\(Int(metalLayer?.bounds.width ?? 0))x\(Int(metalLayer?.bounds.height ?? 0)))")
 
         guard let handle = mpv_create() else {
-            statusMessage = "mpv_create 初始化失败"
+            let msg = "mpv_create 初始化失败"
+            statusMessage = msg
+            lastErrorMessage = msg
+            playbackState = "初始化失败"
+            appendLog("[error] \(msg)")
             return
         }
 
-        attachedLayer = metalLayer
-        var wid = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
-        checkError(mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &wid))
+        mpv_request_log_messages(handle, "warn")
 
-        // Apple Metal / MoltenVK 管线配置
-        checkError(mpv_set_option_string(handle, "vo", "gpu-next"))
-        checkError(mpv_set_option_string(handle, "gpu-api", "vulkan"))
-        checkError(mpv_set_option_string(handle, "gpu-context", "moltenvk"))
-        checkError(mpv_set_option_string(handle, "hwdec", "videotoolbox"))
-        checkError(mpv_set_option_string(handle, "keep-open", "yes"))
-        checkError(mpv_set_option_string(handle, "osc", "no"))
-        checkError(mpv_set_option_string(handle, "osd-level", "0"))
-        checkError(mpv_set_option_string(handle, "loop-playlist", "inf"))
-        checkError(mpv_set_option_string(handle, "slang", "chs,sc,zh,zho,chi,cht,tc"))
-        checkError(mpv_set_option_string(handle, "subs-fallback", "yes"))
-        checkError(mpv_set_option_string(handle, "demuxer-max-bytes", "150MiB"))
+        if headless {
+            checkError(mpv_set_option_string(handle, "vo", "null"))
+            checkError(mpv_set_option_string(handle, "ao", "null"))
+            checkError(mpv_set_option_string(handle, "hwdec", "no"))
+            checkError(mpv_set_option_string(handle, "keep-open", "yes"))
+            checkError(mpv_set_option_string(handle, "loop-playlist", "no"))
+        } else if let metalLayer {
+            attachedLayer = metalLayer
+            var wid = Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
+            checkError(mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &wid))
+
+            // Apple Metal / MoltenVK 管线配置（auto-safe 支持硬解失败安全回退软解）
+            checkError(mpv_set_option_string(handle, "vo", "gpu-next"))
+            checkError(mpv_set_option_string(handle, "gpu-api", "vulkan"))
+            checkError(mpv_set_option_string(handle, "gpu-context", "moltenvk"))
+            checkError(mpv_set_option_string(handle, "hwdec", "auto-safe"))
+            checkError(mpv_set_option_string(handle, "keep-open", "yes"))
+            checkError(mpv_set_option_string(handle, "osc", "no"))
+            checkError(mpv_set_option_string(handle, "osd-level", "0"))
+            checkError(mpv_set_option_string(handle, "loop-playlist", "inf"))
+            checkError(mpv_set_option_string(handle, "slang", "chs,sc,zh,zho,chi,cht,tc"))
+            checkError(mpv_set_option_string(handle, "subs-fallback", "yes"))
+            checkError(mpv_set_option_string(handle, "demuxer-max-bytes", "150MiB"))
+        }
 
         let initStatus = mpv_initialize(handle)
         if initStatus < 0 {
             checkError(initStatus)
+            let errText = String(cString: mpv_error_string(initStatus))
+            lastErrorMessage = "mpv_initialize 失败：\(errText)"
+            playbackState = "初始化失败"
+            appendLog("[fatal] mpv_initialize failed (\(initStatus)): \(errText)")
             mpv_terminate_destroy(handle)
             attachedLayer = nil
             return
@@ -168,34 +231,45 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             controller.readEvents()
         }, context)
 
-        let bgObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.pause()
-            self.setVideoTrackOption("no")
-        }
+        var observers: [NSObjectProtocol] = []
+        if !headless {
+            let bgObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.pause()
+                self.setVideoTrackProperty("no")
+            }
 
-        let fgObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.willEnterForegroundNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.setVideoTrackOption("auto")
+            let fgObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.setVideoTrackProperty("auto")
+            }
+            observers = [bgObserver, fgObserver]
         }
 
         stateLock.lock()
         self.mpv = handle
-        self.lifecycleObservers = [bgObserver, fgObserver]
+        self.isHeadlessMode = headless
+        self.lifecycleObservers = observers
         let queuedURL = self.pendingURL
         self.pendingURL = nil
         stateLock.unlock()
 
-        applyInterpolation(currentInterpolation)
-        applyShaders(preset: currentPreset, extras: currentExtras)
+        isInitialized = true
+        playbackState = "内核就绪"
+        appendLog("[init] mpv_initialize 成功")
+
+        if !headless {
+            applyInterpolation(currentInterpolation)
+            applyShaders(preset: currentPreset, extras: currentExtras)
+        }
         if abs(currentSpeed - 1.0) > 0.001 {
             setSpeed(currentSpeed)
         }
@@ -206,16 +280,29 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     func load(url: URL) {
+        let target = url.isFileURL ? url.path : url.absoluteString
+        appendLog("[load] 请求播放: \(target)")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.lastErrorMessage = nil
+            self.currentTime = 0
+            self.duration = 0
+            self.videoWidth = 0
+            self.videoHeight = 0
+            self.playbackState = "正在加载媒体..."
+        }
+
         stateLock.lock()
         guard let handle = mpv else {
             pendingURL = url
             stateLock.unlock()
+            appendLog("[load] 内核尚未就绪，已入队等待图层挂载")
             return
         }
         stateLock.unlock()
 
-        let target = url.isFileURL ? url.path : url.absoluteString
-        command(handle: handle, "loadfile", args: [target, "replace"])
+        commandAsync(handle: handle, "loadfile", args: [target, "replace"])
         setFlag(handle: handle, name: "pause", value: false)
     }
 
@@ -247,7 +334,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             return
         }
         stateLock.unlock()
-        command(handle: handle, "seek", args: [String(format: "%.3f", seconds), "absolute"])
+        commandAsync(handle: handle, "seek", args: [String(format: "%.3f", seconds), "absolute"])
     }
 
     func seekRelative(_ delta: Double) {
@@ -257,7 +344,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             return
         }
         stateLock.unlock()
-        command(handle: handle, "seek", args: [String(format: "%.3f", delta), "relative"])
+        commandAsync(handle: handle, "seek", args: [String(format: "%.3f", delta), "relative"])
     }
 
     func setSpeed(_ speed: Double) {
@@ -289,11 +376,13 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         stateLock.unlock()
 
         if paths.isEmpty {
-            command(handle: handle, "change-list", args: ["glsl-shaders", "clr", ""])
+            commandAsync(handle: handle, "change-list", args: ["glsl-shaders", "clr", ""])
+            appendLog("[shader] 已清空着色器（原画直出）")
         } else {
             // Unix / iOS 下 mpv 使用冒号分隔多个着色器路径
             let joined = paths.joined(separator: ":")
-            command(handle: handle, "change-list", args: ["glsl-shaders", "set", joined])
+            commandAsync(handle: handle, "change-list", args: ["glsl-shaders", "set", joined])
+            appendLog("[shader] 应用 \(count) 个 GLSL 着色器 (\(preset.title))")
         }
     }
 
@@ -312,9 +401,35 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             mpv_set_property_string(handle, "video-sync", "display-resample")
             mpv_set_property_string(handle, "interpolation", "yes")
             mpv_set_property_string(handle, "tscale", "oversample")
+            appendLog("[interp] 开启 120Hz 时域平滑 (display-resample)")
         case .off, .vtOpticalFlow2x:
             mpv_set_property_string(handle, "interpolation", "no")
             mpv_set_property_string(handle, "video-sync", "audio")
+            appendLog("[interp] 关闭时域插值 (video-sync=audio)")
+        }
+    }
+
+    @MainActor
+    func clearError() {
+        lastErrorMessage = nil
+    }
+
+    @MainActor
+    func recordExternalError(_ message: String) {
+        lastErrorMessage = message
+        statusMessage = message
+        playbackState = "打开失败"
+        appendLog("[error] \(message)")
+    }
+
+    func appendLog(_ line: String) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stamp = Self.logTimeFormatter.string(from: Date())
+            self.diagnosticLogs.append("[\(stamp)] \(line)")
+            if self.diagnosticLogs.count > 100 {
+                self.diagnosticLogs.removeFirst(self.diagnosticLogs.count - 100)
+            }
         }
     }
 
@@ -324,14 +439,20 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         lifecycleObservers.removeAll()
         guard let handle = mpv else {
             attachedLayer = nil
+            isHeadlessMode = false
             stateLock.unlock()
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
+            }
+            Task { @MainActor [weak self] in
+                self?.isInitialized = false
+                self?.playbackState = "待机"
             }
             return
         }
         mpv = nil
         attachedLayer = nil
+        isHeadlessMode = false
         stateLock.unlock()
 
         for observer in observers {
@@ -339,16 +460,21 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         }
         mpv_set_wakeup_callback(handle, nil, nil)
         mpv_terminate_destroy(handle)
+
+        Task { @MainActor [weak self] in
+            self?.isInitialized = false
+            self?.playbackState = "已停止"
+        }
     }
 
-    private func setVideoTrackOption(_ value: String) {
+    private func setVideoTrackProperty(_ value: String) {
         stateLock.lock()
         guard let handle = mpv else {
             stateLock.unlock()
             return
         }
         stateLock.unlock()
-        checkError(mpv_set_option_string(handle, "vid", value))
+        checkError(mpv_set_property_string(handle, "vid", value))
     }
 
     deinit {
@@ -375,15 +501,72 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
                 }
 
                 switch event.event_id {
+                case MPV_EVENT_START_FILE:
+                    Task { @MainActor [weak self] in
+                        self?.playbackState = "正在打开媒体..."
+                        self?.lastErrorMessage = nil
+                    }
+                    appendLog("[event] START_FILE")
+
+                case MPV_EVENT_FILE_LOADED:
+                    Task { @MainActor [weak self] in
+                        self?.playbackState = "已加载，开始解码..."
+                    }
+                    appendLog("[event] FILE_LOADED")
+
+                case MPV_EVENT_PLAYBACK_RESTART:
+                    Task { @MainActor [weak self] in
+                        self?.playbackState = "播放中"
+                    }
+                    appendLog("[event] PLAYBACK_RESTART")
+
+                case MPV_EVENT_VIDEO_RECONFIG:
+                    appendLog("[event] VIDEO_RECONFIG")
+
+                case MPV_EVENT_END_FILE:
+                    if let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(event.data))?.pointee {
+                        if endFile.reason == MPV_END_FILE_REASON_ERROR {
+                            let errStr = String(cString: mpv_error_string(endFile.error))
+                            let message = "播放失败：\(errStr) (\(endFile.error))"
+                            Task { @MainActor [weak self] in
+                                self?.lastErrorMessage = message
+                                self?.statusMessage = message
+                                self?.playbackState = "播放失败"
+                            }
+                            appendLog("[error] END_FILE error: \(errStr) (\(endFile.error))")
+                        } else if endFile.reason == MPV_END_FILE_REASON_EOF {
+                            Task { @MainActor [weak self] in
+                                self?.playbackState = "播放结束"
+                            }
+                            appendLog("[event] END_FILE (EOF)")
+                        } else {
+                            appendLog("[event] END_FILE reason=\(endFile.reason.rawValue)")
+                        }
+                    }
+
+                case MPV_EVENT_LOG_MESSAGE:
+                    if let logMsg = UnsafePointer<mpv_event_log_message>(OpaquePointer(event.data))?.pointee {
+                        let prefix = logMsg.prefix.map { String(cString: $0) } ?? "mpv"
+                        let level = logMsg.level.map { String(cString: $0) } ?? "info"
+                        let rawText = logMsg.text.map { String(cString: $0) } ?? ""
+                        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !text.isEmpty {
+                            appendLog("[\(level)][\(prefix)] \(text)")
+                        }
+                    }
+
                 case MPV_EVENT_PROPERTY_CHANGE:
                     if let prop = UnsafePointer<mpv_event_property>(OpaquePointer(event.data))?.pointee,
                        let cName = prop.name {
                         let name = String(cString: cName)
                         handlePropertyChange(name: name, property: prop)
                     }
+
                 case MPV_EVENT_SHUTDOWN:
+                    appendLog("[event] SHUTDOWN")
                     shutdown()
                     return
+
                 default:
                     break
                 }
@@ -436,7 +619,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func command(handle: OpaquePointer, _ cmd: String, args: [String]) {
+    private func commandAsync(handle: OpaquePointer, _ cmd: String, args: [String]) {
         let allArgs: [String?] = [cmd] + args + [nil]
         let cStrings: [UnsafeMutablePointer<CChar>?] = allArgs.map { item in
             item.map { strdup($0) } ?? nil
@@ -447,7 +630,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             }
         }
         var constArgs = cStrings.map { UnsafePointer($0) }
-        checkError(mpv_command(handle, &constArgs))
+        checkError(mpv_command_async(handle, 0, &constArgs))
     }
 
     private func getFlag(handle: OpaquePointer, name: String) -> Bool {
@@ -467,6 +650,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             Task { @MainActor [weak self] in
                 self?.statusMessage = "mpv: \(msg)"
             }
+            appendLog("[warn] mpv error (\(status)): \(msg)")
         }
     }
 }
