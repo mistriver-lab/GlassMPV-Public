@@ -441,6 +441,10 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     func shutdown() {
+        shutdownCore(fromDeinit: false)
+    }
+
+    private func shutdownCore(fromDeinit: Bool) {
         stateLock.lock()
         let observers = lifecycleObservers
         lifecycleObservers.removeAll()
@@ -451,9 +455,8 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             for observer in observers {
                 NotificationCenter.default.removeObserver(observer)
             }
-            Task { @MainActor [weak self] in
-                self?.isInitialized = false
-                self?.playbackState = "待机"
+            if !fromDeinit {
+                updateShutdownUIState(playbackState: "待机")
             }
             return
         }
@@ -471,9 +474,22 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         }
         mpv_terminate_destroy(handle)
 
-        Task { @MainActor [weak self] in
-            self?.isInitialized = false
-            self?.playbackState = "已停止"
+        if !fromDeinit {
+            updateShutdownUIState(playbackState: "已停止")
+        }
+    }
+
+    private func updateShutdownUIState(playbackState: String) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                self.isInitialized = false
+                self.playbackState = playbackState
+            }
+        } else {
+            Task { @MainActor [weak self] in
+                self?.isInitialized = false
+                self?.playbackState = playbackState
+            }
         }
     }
 
@@ -488,7 +504,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     deinit {
-        shutdown()
+        shutdownCore(fromDeinit: true)
     }
 
     // MARK: - Private libmpv helpers
