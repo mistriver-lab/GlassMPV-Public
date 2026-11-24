@@ -1,6 +1,6 @@
 # GlassMPV 工程踩坑复盘与防复发门禁沉淀
 
-本文档系统记录 GlassMPV 从 `v1.0.0` 立项至 `v1.0.2` 云端 CI 出包与端内实播排查期间暴露出的 7 类典型工程问题，以及对应的根因修复与自动化防复发门禁。
+本文档系统记录 GlassMPV 从 `v1.0.0` 立项至 `v1.0.2` 云端 CI 出包与端内实播排查期间暴露出的 8 类典型工程问题，以及对应的根因修复与自动化防复发门禁。
 
 ---
 
@@ -127,3 +127,23 @@
 
 ### 【防复发门禁】
 - [test_project_integrity.py](../tests/test_project_integrity.py) 校验 `GlassMPVTests` 存在于 `project.yml` 且 `xcodebuild test` 存在于 CI 工作流；每次推送 `main` 必须先通过模拟器实播测试才允许出包。
+
+---
+
+## 8. Swift 6 `@MainActor` 方法内联 C 回调触发 `_dispatch_assert_queue_fail` 闪退
+
+### 【现象】
+- CI iOS 模拟器测试中，前 3 项测试全部通过，但 `testMPVCoreHeadlessPlayback` 在调用 `controller.load(url:)` 后立即导致宿主进程 `SIGTRAP` (`EXC_BREAKPOINT`) 崩溃退出（`exit code 65`）。
+- Run `45312256314` 捕获的 `.ips` 崩溃日志显示崩在 libmpv 内部 `core` 线程：`core_thread -> mp_client_send_property_changes -> closure #3 in MPVPlayerController.configureAndInitialize(metalLayer:headless:) -> _swift_task_checkIsolatedSwift -> dispatch_assert_queue -> _dispatch_assert_queue_fail`。
+
+### 【根因】
+- `MPVPlayerController.configureAndInitialize(metalLayer:headless:)` 标记为 `@MainActor`；在 `SWIFT_VERSION = 6.0` 下，直接在该方法体内向 C 函数 `mpv_set_wakeup_callback` 传入内联闭包 `{ ctx in ... }`，Swift 6 编译器会让该 C 回调闭包隐式继承 `@MainActor` 隔离校验。当 `libmpv` 在后台 `core` pthread 上触发 wakeup 回调时，Swift 6 运行时执行主队列隔离断言 `_dispatch_assert_queue_fail` 并立即中断进程。
+- 同时，`configureAndInitialize` 原先在 `self.mpv = handle` 赋值前注册 wakeup 回调，而 `shutdown()` 未先同步排空 `eventQueue` 上在途的 `readEvents()` 即调用 `mpv_terminate_destroy(handle)`，也存在生命周期竞争隐患。
+
+### 【修复】
+- 将 C 回调函数抽离至文件顶层非隔离作用域 `private func mpvWakeupCallback(_ ctx: UnsafeMutableRawPointer?)`，并将 `MPVPlayerController.readEvents()` 声明为 `fileprivate`，通过 `mpv_set_wakeup_callback(handle, mpvWakeupCallback, context)` 注册。
+- 在 `configureAndInitialize` 中先完成 `stateLock` 保护下的 `self.mpv` 赋值再注册回调；在 `shutdown()` 中先注销回调并经由 `eventQueueKey` 判断后执行 `eventQueue.sync {}` 排空在途事件，再调用 `mpv_terminate_destroy(handle)`。
+- 在 [build-ios.yml](../.github/workflows/build-ios.yml) 中为 `xcodebuild test` 增加失败自动打印 `~/Library/Logs/DiagnosticReports/*GlassMPV*` 崩溃栈逻辑。
+
+### 【防复发门禁】
+- [test_project_integrity.py](../tests/test_project_integrity.py) 强制断言 `MPVPlayerCore.swift` 必须定义顶层 `mpvWakeupCallback` 并通过函数引用传给 `mpv_set_wakeup_callback`，严禁出现 `mpv_set_wakeup_callback(handle, {` 内联闭包形式；同时校验本复盘文档维护 8 节编号。

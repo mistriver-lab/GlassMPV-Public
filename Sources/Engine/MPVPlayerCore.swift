@@ -11,6 +11,12 @@ private struct UnsafeSendableBox<T>: @unchecked Sendable {
     let value: T
 }
 
+private func mpvWakeupCallback(_ ctx: UnsafeMutableRawPointer?) {
+    guard let ctx else { return }
+    let controller = Unmanaged<MPVPlayerController>.fromOpaque(ctx).takeUnretainedValue()
+    controller.readEvents()
+}
+
 /// 防止 MoltenVK 将 drawableSize 临时设为 1x1 引起闪烁，并避免非主线程同步切主线程造成死锁
 final class MPVMetalLayer: CAMetalLayer {
     override var drawableSize: CGSize {
@@ -261,11 +267,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         stateLock.unlock()
 
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        mpv_set_wakeup_callback(handle, { ctx in
-            guard let ctx else { return }
-            let controller = Unmanaged<MPVPlayerController>.fromOpaque(ctx).takeUnretainedValue()
-            controller.readEvents()
-        }, context)
+        mpv_set_wakeup_callback(handle, mpvWakeupCallback, context)
 
         isInitialized = true
         playbackState = "内核就绪"
@@ -491,7 +493,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
 
     // MARK: - Private libmpv helpers
 
-    private func readEvents() {
+    fileprivate func readEvents() {
         eventQueue.async { [weak self] in
             guard let self else { return }
             while true {

@@ -203,6 +203,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "MPV_EVENT_END_FILE" in mpv_core
     assert "MPV_EVENT_LOG_MESSAGE" in mpv_core
     assert "mpv_command_async" in mpv_core
+    assert "private func mpvWakeupCallback(" in mpv_core
+    assert "mpv_set_wakeup_callback(handle, mpvWakeupCallback," in mpv_core
+    assert "mpv_set_wakeup_callback(handle, {" not in mpv_core
 
 
 def test_lessons_learned_documented():
@@ -210,4 +213,4 @@ def test_lessons_learned_documented():
     assert lessons_path.is_file(), f"Missing {lessons_path}"
     content = lessons_path.read_text(encoding="utf-8")
     headings = re.findall(r"^## \d+\.", content, flags=re.MULTILINE)
-    assert len(headings) == 7, f"Expected 7 numbered sections in LESSONS_LEARNED.md, found {headings}"
+    assert len(headings) == 8, f"Expected 8 numbered sections in LESSONS_LEARNED.md, found {headings}"
