@@ -104,7 +104,7 @@ final class GlassMPVTests: XCTestCase {
     }
 
     @MainActor
-    func testMetalContainerViewSublayerAndEDRThreadSafety() async throws {
+    func testMetalContainerViewSublayerAndEDRThreadSafety() {
         let container = MPVMetalContainerView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         XCTAssertFalse(container.layer is MPVMetalLayer, "不应通过重写 layerClass 绑定容器图层")
         XCTAssertTrue(
@@ -126,6 +126,6 @@ final class GlassMPVTests: XCTestCase {
         }
         let waitResult = bgDone.wait(timeout: .now() + 2.0)
         XCTAssertEqual(waitResult, .success, "后台线程写入 wantsExtendedDynamicRangeContent 不应同步阻塞导致死锁")
-        try await Task.sleep(nanoseconds: 50_000_000)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     }
 }
