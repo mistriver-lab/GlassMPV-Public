@@ -120,6 +120,7 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     private var attachedLayer: MPVMetalLayer?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private let eventQueue = DispatchQueue(label: "com.glassmpv.mpv.events", qos: .userInitiated)
+    private let eventQueueKey = DispatchSpecificKey<Bool>()
     private let stateLock = NSLock()
 
     private var pendingURL: URL?
@@ -128,6 +129,10 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
     private var currentInterpolation: InterpolationMode = .off
     private var currentSpeed: Double = 1.0
     private var isHeadlessMode: Bool = false
+
+    init() {
+        eventQueue.setSpecific(key: eventQueueKey, value: true)
+    }
 
     @MainActor
     func attach(to metalLayer: MPVMetalLayer) {
@@ -224,13 +229,6 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         mpv_observe_property(handle, 0, "video-params/w", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "video-params/h", MPV_FORMAT_INT64)
 
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        mpv_set_wakeup_callback(handle, { ctx in
-            guard let ctx else { return }
-            let controller = Unmanaged<MPVPlayerController>.fromOpaque(ctx).takeUnretainedValue()
-            controller.readEvents()
-        }, context)
-
         var observers: [NSObjectProtocol] = []
         if !headless {
             let bgObserver = NotificationCenter.default.addObserver(
@@ -261,6 +259,13 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
         let queuedURL = self.pendingURL
         self.pendingURL = nil
         stateLock.unlock()
+
+        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        mpv_set_wakeup_callback(handle, { ctx in
+            guard let ctx else { return }
+            let controller = Unmanaged<MPVPlayerController>.fromOpaque(ctx).takeUnretainedValue()
+            controller.readEvents()
+        }, context)
 
         isInitialized = true
         playbackState = "内核就绪"
@@ -459,6 +464,9 @@ final class MPVPlayerController: ObservableObject, @unchecked Sendable {
             NotificationCenter.default.removeObserver(observer)
         }
         mpv_set_wakeup_callback(handle, nil, nil)
+        if DispatchQueue.getSpecific(key: eventQueueKey) != true {
+            eventQueue.sync {}
+        }
         mpv_terminate_destroy(handle)
 
         Task { @MainActor [weak self] in

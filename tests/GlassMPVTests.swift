@@ -68,15 +68,18 @@ final class GlassMPVTests: XCTestCase {
             height: 360,
             fps: 30
         )
+        NSLog("[GlassMPVTests] stage 1: generated sample MP4 at %@", sampleURL.path)
 
         let controller = MPVPlayerController()
         controller.attachHeadlessForTesting()
+        NSLog("[GlassMPVTests] stage 2: attachHeadlessForTesting done, isInitialized=%d", controller.isInitialized ? 1 : 0)
         XCTAssertTrue(
             controller.isInitialized,
             "mpv_initialize 失败: \(controller.lastErrorMessage ?? "unknown")"
         )
 
         controller.load(url: sampleURL)
+        NSLog("[GlassMPVTests] stage 3: load dispatched")
 
         let deadline = Date().addingTimeInterval(10.0)
         while Date() < deadline {
@@ -91,6 +94,14 @@ final class GlassMPVTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
+        NSLog(
+            "[GlassMPVTests] stage 4: poll done duration=%.2f size=%dx%d time=%.2f err=%@",
+            controller.duration,
+            controller.videoWidth,
+            controller.videoHeight,
+            controller.currentTime,
+            controller.lastErrorMessage ?? "nil"
+        )
 
         let logsDump = controller.diagnosticLogs.joined(separator: "\n")
         XCTAssertNil(controller.lastErrorMessage, "播放过程不应报错，日志:\n\(logsDump)")
@@ -100,6 +111,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertGreaterThan(controller.currentTime, 0.1, "播放时间戳应向前推进，日志:\n\(logsDump)")
 
         controller.shutdown()
+        NSLog("[GlassMPVTests] stage 5: shutdown done")
         XCTAssertFalse(controller.isInitialized)
     }
 
