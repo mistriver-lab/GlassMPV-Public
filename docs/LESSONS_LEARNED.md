@@ -123,6 +123,7 @@
 - 新增 `TestVideoGenerator`，纯代码通过 `AVAssetWriter` 在 0.2 秒内合成 3 秒 640×360 H.264 MP4 彩条测试片；
 - 首页与诊断中心 (`DiagnosticLogSheet`) 新增「一键自测（内置 3 秒测试视频）」与最近 100 条 `libmpv` 日志查看/复制面板；
 - 新增 `GlassMPVTests` 靶标与 `MPVPlayerController.attachHeadlessForTesting()`，并在 [build-ios.yml](../.github/workflows/build-ios.yml) 中接入 iOS 模拟器 `xcodebuild test` 门禁，验证 `duration > 2.0`、`videoWidth == 640`、`videoHeight == 360` 与 `currentTime > 0.1`。
+- 针对 `VideoToolbox` 光流 API（`VTFrameProcessor` / `VTLowLatencyFrameInterpolationConfiguration`）仅在 `iphoneos` 真机 SDK 提供、在 `iphonesimulator` SDK 下不存在的问题，在 `VTOpticalFlowEngine.swift` 中使用 `#if !targetEnvironment(simulator)` 隔离硬件光流管线，保证模拟器测试宿主编译通过且真机逻辑完全不变。
 
 ### 【防复发门禁】
 - [test_project_integrity.py](../tests/test_project_integrity.py) 校验 `GlassMPVTests` 存在于 `project.yml` 且 `xcodebuild test` 存在于 CI 工作流；每次推送 `main` 必须先通过模拟器实播测试才允许出包。

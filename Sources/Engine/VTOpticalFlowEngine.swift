@@ -64,6 +64,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         enableSpatial2xUpscale = spatial2x
         errorMessage = nil
 
+#if targetEnvironment(simulator)
+        isHardwareSupported = false
+        errorMessage = "iOS 模拟器不支持 VideoToolbox ANE 硬件光流，请切换回「MPV 超分核」。"
+        return
+#else
         let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
         isHardwareSupported = supported
         guard supported else {
@@ -132,6 +137,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.errorMessage = "光流核加载失败（\(error.localizedDescription)），建议切换回「MPV 超分核」。"
             }
         }
+#endif
     }
 
     @MainActor
@@ -228,6 +234,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         spatial2x: Bool,
         token: UUID
     ) {
+#if !targetEnvironment(simulator)
         let safeW = max(width, 2)
         let safeH = max(height, 2)
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -241,8 +248,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 token: token
             )
         }
+#endif
     }
 
+#if !targetEnvironment(simulator)
     private func runOpticalFlowTask(
         url: URL,
         width: Int,
@@ -380,6 +389,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
         }
     }
+#endif
 
     @MainActor
     @objc private func onDisplayTick() {
@@ -440,6 +450,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.unlock()
     }
 
+#if !targetEnvironment(simulator)
     private func resolveSourcePixelFormat(from configuration: VTLowLatencyFrameInterpolationConfiguration) -> OSType {
         let raw = configuration.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String]
         if let num = raw as? NSNumber {
@@ -481,6 +492,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         return pool
     }
+#endif
 
     private func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, ptsSeconds: Double) -> CMSampleBuffer? {
         var formatDesc: CMVideoFormatDescription?
