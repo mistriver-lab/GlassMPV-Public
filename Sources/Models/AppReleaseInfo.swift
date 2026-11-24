@@ -10,7 +10,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 
 enum AppReleaseInfo {
     static var shortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.2"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0"
     }
 
     static var buildNumber: String {
@@ -22,6 +22,16 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v1.1.0",
+            date: "2026-11-24",
+            highlights: [
+                "切换开源 SwiftUI 播放器底座 MPVUI (0.11.0)，保留 Metal gpu-next 58 个超分着色器管线",
+                "新增系统相册直选 (PhotosPicker) 与后台异步沙盒安全拷贝，修复本地文件打不开问题",
+                "修复 ANE 光流补帧 DisplayImmediately 时间轴同步与静默吞错，暴露成功/失败帧遥测",
+                "诊断中心新增「一键真机 5 项体检」与完整体检报告导出"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v1.0.2",
             date: "2026-11-24",

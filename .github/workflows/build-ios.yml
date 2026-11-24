@@ -23,7 +23,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Resolve Swift Package dependencies (MPVKit)
+      - name: Resolve Swift Package dependencies (MPVUI)
         run: xcodebuild -resolvePackageDependencies -project GlassMPV.xcodeproj -scheme GlassMPV
 
       - name: Run iOS Simulator XCTest self-test

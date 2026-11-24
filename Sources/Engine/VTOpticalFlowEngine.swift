@@ -37,6 +37,19 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var errorMessage: String?
     @Published @MainActor var isHardwareSupported: Bool = false
     @Published @MainActor var enableSpatial2xUpscale: Bool = false
+    @Published @MainActor var interpolatedFrameCount: Int = 0
+    @Published @MainActor var failedInterpolationCount: Int = 0
+    @Published @MainActor var lastInterpolationError: String?
+
+    @MainActor
+    var capabilityDescription: String {
+#if targetEnvironment(simulator)
+        return "Simulator (硬件光流仅真机可用)"
+#else
+        let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
+        return supported ? "真机支持 ANE 光流" : "当前设备不支持 VTLowLatencyFrameInterpolation"
+#endif
+    }
 
     private let bufferLock = NSLock()
     private let tokenLock = NSLock()
@@ -63,6 +76,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         currentURL = url
         enableSpatial2xUpscale = spatial2x
         errorMessage = nil
+        interpolatedFrameCount = 0
+        failedInterpolationCount = 0
+        lastInterpolationError = nil
 
 #if targetEnvironment(simulator)
         isHardwareSupported = false
@@ -217,6 +233,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         audioPlayer = nil
         clearBufferedFrames()
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        interpolatedFrameCount = 0
+        failedInterpolationCount = 0
+        lastInterpolationError = nil
         isPaused = true
     }
 
@@ -307,7 +326,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
             let outputSettings: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
             ]
             let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
             trackOutput.alwaysCopiesSampleData = false
@@ -327,8 +347,20 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 fallbackFormat: pixelFormat
             )
 
+            var transferSession: VTPixelTransferSession?
+            if spatial2x {
+                VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferSession)
+            }
+            defer {
+                if let transferSession {
+                    VTPixelTransferSessionInvalidate(transferSession)
+                }
+            }
+
             var previousBuffer: CVPixelBuffer?
             var previousPTS: CMTime = .invalid
+            var localSuccessCount = 0
+            var localConsecutiveFailures = 0
 
             while reader.status == .reading {
                 if !isTokenValid(token) {
@@ -371,14 +403,29 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                             do {
                                 _ = try await processor.process(parameters: params)
                                 enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
+                                localSuccessCount += 1
+                                localConsecutiveFailures = 0
+                                Task { @MainActor [weak self] in
+                                    self?.interpolatedFrameCount += 1
+                                }
                             } catch {
-                                // 单帧光流跳过，仍保留原帧播放
+                                localConsecutiveFailures += 1
+                                let errDesc = error.localizedDescription
+                                Task { @MainActor [weak self] in
+                                    guard let self else { return }
+                                    self.failedInterpolationCount += 1
+                                    self.lastInterpolationError = errDesc
+                                    if localSuccessCount == 0 && localConsecutiveFailures >= 5 && self.errorMessage == nil {
+                                        self.errorMessage = "ANE 光流补帧连续失败：\(errDesc)"
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                enqueueDecodedFrame(pts: currentPTS.seconds, buffer: currentBuffer)
+                let outputBuffer = scaleIfNeeded(currentBuffer, spatial2x: spatial2x, transferSession: transferSession, pool: destPool)
+                enqueueDecodedFrame(pts: currentPTS.seconds, buffer: outputBuffer)
                 previousBuffer = currentBuffer
                 previousPTS = currentPTS
             }
@@ -482,6 +529,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             attrs[kCVPixelBufferPixelFormatTypeKey as String] = fallbackFormat
         }
         attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+        attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
 
         var pool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
@@ -492,9 +540,27 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         return pool
     }
+
+    private func scaleIfNeeded(
+        _ sourceBuffer: CVPixelBuffer,
+        spatial2x: Bool,
+        transferSession: VTPixelTransferSession?,
+        pool: CVPixelBufferPool
+    ) -> CVPixelBuffer {
+        guard spatial2x, let transferSession else {
+            return sourceBuffer
+        }
+        var scaledBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &scaledBuffer) == kCVReturnSuccess,
+              let destBuffer = scaledBuffer else {
+            return sourceBuffer
+        }
+        let status = VTPixelTransferSessionTransferImage(transferSession, from: sourceBuffer, to: destBuffer)
+        return status == noErr ? destBuffer : sourceBuffer
+    }
 #endif
 
-    private func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, ptsSeconds: Double) -> CMSampleBuffer? {
+    func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, ptsSeconds: Double) -> CMSampleBuffer? {
         var formatDesc: CMVideoFormatDescription?
         let descStatus = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
@@ -516,7 +582,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             sampleTiming: &timing,
             sampleBufferOut: &sampleBuffer
         )
-        return status == noErr ? sampleBuffer : nil
+        guard status == noErr, let sampleBuffer else { return nil }
+
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0 {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+        return sampleBuffer
     }
 }
 

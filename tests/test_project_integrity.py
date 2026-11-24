@@ -38,8 +38,8 @@ def test_project_yml_and_github_workflow_valid():
     project_cfg = yaml.safe_load((ROOT / "project.yml").read_text(encoding="utf-8"))
     assert project_cfg["name"] == "GlassMPV"
     assert project_cfg["options"]["deploymentTarget"]["iOS"] == "26.0"
-    assert project_cfg["packages"]["MPVKit"]["url"] == "https://github.com/mpvkit/MPVKit.git"
-    assert project_cfg["packages"]["MPVKit"]["from"] == "1.0.0"
+    assert project_cfg["packages"]["MPVUI"]["url"] == "https://github.com/LePips/MPVUI.git"
+    assert project_cfg["packages"]["MPVUI"]["from"] == "0.11.0"
 
     target_cfg = project_cfg["targets"]["GlassMPV"]
     assert "resources" not in target_cfg
@@ -194,18 +194,34 @@ def test_swift_sources_non_empty_and_balanced():
     for path in swift_files + [swift_test_file]:
         _assert_swift_delimiters_balanced(path)
 
+    importer = ROOT / "Sources" / "Engine" / "LocalMediaImporter.swift"
+    assert importer.is_file(), f"Missing {importer}"
+    importer_src = importer.read_text(encoding="utf-8")
+    assert "MovieFileTransferable" in importer_src
+    assert "LocalMediaImporter" in importer_src
+    assert "NSFileCoordinator" in importer_src
+    assert "startAccessingSecurityScopedResource" in importer_src
+
     mpv_core = (ROOT / "Sources" / "Engine" / "MPVPlayerCore.swift").read_text(encoding="utf-8")
+    assert "import MPVUI" in mpv_core
+    assert "MPVVideoPlayer" in mpv_core
+    assert "videoOutput: .metal" in mpv_core
+    assert "display-fps-override" in mpv_core
+    assert "setDiagnosticsEnabled(true)" in mpv_core
     assert 'joined(separator: ":")' in mpv_core
     assert 'joined(separator: ";")' not in mpv_core
-    assert 'setlocale(LC_NUMERIC, "C")' in mpv_core
     assert "DispatchQueue.main.sync" not in mpv_core
-    assert "addSublayer" in mpv_core
-    assert "MPV_EVENT_END_FILE" in mpv_core
-    assert "MPV_EVENT_LOG_MESSAGE" in mpv_core
-    assert "mpv_command_async" in mpv_core
-    assert "private func mpvWakeupCallback(" in mpv_core
-    assert "mpv_set_wakeup_callback(handle, mpvWakeupCallback," in mpv_core
-    assert "mpv_set_wakeup_callback(handle, {" not in mpv_core
+
+    vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
+    assert "kCMSampleAttachmentKey_DisplayImmediately" in vt_engine
+    assert "interpolatedFrameCount" in vt_engine
+    assert "failedInterpolationCount" in vt_engine
+    assert "#if targetEnvironment(simulator)" in vt_engine
+
+    player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
+    assert "import PhotosUI" in player_view
+    assert "PhotosPicker" in player_view
+    assert "runRealDeviceSelfCheck()" in player_view
 
 
 def test_lessons_learned_documented():
@@ -213,4 +229,4 @@ def test_lessons_learned_documented():
     assert lessons_path.is_file(), f"Missing {lessons_path}"
     content = lessons_path.read_text(encoding="utf-8")
     headings = re.findall(r"^## \d+\.", content, flags=re.MULTILINE)
-    assert len(headings) == 8, f"Expected 8 numbered sections in LESSONS_LEARNED.md, found {headings}"
+    assert len(headings) == 9, f"Expected 9 numbered sections in LESSONS_LEARNED.md, found {headings}"

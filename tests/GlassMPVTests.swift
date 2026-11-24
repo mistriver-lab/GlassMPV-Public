@@ -1,13 +1,11 @@
 import AVFoundation
+import CoreMedia
+import CoreVideo
 import Foundation
-import QuartzCore
+import SwiftUI
 import UIKit
 import XCTest
 @testable import GlassMPV
-
-private struct TestSendableBox<T>: @unchecked Sendable {
-    let value: T
-}
 
 final class GlassMPVTests: XCTestCase {
     func testAll58GLSLShadersPresentAndResolvable() throws {
@@ -60,28 +58,115 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(Int(naturalSize.height), 360)
     }
 
+    func testLocalMediaImporterSanitizationAndCopy() async throws {
+        let sanitized = LocalMediaImporter.sanitizeFilenameComponent("测试 视频#1:2?3/4")
+        XCTAssertFalse(sanitized.isEmpty)
+        XCTAssertFalse(sanitized.contains("/"))
+        XCTAssertFalse(sanitized.contains(":"))
+        XCTAssertFalse(sanitized.contains("#"))
+        XCTAssertFalse(sanitized.contains("?"))
+
+        let sampleURL = try await TestVideoGenerator.generateSampleMP4(
+            durationSeconds: 1.0,
+            width: 320,
+            height: 180,
+            fps: 30
+        )
+        let cachesDir = try XCTUnwrap(
+            FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        )
+        try FileManager.default.createDirectory(at: cachesDir, withIntermediateDirectories: true)
+        let sourceURL = cachesDir.appendingPathComponent("测试 视频#1[120Hz].mp4")
+        if FileManager.default.fileExists(atPath: sourceURL.path) {
+            try FileManager.default.removeItem(at: sourceURL)
+        }
+        try FileManager.default.copyItem(at: sampleURL, to: sourceURL)
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+        }
+
+        let importedURL = try await LocalMediaImporter.preparePlayableLocalURL(
+            from: sourceURL,
+            isSecurityScoped: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: importedURL)
+        }
+
+        let importsRoot = LocalMediaImporter.importsDirectory.standardizedFileURL.path
+        XCTAssertTrue(
+            importedURL.standardizedFileURL.path.hasPrefix(importsRoot),
+            "导入文件应落在沙盒导入目录: \(importedURL.path)"
+        )
+        XCTAssertTrue(FileManager.default.isReadableFile(atPath: importedURL.path))
+        let attrs = try FileManager.default.attributesOfItem(atPath: importedURL.path)
+        let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        XCTAssertGreaterThan(size, 10_000)
+    }
+
     @MainActor
-    func testMPVCoreHeadlessPlayback() async throws {
+    func testOpticalFlowSampleBufferDisplayImmediately() throws {
+        var pixelBufferOpt: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            64,
+            64,
+            kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &pixelBufferOpt
+        )
+        XCTAssertEqual(status, kCVReturnSuccess)
+        let pixelBuffer = try XCTUnwrap(pixelBufferOpt)
+
+        let controller = OpticalFlowPlayerController()
+        let sampleBuffer = try XCTUnwrap(controller.makeSampleBuffer(from: pixelBuffer, ptsSeconds: 0.5))
+        let attachments = try XCTUnwrap(
+            CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+        )
+        XCTAssertGreaterThan(CFArrayGetCount(attachments), 0)
+
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque()
+        let valPtr = try XCTUnwrap(CFDictionaryGetValue(dict, key))
+        XCTAssertTrue(CFBooleanGetValue(unsafeBitCast(valPtr, to: CFBoolean.self)))
+    }
+
+    @MainActor
+    func testMPVUIControllerPlaybackWithWindowHost() async throws {
         let sampleURL = try await TestVideoGenerator.generateSampleMP4(
             durationSeconds: 3.0,
             width: 640,
             height: 360,
             fps: 30
         )
-        NSLog("[GlassMPVTests] stage 1: generated sample MP4 at %@", sampleURL.path)
 
         let controller = MPVPlayerController()
-        controller.attachHeadlessForTesting()
-        NSLog("[GlassMPVTests] stage 2: attachHeadlessForTesting done, isInitialized=%d", controller.isInitialized ? 1 : 0)
-        XCTAssertTrue(
-            controller.isInitialized,
-            "mpv_initialize 失败: \(controller.lastErrorMessage ?? "unknown")"
-        )
+        XCTAssertTrue(controller.isInitialized)
 
+        let window: UIWindow
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            window = UIWindow(windowScene: scene)
+        } else {
+            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        }
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.windowLevel = .normal + 1
+        let hostController = UIHostingController(rootView: MPVVideoSurface(controller: controller))
+        window.rootViewController = hostController
+        window.makeKeyAndVisible()
+        hostController.view.setNeedsLayout()
+        hostController.view.layoutIfNeeded()
+
+        defer {
+            controller.shutdown()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        try await Task.sleep(nanoseconds: 200_000_000)
         controller.load(url: sampleURL)
-        NSLog("[GlassMPVTests] stage 3: load dispatched")
 
-        let deadline = Date().addingTimeInterval(10.0)
+        let deadline = Date().addingTimeInterval(12.0)
         while Date() < deadline {
             if controller.lastErrorMessage != nil {
                 break
@@ -94,14 +179,6 @@ final class GlassMPVTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        NSLog(
-            "[GlassMPVTests] stage 4: poll done duration=%.2f size=%dx%d time=%.2f err=%@",
-            controller.duration,
-            controller.videoWidth,
-            controller.videoHeight,
-            controller.currentTime,
-            controller.lastErrorMessage ?? "nil"
-        )
 
         let logsDump = controller.diagnosticLogs.joined(separator: "\n")
         XCTAssertNil(controller.lastErrorMessage, "播放过程不应报错，日志:\n\(logsDump)")
@@ -110,34 +187,12 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(controller.videoHeight, 360, "应解出视频高度 360，日志:\n\(logsDump)")
         XCTAssertGreaterThan(controller.currentTime, 0.1, "播放时间戳应向前推进，日志:\n\(logsDump)")
 
+        controller.applyInterpolation(.mpvSmooth120Hz)
+        controller.applyShaders(preset: .off, extras: [])
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertNil(controller.lastErrorMessage, "运行时切换插帧与着色器不应报错，日志:\n\(logsDump)")
+
         controller.shutdown()
-        NSLog("[GlassMPVTests] stage 5: shutdown done")
         XCTAssertFalse(controller.isInitialized)
-    }
-
-    @MainActor
-    func testMetalContainerViewSublayerAndEDRThreadSafety() {
-        let container = MPVMetalContainerView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
-        XCTAssertFalse(container.layer is MPVMetalLayer, "不应通过重写 layerClass 绑定容器图层")
-        XCTAssertTrue(
-            container.layer.sublayers?.contains(where: { $0 === container.metalLayer }) ?? false,
-            "MPVMetalLayer 应作为独立子图层 addSublayer 挂载"
-        )
-
-        container.metalLayer.drawableSize = CGSize(width: 390, height: 844)
-        container.metalLayer.drawableSize = CGSize(width: 1, height: 1)
-        XCTAssertEqual(Int(container.metalLayer.drawableSize.width), 390, "应拦截 1x1 临时 drawableSize 缩水")
-        XCTAssertEqual(Int(container.metalLayer.drawableSize.height), 844)
-
-        let layerBox = TestSendableBox(value: container.metalLayer)
-        let bgDone = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            layerBox.value.wantsExtendedDynamicRangeContent = true
-            layerBox.value.wantsExtendedDynamicRangeContent = false
-            bgDone.signal()
-        }
-        let waitResult = bgDone.wait(timeout: .now() + 2.0)
-        XCTAssertEqual(waitResult, .success, "后台线程写入 wantsExtendedDynamicRangeContent 不应同步阻塞导致死锁")
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     }
 }

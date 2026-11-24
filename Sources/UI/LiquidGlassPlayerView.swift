@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -12,42 +13,65 @@ final class PlayerCoordinator: ObservableObject {
     @Published var speed: Double = 1.0
     @Published var currentURL: URL?
     @Published var isGeneratingSample: Bool = false
+    @Published var isImportingFile: Bool = false
+    @Published var selfCheckReport: String = ""
 
     let mpvController = MPVPlayerController()
     let opticalFlowController = OpticalFlowPlayerController()
 
-    private var securityScopedURL: URL?
-
     func open(url: URL, isSecurityScoped: Bool = false) {
-        var resolvedURL = url
+        mpvController.clearError()
 
-        if url.isFileURL {
-            if isSecurityScoped {
-                if let old = securityScopedURL, old != url {
-                    old.stopAccessingSecurityScopedResource()
-                }
-                if url.startAccessingSecurityScopedResource() {
-                    securityScopedURL = url
-                    mpvController.appendLog("[file] 已获取 Security-Scoped 访问权限")
-                } else {
-                    mpvController.appendLog("[file] startAccessingSecurityScopedResource 返回 false，尝试直接/协调读取")
-                }
-            }
-
-            if !FileManager.default.isReadableFile(atPath: url.path) {
-                mpvController.appendLog("[file] 路径暂不可直读，尝试 NSFileCoordinator 协调拷贝到沙盒临时区")
-                do {
-                    resolvedURL = try copyToPlayableTemporaryURL(sourceURL: url)
-                    mpvController.appendLog("[file] 已拷贝到可播放副本: \(resolvedURL.lastPathComponent)")
-                } catch {
-                    mpvController.recordExternalError("无法读取本地文件（\(url.lastPathComponent)）：\(error.localizedDescription)")
-                    return
-                }
-            }
+        if !url.isFileURL {
+            currentURL = url
+            startPlaybackForCurrentEngine()
+            return
         }
 
-        currentURL = resolvedURL
-        startPlaybackForCurrentEngine()
+        isImportingFile = true
+        mpvController.appendLog("[file] 正在异步准备本地视频: \(url.lastPathComponent)")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let playableURL = try await LocalMediaImporter.preparePlayableLocalURL(
+                    from: url,
+                    isSecurityScoped: isSecurityScoped
+                )
+                self.isImportingFile = false
+                self.mpvController.appendLog("[file] 本地视频已就绪: \(playableURL.lastPathComponent)")
+                self.currentURL = playableURL
+                self.startPlaybackForCurrentEngine()
+            } catch {
+                self.isImportingFile = false
+                self.mpvController.recordExternalError("无法读取本地视频（\(url.lastPathComponent)）：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func importFromPhotosItem(_ item: PhotosPickerItem) {
+        guard !isImportingFile else { return }
+        isImportingFile = true
+        mpvController.clearError()
+        mpvController.appendLog("[photos] 开始从系统相册导入视频...")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                guard let movie = try await item.loadTransferable(type: MovieFileTransferable.self) else {
+                    self.isImportingFile = false
+                    self.mpvController.recordExternalError("未能从系统相册读取该视频（请确认 iCloud 原片已下载到本地）。")
+                    return
+                }
+                self.isImportingFile = false
+                self.mpvController.appendLog("[photos] 相册视频已拷贝至沙盒: \(movie.url.lastPathComponent)")
+                self.currentURL = movie.url
+                self.startPlaybackForCurrentEngine()
+            } catch {
+                self.isImportingFile = false
+                self.mpvController.recordExternalError("相册视频导入失败：\(error.localizedDescription)")
+            }
+        }
     }
 
     func playBuiltInSampleVideo() {
@@ -81,42 +105,57 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
-    private func copyToPlayableTemporaryURL(sourceURL: URL) throws -> URL {
-        let importDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("GlassMPV_Imports", isDirectory: true)
-        try FileManager.default.createDirectory(at: importDir, withIntermediateDirectories: true)
+    func runRealDeviceSelfCheck() {
+        mpvController.refreshDiagnosticsSnapshot()
 
-        let filename = sourceURL.lastPathComponent.isEmpty ? "imported_video.mp4" : sourceURL.lastPathComponent
-        let destURL = importDir.appendingPathComponent(filename)
+        let maxScreenFPS = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.maximumFramesPerSecond ?? 60
 
-        var coordinatorError: NSError?
-        var copyError: Error?
-        let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { readableURL in
-            do {
-                if FileManager.default.fileExists(atPath: destURL.path) {
-                    try FileManager.default.removeItem(at: destURL)
-                }
-                try FileManager.default.copyItem(at: readableURL, to: destURL)
-            } catch {
-                copyError = error
+        let shaderCount: Int = {
+            guard let dir = Bundle.main.resourceURL?.appendingPathComponent("Shaders", isDirectory: true),
+                  let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+                return 0
             }
-        }
+            return items.filter { $0.pathExtension.lowercased() == "glsl" }.count
+        }()
 
-        if let coordinatorError {
-            throw coordinatorError
-        }
-        if let copyError {
-            throw copyError
-        }
-        guard FileManager.default.isReadableFile(atPath: destURL.path) else {
-            throw NSError(
-                domain: "GlassMPV.FileAccess",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "拷贝后的副本不可读"]
-            )
-        }
-        return destURL
+        let resolvedShaderCount = SingleShaderOption.resolvedShaderPaths(
+            preset: selectedPreset,
+            extras: selectedExtras
+        ).count
+
+        let importCheck: String = {
+            do {
+                try FileManager.default.createDirectory(
+                    at: LocalMediaImporter.importsDirectory,
+                    withIntermediateDirectories: true
+                )
+                let currentReadable = currentURL.map {
+                    $0.isFileURL ? FileManager.default.isReadableFile(atPath: $0.path(percentEncoded: false)) : true
+                } ?? true
+                return "PASS (沙盒导入目录可写, 当前片源可读=\(currentReadable))"
+            } catch {
+                return "FAIL (\(error.localizedDescription))"
+            }
+        }()
+
+        let mpvStatus = mpvController.isInitialized
+            ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | display=\(String(format: "%.0f", mpvController.displaySyncFPS))Hz | passes=\(mpvController.freshRenderPassCount) | err=\(mpvController.lastErrorMessage ?? "none")"
+            : "未初始化"
+
+        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 成功补帧=\(opticalFlowController.interpolatedFrameCount) | 失败=\(opticalFlowController.failedInterpolationCount) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
+
+        let lines = [
+            "=== GlassMPV 真机 5 项体检报告 ===",
+            "版本: \(AppReleaseInfo.displayVersion) | 当前引擎: \(engineMode.rawValue)",
+            "1. 屏幕 ProMotion 上限: \(maxScreenFPS) Hz \(maxScreenFPS >= 120 ? "(PASS)" : "(非120Hz)")",
+            "2. GLSL 着色器包校验: \(shaderCount)/58 个 (\(shaderCount == 58 ? "PASS" : "FAIL")), 当前激活=\(resolvedShaderCount) 个",
+            "3. 本地/相册导入沙盒通道: \(importCheck)",
+            "4. MPVUI 播放内核: \(mpvStatus)",
+            "5. ANE 光流真补帧核: \(opticalStatus)"
+        ]
+        selfCheckReport = lines.joined(separator: "\n")
     }
 
     func switchEngine(to target: PlayerEngineMode) {
@@ -242,10 +281,6 @@ final class PlayerCoordinator: ObservableObject {
             }
         }
     }
-
-    deinit {
-        securityScopedURL?.stopAccessingSecurityScopedResource()
-    }
 }
 
 struct LiquidGlassPlayerView: View {
@@ -255,6 +290,7 @@ struct LiquidGlassPlayerView: View {
 
     @State private var showHUD: Bool = true
     @State private var showFileImporter: Bool = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
     @State private var showEnhancementSheet: Bool = false
@@ -307,6 +343,10 @@ struct LiquidGlassPlayerView: View {
                 }
             }
 
+            if coordinator.isImportingFile {
+                loadingStatusPill("正在导入视频至沙盒...")
+            }
+
             if coordinator.engineMode == .mpv, let mpvError = mpv.lastErrorMessage {
                 mpvErrorBanner(mpvError)
             } else if coordinator.engineMode == .opticalFlow, let error = optical.errorMessage {
@@ -326,6 +366,11 @@ struct LiquidGlassPlayerView: View {
             case .failure(let error):
                 coordinator.mpvController.recordExternalError("文件选择器返回错误：\(error.localizedDescription)")
             }
+        }
+        .onChange(of: selectedPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            selectedPhotoItem = nil
+            coordinator.importFromPhotosItem(newItem)
         }
         .alert("打开网络视频流", isPresented: $showURLPrompt) {
             TextField("https:// 或 smb:// 视频地址", text: $streamURLInput)
@@ -359,8 +404,8 @@ struct LiquidGlassPlayerView: View {
     // MARK: - Welcome Empty State
 
     private var welcomeOverlay: some View {
-        GlassEffectContainer(spacing: 18) {
-            VStack(spacing: 20) {
+        GlassEffectContainer(spacing: 16) {
+            VStack(spacing: 16) {
                 VStack(spacing: 8) {
                     Image(systemName: "sparkles.tv")
                         .font(.system(size: 46, weight: .semibold))
@@ -375,29 +420,38 @@ struct LiquidGlassPlayerView: View {
                 .padding(24)
                 .glassEffect(.regular, in: .rect(cornerRadius: 28))
 
-                HStack(spacing: 14) {
+                HStack(spacing: 12) {
                     Button {
                         showFileImporter = true
                     } label: {
                         Label("打开本地视频", systemImage: "folder.badge.plus")
                             .font(.headline)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 14)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 13)
                     }
                     .buttonStyle(.plain)
                     .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
 
-                    Button {
-                        showURLPrompt = true
-                    } label: {
-                        Label("网络串流", systemImage: "link")
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                        Label("从相册选取", systemImage: "photo.on.rectangle.angled")
                             .font(.headline)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 14)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 13)
                     }
                     .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .glassEffect(.regular.tint(.indigo).interactive(), in: .capsule)
                 }
+
+                Button {
+                    showURLPrompt = true
+                } label: {
+                    Label("网络串流", systemImage: "link")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 11)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
 
                 Button {
                     coordinator.playBuiltInSampleVideo()
@@ -470,6 +524,14 @@ struct LiquidGlassPlayerView: View {
                         showFileImporter = true
                     } label: {
                         Image(systemName: "folder")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 40, height: 40)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .circle)
+
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                        Image(systemName: "photo.on.rectangle")
                             .font(.body.weight(.semibold))
                             .frame(width: 40, height: 40)
                     }
@@ -931,12 +993,44 @@ struct ReleaseNotesSheet: View {
 struct DiagnosticLogSheet: View {
     @ObservedObject var mpv: MPVPlayerController
     @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject private var optical: OpticalFlowPlayerController
     @Environment(\.dismiss) private var dismiss
     @State private var copiedFeedback: Bool = false
+    @State private var copiedSelfCheckFeedback: Bool = false
+
+    init(mpv: MPVPlayerController, coordinator: PlayerCoordinator) {
+        self.mpv = mpv
+        self.coordinator = coordinator
+        self._optical = ObservedObject(wrappedValue: coordinator.opticalFlowController)
+    }
 
     var body: some View {
         NavigationStack {
             List {
+                Section("真机 5 项体检") {
+                    Button {
+                        coordinator.runRealDeviceSelfCheck()
+                    } label: {
+                        Label("一键执行真机 5 项体检", systemImage: "stethoscope.circle.fill")
+                    }
+
+                    if !coordinator.selfCheckReport.isEmpty {
+                        Text(coordinator.selfCheckReport)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+
+                        Button {
+                            UIPasteboard.general.string = coordinator.selfCheckReport
+                            copiedSelfCheckFeedback = true
+                        } label: {
+                            Label(
+                                copiedSelfCheckFeedback ? "已复制体检报告" : "一键复制体检报告",
+                                systemImage: copiedSelfCheckFeedback ? "checkmark.circle.fill" : "doc.on.clipboard"
+                            )
+                        }
+                    }
+                }
+
                 Section("内核与播放状态") {
                     LabeledContent("当前引擎", value: coordinator.engineMode.rawValue)
                     LabeledContent("初始化状态", value: mpv.isInitialized ? "已就绪" : "未初始化")
@@ -944,13 +1038,30 @@ struct DiagnosticLogSheet: View {
                     LabeledContent("视频分辨率", value: mpv.videoWidth > 0 ? "\(mpv.videoWidth)×\(mpv.videoHeight)" : "暂无")
                     LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", mpv.sourceFPS)) / \(String(format: "%.1f", mpv.outputFPS)) fps")
                     LabeledContent("启用着色器数", value: "\(mpv.activeShaderCount)")
+                    LabeledContent(
+                        "解码器 / 硬解",
+                        value: "\(mpv.videoCodec.isEmpty ? "-" : mpv.videoCodec) / \(mpv.hardwareDecoder.isEmpty ? "-" : mpv.hardwareDecoder)"
+                    )
+                    LabeledContent(
+                        "显示同步 / 渲染 Pass",
+                        value: "\(String(format: "%.0f", mpv.displaySyncFPS)) Hz / \(mpv.freshRenderPassCount)"
+                    )
+                    LabeledContent(
+                        "ANE 光流状态",
+                        value: "\(optical.capabilityDescription) (成功 \(optical.interpolatedFrameCount) / 失败 \(optical.failedInterpolationCount))"
+                    )
                     if let currentURL = coordinator.currentURL {
                         LabeledContent("当前片源", value: currentURL.lastPathComponent)
                     }
                     if let err = mpv.lastErrorMessage {
-                        Text("最近错误：\(err)")
+                        Text("MPV 最近错误：\(err)")
                             .font(.caption)
                             .foregroundStyle(.orange)
+                    }
+                    if let optErr = optical.errorMessage ?? optical.lastInterpolationError {
+                        Text("光流最近错误：\(optErr)")
+                            .font(.caption)
+                            .foregroundStyle(.yellow)
                     }
                 }
 
@@ -970,12 +1081,18 @@ struct DiagnosticLogSheet: View {
                     }
 
                     Button {
+                        if coordinator.selfCheckReport.isEmpty {
+                            coordinator.runRealDeviceSelfCheck()
+                        }
                         let summary = [
                             "GlassMPV \(AppReleaseInfo.displayVersion)",
                             "Engine: \(coordinator.engineMode.rawValue)",
                             "State: \(mpv.playbackState)",
                             "Video: \(mpv.videoWidth)x\(mpv.videoHeight) @ \(mpv.sourceFPS)fps",
+                            "Decoder: \(mpv.videoCodec) / \(mpv.hardwareDecoder)",
                             "Error: \(mpv.lastErrorMessage ?? "none")",
+                            "--- Self Check ---",
+                            coordinator.selfCheckReport,
                             "--- Logs ---"
                         ] + mpv.diagnosticLogs
                         UIPasteboard.general.string = summary.joined(separator: "\n")
@@ -1001,6 +1118,9 @@ struct DiagnosticLogSheet: View {
                         }
                     }
                 }
+            }
+            .onAppear {
+                coordinator.runRealDeviceSelfCheck()
             }
             .navigationTitle("播放诊断中心")
             .navigationBarTitleDisplayMode(.inline)

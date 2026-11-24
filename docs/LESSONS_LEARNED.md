@@ -1,6 +1,6 @@
 # GlassMPV 工程踩坑复盘与防复发门禁沉淀
 
-本文档系统记录 GlassMPV 从 `v1.0.0` 立项至 `v1.0.2` 云端 CI 出包与端内实播排查期间暴露出的 8 类典型工程问题，以及对应的根因修复与自动化防复发门禁。
+本文档系统记录 GlassMPV 从 `v1.0.0` 立项至 `v1.1.0` 开源底座重构与端内/云端实播验证期间暴露出的 9 类典型工程问题，以及对应的根因修复与自动化防复发门禁。
 
 ---
 
@@ -146,4 +146,25 @@
 - 在 [build-ios.yml](../.github/workflows/build-ios.yml) 中为 `xcodebuild test` 增加失败自动打印 `~/Library/Logs/DiagnosticReports/*GlassMPV*` 崩溃栈逻辑。
 
 ### 【防复发门禁】
-- [test_project_integrity.py](../tests/test_project_integrity.py) 强制断言 `MPVPlayerCore.swift` 必须定义顶层 `mpvWakeupCallback` 并通过函数引用传给 `mpv_set_wakeup_callback`，严禁出现 `mpv_set_wakeup_callback(handle, {` 内联闭包形式；同时校验本复盘文档维护 8 节编号。
+- [test_project_integrity.py](../tests/test_project_integrity.py) 历史曾以 `MPVPlayerCore.swift` 的顶层 `mpvWakeupCallback` 作为门禁基准，后续在 `v1.1.0` 已整体升级迁入 `LePips/MPVUI`（参见第 9 节）。
+
+---
+
+## 9. 手写 libmpv C 桥接/同步文件拷贝/光流无立即渲染标记的架构收口与 MPVUI 底座切换
+
+### 【现象】
+- 真机安装无签 IPA 后仍存在两类高频痛点：部分本地/相册视频导入易失败或触发卡顿，以及切换「ANE 光流核」后画面静止或黑屏且界面未明确报出补帧失败原因。
+
+### 【根因】
+1. **手写 C 桥接维护面过重**：自研 `MPVPlayerCore` 需自行维护 Metal 图层尺寸同步、EDR 跨线程读写、`wakeup` 线程隔离与生命周期排空，脆弱且与上游生态割裂。
+2. **本地与相册文件导入路径缺口**：缺少系统相册 `PhotosPicker` + `Transferable` 流式拷贝通道；`.fileImporter` 返回的 `Security-Scoped` 文件在主线程同步读写易受 FileProvider 权限与中文/空格/`#` 字符影响。
+3. **光流帧送显缺乏立即渲染标记与遥测**：`VTOpticalFlowEngine` 送入 `AVSampleBufferDisplayLayer` 的 `CMSampleBuffer` 未挂载 `kCMSampleAttachmentKey_DisplayImmediately`，且 `processor.process` 异常被静默吞掉，`spatial2x` 模式下原帧未缩放导致尺寸跳变。
+
+### 【修复】
+- 切换成熟开源 Swift 6 播放器底座 **`LePips/MPVUI (0.11.0)`**：以 `MPVPlayer` + `MPVVideoPlayer` (`videoOutput: .metal`) 承载底图渲染与事件/诊断流，继续透传 `change-list glsl-shaders`（58 个着色器）与 `display-fps-override=120`。
+- 新增 **`LocalMediaImporter`** 与 **`MovieFileTransferable`**：引入界面层 `PhotosPicker` 流式拷贝，将 `NSFileCoordinator` 与 `startAccessingSecurityScopedResource()` 迁入后台异步执行并清理文件名非法字符。
+- 加固 **`VTOpticalFlowEngine`**：为输出帧挂载 `kCMSampleAttachmentKey_DisplayImmediately`，`spatial2x` 下通过 `VTPixelTransferSession` 统一分辨率，并暴露 `interpolatedFrameCount`、`failedInterpolationCount` 与 `lastInterpolationError`；诊断中心同步上线「一键真机 5 项体检」台。
+
+### 【防复发门禁】
+- [test_project_integrity.py](../tests/test_project_integrity.py) 强制校验 `project.yml` 锁定 `LePips/MPVUI (0.11.0)`、`LocalMediaImporter.swift` 具备后台 `NSFileCoordinator` 与 `Security-Scoped` 处理、`VTOpticalFlowEngine.swift` 保留 `kCMSampleAttachmentKey_DisplayImmediately` 与失败计数器、`LiquidGlassPlayerView.swift` 挂载 `PhotosPicker` 与 `runRealDeviceSelfCheck()`，以及本复盘文档维护 9 节编号。
+- `GlassMPVTests` 新增 `testLocalMediaImporterSanitizationAndCopy`、`testOpticalFlowSampleBufferDisplayImmediately` 与窗口宿主下的 `testMPVUIControllerPlaybackWithWindowHost`。

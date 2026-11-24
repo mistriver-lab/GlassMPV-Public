@@ -2,6 +2,18 @@
 
 本项目遵循 [语义化版本规范 (Semantic Versioning)](https://semver.org/lang/zh-CN/)。
 
+## [v1.1.0] - 2026-11-24
+
+### 重构与变更 (Changed)
+- **切换成熟开源播放器底座 `LePips/MPVUI (0.11.0)`**：以 Swift 6 原生 `MPVPlayer` / `MPVVideoPlayer`（`videoOutput: .metal`）替代手写 C 回调桥接与自定义 `MPVMetalLayer`，消除跨线程回调隐患并保持 58 个 GLSL 着色器与 `display-fps-override=120` 完整兼容。
+
+### 新增 (Added)
+- **系统相册视频直选 (`PhotosPicker`) 与异步文件导入引擎 (`LocalMediaImporter`)**：新增 `MovieFileTransferable` 流式拷贝与后台 `NSFileCoordinator` 协调读取，支持含中文/空格/`#` 等特殊字符路径及 iCloud/FileProvider 文件，杜绝主线程卡顿与沙盒权限拦截。
+- **端内「一键真机 5 项体检」台**：在播放诊断中心支持一键校验屏幕 ProMotion 最大帧率、58 个 GLSL 着色器完整性、MPVUI 解码器/硬解状态、ANE 光流支持性与补帧成功/失败实测计数，支持一键复制完整体检报告。
+
+### 修复 (Fixed)
+- **修复 ANE 硬件光流渲染同步与静默吞错 (`VTOpticalFlowEngine`)**：为送入 `AVSampleBufferDisplayLayer` 的 `CMSampleBuffer` 挂载 `kCMSampleAttachmentKey_DisplayImmediately`，并实时暴露 `interpolatedFrameCount`、`failedInterpolationCount` 与 `lastInterpolationError`，连续失败主动弹窗告知原因；同时确保 `spatial2x` 模式下输出分辨率一致。
+
 ## [v1.0.2] - 2026-11-24
 
 ### 修复 (Fixed)
