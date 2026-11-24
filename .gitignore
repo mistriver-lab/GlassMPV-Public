@@ -6,3 +6,5 @@ Payload/
 *.ipa
 GlassMPV.xcodeproj/
 .DS_Store
+.agents/.snapshots/
+.agents/memory/
