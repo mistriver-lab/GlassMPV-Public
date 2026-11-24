@@ -411,11 +411,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                             } catch {
                                 localConsecutiveFailures += 1
                                 let errDesc = error.localizedDescription
+                                let shouldSurfaceError = (localSuccessCount == 0 && localConsecutiveFailures >= 5)
                                 Task { @MainActor [weak self] in
                                     guard let self else { return }
                                     self.failedInterpolationCount += 1
                                     self.lastInterpolationError = errDesc
-                                    if localSuccessCount == 0 && localConsecutiveFailures >= 5 && self.errorMessage == nil {
+                                    if shouldSurfaceError && self.errorMessage == nil {
                                         self.errorMessage = "ANE 光流补帧连续失败：\(errDesc)"
                                     }
                                 }
