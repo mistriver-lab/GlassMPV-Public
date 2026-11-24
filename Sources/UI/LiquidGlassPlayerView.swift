@@ -168,6 +168,7 @@ struct LiquidGlassPlayerView: View {
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
     @State private var showEnhancementSheet: Bool = false
+    @State private var showChangelogSheet: Bool = false
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
 
@@ -236,6 +237,11 @@ struct LiquidGlassPlayerView: View {
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.ultraThinMaterial)
         }
+        .sheet(isPresented: $showChangelogSheet) {
+            ReleaseNotesSheet()
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.ultraThinMaterial)
+        }
     }
 
     // MARK: - Welcome Empty State
@@ -288,6 +294,18 @@ struct LiquidGlassPlayerView: View {
                         .font(.footnote.weight(.medium))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
+
+                Button {
+                    showChangelogSheet = true
+                } label: {
+                    Label("GlassMPV \(AppReleaseInfo.displayVersion) · 更新日志", systemImage: "doc.text")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.regular.interactive(), in: .capsule)
@@ -628,6 +646,22 @@ struct EnhancementControlSheet: View {
                         }
                     }
                 }
+
+                Section("关于与更新日志") {
+                    LabeledContent("当前版本", value: AppReleaseInfo.displayVersion)
+                    ForEach(AppReleaseInfo.changelog) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(entry.version) · \(entry.date)")
+                                .font(.caption.weight(.semibold))
+                            ForEach(entry.highlights, id: \.self) { item in
+                                Text("• \(item)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
             }
             .navigationTitle("超分与补帧控制台")
             .navigationBarTitleDisplayMode(.inline)
@@ -655,6 +689,36 @@ struct EnhancementControlSheet: View {
             return "display-resample + tscale=oversample，与全部GLSL超分共存"
         case .vtOpticalFlow2x:
             return "Apple VideoToolbox 神经网络真光流插帧（仅 MP4/MOV）"
+        }
+    }
+}
+
+struct ReleaseNotesSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("当前版本") {
+                    LabeledContent("GlassMPV", value: AppReleaseInfo.displayVersion)
+                }
+
+                ForEach(AppReleaseInfo.changelog) { entry in
+                    Section("\(entry.version) · \(entry.date)") {
+                        ForEach(entry.highlights, id: \.self) { item in
+                            Label(item, systemImage: "sparkles")
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("版本与更新日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
         }
     }
 }

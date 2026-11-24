@@ -1,0 +1,24 @@
+# 更新日志 (Changelog)
+
+本项目遵循 [语义化版本规范 (Semantic Versioning)](https://semver.org/lang/zh-CN/)。
+
+## [v1.0.1] - 2026-11-24
+
+### 新增 (Added)
+- 新增 iOS 26 Liquid Glass 晶透质感应用图标（`Assets.xcassets/AppIcon` 1024×1024）。
+- 建立仓库级 `VERSION` 与 `CHANGELOG.md` 版本管理体系，CI 构建自动按 `github.run_number` 递增 `CFBundleVersion` 并输出带版本号的 IPA 产物（`GlassMPV-v{VERSION}-b{BUILD}-unsigned.ipa`）。
+- 应用首页与控制台新增当前版本号展示及可点击的「更新日志」弹窗面板。
+
+### 修复 (Fixed)
+- 修复启动闪退问题：延迟挂载视频表面至实际打开视频、确保图层接入 `UIWindow` 且尺寸有效后才初始化 `mpv`，并补齐 `setlocale(LC_NUMERIC, "C")` 与前后台切换生命周期管理。
+- 修复 `project.yml` 导致 `Sources/Info.plist` 被覆盖及 58 个 GLSL 着色器未打入 IPA 的构建配置缺陷。
+- 在 GitHub Actions 打包阶段核验静态链接并剔除 26 个无用的 `MinimumOSVersion: 100.0` 占位 `.framework`。
+- 将 `VTLowLatencyFrameInterpolationConfiguration.isSupported` 探测延后至实际进入 ANE 光流核加载时执行。
+
+## [v1.0.0] - 2026-11-23
+
+### 新增 (Added)
+- 初始化 iOS 26+ 双核播放器架构：
+  - **MPV 超分核**：基于 `MPVKit` (`libmpv` + `MoltenVK` + `gpu-next` + `VideoToolbox`)，内置 58 个 Anime4K / FSRCNNX / AMD FSR / KrigBilateral / NNEDI3 / RAVU GLSL 着色器与 120Hz 时域平滑插帧。
+  - **ANE 光流核**：基于 Apple `VideoToolbox` `VTFrameProcessor` 硬件光流真补帧 (2×) 与 ANE 2× 硬件超分。
+- 构建 iOS 26 Liquid Glass 悬浮控制台、本地文件导入、网络串流与横竖屏自适应界面。

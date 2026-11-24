@@ -39,15 +39,37 @@ def test_project_yml_and_github_workflow_valid():
     assert target_cfg["settings"]["base"]["SWIFT_VERSION"] == "6.0"
     assert target_cfg["settings"]["base"]["INFOPLIST_FILE"] == "Sources/Info.plist"
     assert target_cfg["settings"]["base"]["GENERATE_INFOPLIST_FILE"] in (False, "NO")
+    assert target_cfg["settings"]["base"]["ASSETCATALOG_COMPILER_APPICON_NAME"] == "AppIcon"
     shader_sources = [s for s in target_cfg["sources"] if isinstance(s, dict) and s.get("path") == "Resources/Shaders"]
     assert len(shader_sources) == 1 and shader_sources[0].get("buildPhase") == "resources"
+    assert any(isinstance(s, dict) and s.get("path") == "Resources/Assets.xcassets" for s in target_cfg["sources"])
 
     workflow_raw = (ROOT / ".github" / "workflows" / "build-ios.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(workflow_raw)
     steps_text = "\n".join(str(step.get("run", "")) + str(step.get("with", "")) for step in workflow["jobs"]["build-ios"]["steps"])
     assert "xcodegen generate" in steps_text
-    assert "GlassMPV-unsigned.ipa" in steps_text
+    assert "-unsigned.ipa" in steps_text
+    assert "Assets.car" in steps_text
+    assert "CFBundleIcons" in steps_text
     assert "SYMMROOT" not in workflow_raw
+
+
+def test_version_changelog_and_app_icon():
+    from PIL import Image
+
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    assert version, "VERSION file must not be empty"
+    project_cfg = yaml.safe_load((ROOT / "project.yml").read_text(encoding="utf-8"))
+    assert project_cfg["targets"]["GlassMPV"]["settings"]["base"]["MARKETING_VERSION"] == version
+
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"[v{version}]" in changelog
+
+    icon_path = ROOT / "Resources" / "Assets.xcassets" / "AppIcon.appiconset" / "AppIcon-1024.png"
+    assert icon_path.is_file(), f"Missing AppIcon: {icon_path}"
+    with Image.open(icon_path) as img:
+        assert img.size == (1024, 1024)
+        assert img.mode == "RGB"
 
 
 def test_info_plist_valid_and_120hz_enabled():

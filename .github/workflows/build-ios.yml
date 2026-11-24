@@ -28,11 +28,14 @@ jobs:
 
       - name: Build unsigned Release app
         run: |
+          APP_VERSION=$(tr -d ' \r\n' < VERSION)
           xcodebuild \
             -project GlassMPV.xcodeproj \
             -scheme GlassMPV \
             -configuration Release \
             -destination "generic/platform=iOS" \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -41,6 +44,7 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
+          APP_VERSION=$(tr -d ' \r\n' < VERSION)
           mkdir -p Payload
           cp -R build/Release-iphoneos/GlassMPV.app Payload/
           if otool -L Payload/GlassMPV.app/GlassMPV | grep -qE '@rpath|@executable_path/Frameworks'; then
@@ -50,13 +54,15 @@ jobs:
           fi
           test -d Payload/GlassMPV.app/Shaders
           test "$(ls -1 Payload/GlassMPV.app/Shaders/*.glsl | wc -l | tr -d ' ')" -eq 58
+          test -f Payload/GlassMPV.app/Assets.car
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q CADisableMinimumFrameDurationOnPhone
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q UILaunchScreen
-          zip -qry GlassMPV-unsigned.ipa Payload
+          plutil -p Payload/GlassMPV.app/Info.plist | grep -q CFBundleIcons
+          zip -qry "GlassMPV-v${APP_VERSION}-b${{ github.run_number }}-unsigned.ipa" Payload
 
       - name: Upload GlassMPV-unsigned.ipa
         uses: actions/upload-artifact@v4
         with:
           name: GlassMPV-unsigned-ipa
-          path: GlassMPV-unsigned.ipa
+          path: GlassMPV-v*-unsigned.ipa
           retention-days: 30
