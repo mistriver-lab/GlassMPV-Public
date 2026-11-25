@@ -23,4 +23,4 @@ trigger: always_on
    - 仅 `iphoneos` 真机 SDK 提供的 `VideoToolbox` 光流 API 必须使用 `#if !targetEnvironment(simulator)` 隔离，确保模拟器 `XCTest` 宿主可编可测。
 4. **本地与云端双重验证铁律**：
    - 每次提交代码前必须在本地执行 `pytest tests/test_project_integrity.py -v` 并全部通过。
-   - 每次代码改动推送 `main` 后须等待 CI `xcodebuild test`（`GlassMPVTests`）绿灯通过并校验 IPA 产物。
+   - 每次代码改动推送 `main` 后须等待 CI `xcodebuild test`（`GlassMPVTests`）绿灯通过并校验 IPA 产物，且默认自动执行 `gh run download <run_id> -n GlassMPV-unsigned-ipa -D dist` 将最新无签 IPA 下载至本地 `dist/` 目录并向用户输出可点击本地文件路径。

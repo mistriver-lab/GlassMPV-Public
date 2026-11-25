@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import MPVUI
 import SwiftUI
+import UIKit
 
 private final class MPVTaskBag: @unchecked Sendable {
     private let lock = NSLock()
@@ -57,6 +58,7 @@ final class MPVPlayerController: ObservableObject {
     @Published var droppedFrames: Int64 = 0
     @Published var freshRenderPassCount: Int = 0
     @Published var activeShaderCount: Int = 0
+    @Published var isSuperResolutionGatedBy4K: Bool = false
     @Published var statusMessage: String = ""
     @Published var playbackState: String = "待机"
     @Published var lastErrorMessage: String?
@@ -77,6 +79,7 @@ final class MPVPlayerController: ObservableObject {
     private var currentInterpolation: InterpolationMode = .off
     private var currentSpeed: Double = 1.0
     private var lastAppliedReadyGeneration: UInt64?
+    private var last4KGateLoggedSize: (Int, Int)?
 
     init(configuration: MPVPlayerConfiguration = MPVPlayerController.defaultConfiguration) {
         self.player = MPVPlayer(configuration: configuration)
@@ -115,6 +118,8 @@ final class MPVPlayerController: ObservableObject {
         isHDRActive = false
         droppedFrames = 0
         freshRenderPassCount = 0
+        isSuperResolutionGatedBy4K = false
+        last4KGateLoggedSize = nil
         lastAppliedReadyGeneration = nil
         isInitialized = true
         playbackState = "正在加载媒体..."
@@ -151,6 +156,21 @@ final class MPVPlayerController: ObservableObject {
         currentPreset = preset
         currentExtras = extras
 
+        if SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight) {
+            isSuperResolutionGatedBy4K = true
+            activeShaderCount = 0
+            player.executeCommand("change-list", arguments: ["glsl-shaders", "clr", ""])
+            let currentSize = (videoWidth, videoHeight)
+            if last4KGateLoggedSize.map({ $0 != currentSize }) ?? true {
+                last4KGateLoggedSize = currentSize
+                let reason = SuperResolutionPolicy.disabledReason(width: videoWidth, height: videoHeight) ?? "片源已达 4K，自动禁用超分"
+                appendLog("[shader] \(reason)")
+            }
+            return
+        }
+
+        isSuperResolutionGatedBy4K = false
+        last4KGateLoggedSize = nil
         let paths = SingleShaderOption.resolvedShaderPaths(preset: preset, extras: extras)
         activeShaderCount = paths.count
 
@@ -170,13 +190,19 @@ final class MPVPlayerController: ObservableObject {
 
         switch mode {
         case .mpvSmooth120Hz:
+            let screenMaxFPS = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .first?.screen.maximumFramesPerSecond ?? 120
+            let targetDisplayFPS = max(screenMaxFPS, 60)
             player.setProperty("video-sync", to: "display-resample")
             player.setProperty("interpolation", to: "yes")
-            player.setProperty("tscale", to: "oversample")
-            player.setProperty("display-fps-override", to: "120")
-            appendLog("[interp] 开启 120Hz 时域平滑 (display-resample + display-fps-override=120)")
+            player.setProperty("interpolation-threshold", to: "-1")
+            player.setProperty("tscale", to: "linear")
+            player.setProperty("display-fps-override", to: "\(targetDisplayFPS)")
+            appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑 (display-resample + interpolation-threshold=-1 + tscale=linear + display-fps-override=\(targetDisplayFPS))")
         case .off, .vtOpticalFlow2x:
             player.setProperty("interpolation", to: "no")
+            player.setProperty("interpolation-threshold", to: "0.01")
             player.setProperty("video-sync", to: "audio")
             player.setProperty("display-fps-override", to: "0")
             appendLog("[interp] 关闭时域插值 (video-sync=audio)")
@@ -223,6 +249,11 @@ final class MPVPlayerController: ObservableObject {
 
         if let dispFPS = diag.estimatedDisplayFramesPerSecond ?? diag.nominalDisplayFramesPerSecond, dispFPS > 0 {
             displaySyncFPS = dispFPS
+        } else if currentInterpolation == .mpvSmooth120Hz && displaySyncFPS <= 0 {
+            let screenMaxFPS = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .first?.screen.maximumFramesPerSecond ?? 120
+            displaySyncFPS = Double(max(screenMaxFPS, 60))
         }
         freshRenderPassCount = diag.freshRenderPasses?.count ?? 0
         droppedFrames = (diag.decoderDroppedFrames ?? 0) + (diag.outputDroppedFrames ?? 0)
@@ -251,6 +282,34 @@ final class MPVPlayerController: ObservableObject {
                 hardwareDecoder = hw
             }
         }
+    }
+
+    func stopPlayback() {
+        player.stop()
+        isPaused = true
+        currentTime = 0
+        duration = 0
+        sourceFPS = 0
+        outputFPS = 0
+        displaySyncFPS = 0
+        videoWidth = 0
+        videoHeight = 0
+        videoCodec = ""
+        hardwareDecoder = ""
+        decodedPixelFormat = ""
+        bitDepthLabel = "--"
+        hdrLabel = "SDR"
+        isHDRActive = false
+        droppedFrames = 0
+        freshRenderPassCount = 0
+        activeShaderCount = 0
+        isSuperResolutionGatedBy4K = false
+        last4KGateLoggedSize = nil
+        lastAppliedReadyGeneration = nil
+        lastErrorMessage = nil
+        statusMessage = ""
+        playbackState = "待机"
+        appendLog("[lifecycle] 已停止播放并返回主界面")
     }
 
     func shutdown() {
@@ -362,6 +421,10 @@ final class MPVPlayerController: ObservableObject {
         if let dims = info.presentationDimensions ?? info.dimensions {
             videoWidth = dims.width
             videoHeight = dims.height
+            let is4K = SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight)
+            if is4K != isSuperResolutionGatedBy4K || (is4K && activeShaderCount > 0) {
+                applyShaders(preset: currentPreset, extras: currentExtras)
+            }
         }
         if let fps = info.framesPerSecond, fps > 0 {
             sourceFPS = fps

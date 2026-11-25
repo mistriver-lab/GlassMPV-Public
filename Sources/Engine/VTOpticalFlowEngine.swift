@@ -48,6 +48,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var interpolatedFrameCount: Int = 0
     @Published @MainActor var failedInterpolationCount: Int = 0
     @Published @MainActor var lastInterpolationError: String?
+    @Published @MainActor var diagnosticLogs: [String] = []
+
+    @MainActor
+    private static let logTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     @MainActor
     var capabilityDescription: String {
@@ -72,6 +80,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var currentURL: URL?
     private var sessionToken = UUID()
     private var playbackSpeed: Float = 1.0
+    @MainActor private var isPipelineReadyToPlay: Bool = false
     private var presentedTimestamps: [CFTimeInterval] = []
     private var lastFPSPublishTimestamp: CFTimeInterval = 0
 
@@ -89,15 +98,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
         lastInterpolationError = nil
+        appendLog("[ane] 请求加载光流核: \(url.lastPathComponent) (请求空间2×=\(spatial2x))")
 
 #if targetEnvironment(simulator)
         isHardwareSupported = false
+        appendLog("[ane] Simulator 环境不支持 VideoToolbox ANE 硬件光流")
         errorMessage = "iOS 模拟器不支持 VideoToolbox ANE 硬件光流，请切换回「MPV 超分核」。"
         return
 #else
         let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
         isHardwareSupported = supported
         guard supported else {
+            appendLog("[ane] 当前设备不支持 VTLowLatencyFrameInterpolation")
             errorMessage = "当前设备不支持 VTLowLatencyFrameInterpolation，请切换回「MPV 超分核」。"
             return
         }
@@ -107,7 +119,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         let item = AVPlayerItem(url: url)
         let player = AVPlayer(playerItem: item)
+        player.rate = 0
         self.audioPlayer = player
+        self.isPaused = false
 
         let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
@@ -133,6 +147,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                 let tracks = try await asset.loadTracks(withMediaType: .video)
                 guard let videoTrack = tracks.first else {
+                    self.isPaused = true
+                    self.appendLog("[ane] 未发现视频轨道（仅支持 MP4/MOV 容器）")
                     self.errorMessage = "光流核仅支持原生 MP4/MOV 容器；MKV/FLV 等封装请切换回「MPV 超分核」。"
                     return
                 }
@@ -146,6 +162,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let naturalSize = try await videoTrack.load(.naturalSize)
                 let formatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
                 let trackMetrics = Self.extractTrackMetrics(from: formatDescriptions.first, naturalSize: naturalSize)
+                let is4K = SuperResolutionPolicy.isAlready4K(width: trackMetrics.width, height: trackMetrics.height)
+                let effectiveSpatial2x = spatial2x && !is4K
+                if spatial2x && is4K {
+                    self.appendLog("[ane] 片源已达 4K（\(trackMetrics.width)×\(trackMetrics.height)），自动禁用 ANE 2× 空间超分，仅保留光流补帧")
+                }
+
                 let srcFps = nominalRate > 0 ? Double(nominalRate) : 24.0
                 self.sourceFPS = srcFps
                 self.interpolatedFPS = srcFps * 2.0
@@ -155,19 +177,19 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.bitDepthLabel = trackMetrics.bitDepth
                 self.hdrLabel = trackMetrics.hdrTag
                 self.isHDRActive = false
+                self.enableSpatial2xUpscale = effectiveSpatial2x
 
                 self.startPipeline(
                     url: url,
                     width: Int(abs(naturalSize.width)),
                     height: Int(abs(naturalSize.height)),
                     startSeconds: 0,
-                    spatial2x: spatial2x,
+                    spatial2x: effectiveSpatial2x,
                     token: token
                 )
-
-                player.rate = self.playbackSpeed
-                self.isPaused = false
             } catch {
+                self.isPaused = true
+                self.appendLog("[ane][error] 加载轨道信息失败: \(error.localizedDescription)")
                 self.errorMessage = "光流核加载失败（\(error.localizedDescription)），建议切换回「MPV 超分核」。"
             }
         }
@@ -178,8 +200,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     func togglePlayPause() {
         guard let audioPlayer else { return }
         if isPaused {
-            audioPlayer.rate = playbackSpeed
             isPaused = false
+            if isPipelineReadyToPlay {
+                audioPlayer.rate = playbackSpeed
+            }
         } else {
             audioPlayer.pause()
             isPaused = true
@@ -195,7 +219,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor
     func setSpeed(_ speed: Double) {
         playbackSpeed = Float(speed)
-        if !isPaused {
+        if !isPaused && isPipelineReadyToPlay {
             audioPlayer?.rate = playbackSpeed
         }
     }
@@ -264,7 +288,24 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
         lastInterpolationError = nil
+        isPipelineReadyToPlay = false
         isPaused = true
+        appendLog("[ane] 光流核已停止")
+    }
+
+    @MainActor
+    func appendLog(_ line: String) {
+        let stamp = Self.logTimeFormatter.string(from: Date())
+        diagnosticLogs.append("[\(stamp)] \(line)")
+        if diagnosticLogs.count > 120 {
+            diagnosticLogs.removeFirst(diagnosticLogs.count - 120)
+        }
+    }
+
+    private func logAsync(_ line: String) {
+        Task { @MainActor [weak self] in
+            self?.appendLog(line)
+        }
     }
 
     private func clearBufferedFrames() {
@@ -317,33 +358,33 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            let configuration: VTLowLatencyFrameInterpolationConfiguration
-            if spatial2x,
-               let scaledConfig = VTLowLatencyFrameInterpolationConfiguration(
-                   frameWidth: width,
-                   frameHeight: height,
-                   spatialScaleFactor: 2
-               ) {
-                configuration = scaledConfig
-            } else if let frcConfig = VTLowLatencyFrameInterpolationConfiguration(
-                frameWidth: width,
-                frameHeight: height,
-                numberOfInterpolatedFrames: 1
-            ) {
-                configuration = frcConfig
-            } else {
+            var activeWidth = width
+            var activeHeight = height
+            var activeSpatial2x = spatial2x && !SuperResolutionPolicy.isAlready4K(width: width, height: height)
+
+            guard let initialSetup = createProcessorConfiguration(
+                width: activeWidth,
+                height: activeHeight,
+                requestedSpatial2x: activeSpatial2x
+            ) else {
+                logAsync("[ane] 无法初始化 VideoToolbox 光流配置（\(activeWidth)×\(activeHeight)）")
                 Task { @MainActor [weak self] in
-                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(width)x\(height)）。"
+                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(activeWidth)x\(activeHeight)）。"
                 }
                 return
             }
 
-            let processor = VTFrameProcessor()
+            var configuration = initialSetup.configuration
+            activeSpatial2x = initialSetup.effectiveSpatial2x
+
+            var processor = VTFrameProcessor()
             try processor.startSession(configuration: configuration)
             defer { processor.endSession() }
 
             let pixelFormat = resolveSourcePixelFormat(from: configuration)
             let resolvedPixFmtString = Self.fourCCString(pixelFormat)
+            logAsync("[ane] 光流会话启动: \(activeWidth)×\(activeHeight), pixFmt=\(resolvedPixFmtString), spatial2x=\(activeSpatial2x)")
+
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if self.bitDepthLabel == "--" {
@@ -370,6 +411,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
             trackOutput.alwaysCopiesSampleData = false
             guard reader.canAdd(trackOutput) else {
+                logAsync("[ane] 无法添加 AVAssetReaderTrackOutput，建议切换 MPV 超分核")
                 Task { @MainActor [weak self] in
                     self?.errorMessage = "无法读取视频轨道，建议切换「MPV 超分核」。"
                 }
@@ -378,15 +420,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             reader.add(trackOutput)
             reader.startReading()
 
-            let destPool = try makeDestinationPool(
+            var destPool = try makeDestinationPool(
                 configuration: configuration,
-                fallbackWidth: spatial2x ? width * 2 : width,
-                fallbackHeight: spatial2x ? height * 2 : height,
+                fallbackWidth: activeSpatial2x ? activeWidth * 2 : activeWidth,
+                fallbackHeight: activeSpatial2x ? activeHeight * 2 : activeHeight,
                 fallbackFormat: pixelFormat
             )
 
             var transferSession: VTPixelTransferSession?
-            if spatial2x {
+            if activeSpatial2x {
                 VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferSession)
             }
             defer {
@@ -399,6 +441,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             var previousPTS: CMTime = .invalid
             var localSuccessCount = 0
             var localConsecutiveFailures = 0
+            var didCheckActualDimensions = false
+            var didStartAudioClock = false
 
             while reader.status == .reading {
                 if !isTokenValid(token) {
@@ -420,56 +464,123 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
                 let currentPTS = CMSampleBufferGetPresentationTimeStamp(sample)
 
-                if let prevBuf = previousBuffer,
-                   previousPTS.isValid,
-                   currentPTS > previousPTS,
-                   let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: previousPTS),
-                   let currFrame = VTFrameProcessorFrame(buffer: currentBuffer, presentationTimeStamp: currentPTS) {
-                    var destBufOpt: CVPixelBuffer?
-                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, destPool, &destBufOpt)
-
-                    if let destBuf = destBufOpt {
-                        let midSeconds = (previousPTS.seconds + currentPTS.seconds) * 0.5
-                        let midPTS = CMTime(seconds: midSeconds, preferredTimescale: 600)
-                        if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS),
-                           let params = VTLowLatencyFrameInterpolationParameters(
-                               sourceFrame: currFrame,
-                               previousFrame: prevFrame,
-                               interpolationPhase: [0.5],
-                               destinationFrames: [destFrame]
-                           ) {
-                            do {
-                                _ = try await processor.process(parameters: params)
-                                enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
-                                localSuccessCount += 1
-                                localConsecutiveFailures = 0
-                                Task { @MainActor [weak self] in
-                                    self?.interpolatedFrameCount += 1
-                                }
-                            } catch {
-                                localConsecutiveFailures += 1
-                                let errDesc = error.localizedDescription
-                                let shouldSurfaceError = (localSuccessCount == 0 && localConsecutiveFailures >= 5)
-                                Task { @MainActor [weak self] in
-                                    guard let self else { return }
-                                    self.failedInterpolationCount += 1
-                                    self.lastInterpolationError = errDesc
-                                    if shouldSurfaceError && self.errorMessage == nil {
-                                        self.errorMessage = "ANE 光流补帧连续失败：\(errDesc)"
-                                    }
-                                }
+                if !didCheckActualDimensions {
+                    didCheckActualDimensions = true
+                    let actualW = CVPixelBufferGetWidth(currentBuffer)
+                    let actualH = CVPixelBufferGetHeight(currentBuffer)
+                    if actualW >= 2, actualH >= 2, (actualW != activeWidth || actualH != activeHeight) {
+                        logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(activeWidth)×\(activeHeight) 不一致，重建光流会话")
+                        let rebuiltSpatial2x = activeSpatial2x && !SuperResolutionPolicy.isAlready4K(width: actualW, height: actualH)
+                        if let rebuilt = createProcessorConfiguration(
+                            width: actualW,
+                            height: actualH,
+                            requestedSpatial2x: rebuiltSpatial2x
+                        ) {
+                            processor.endSession()
+                            let nextProcessor = VTFrameProcessor()
+                            try nextProcessor.startSession(configuration: rebuilt.configuration)
+                            processor = nextProcessor
+                            configuration = rebuilt.configuration
+                            activeWidth = actualW
+                            activeHeight = actualH
+                            activeSpatial2x = rebuilt.effectiveSpatial2x
+                            destPool = try makeDestinationPool(
+                                configuration: configuration,
+                                fallbackWidth: activeSpatial2x ? activeWidth * 2 : activeWidth,
+                                fallbackHeight: activeSpatial2x ? activeHeight * 2 : activeHeight,
+                                fallbackFormat: pixelFormat
+                            )
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                self.videoWidth = actualW
+                                self.videoHeight = actualH
+                                self.enableSpatial2xUpscale = rebuilt.effectiveSpatial2x
                             }
                         }
                     }
                 }
 
-                let outputBuffer = scaleIfNeeded(currentBuffer, spatial2x: spatial2x, transferSession: transferSession, pool: destPool)
+                if let prevBuf = previousBuffer,
+                   previousPTS.isValid,
+                   currentPTS > previousPTS {
+                    if let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: previousPTS),
+                       let currFrame = VTFrameProcessorFrame(buffer: currentBuffer, presentationTimeStamp: currentPTS) {
+                        var destBufOpt: CVPixelBuffer?
+                        let poolStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, destPool, &destBufOpt)
+
+                        if poolStatus == kCVReturnSuccess, let destBuf = destBufOpt {
+                            let midSeconds = (previousPTS.seconds + currentPTS.seconds) * 0.5
+                            let midPTS = CMTime(seconds: midSeconds, preferredTimescale: 600)
+                            if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS),
+                               let params = VTLowLatencyFrameInterpolationParameters(
+                                   sourceFrame: currFrame,
+                                   previousFrame: prevFrame,
+                                   interpolationPhase: [0.5],
+                                   destinationFrames: [destFrame]
+                               ) {
+                                do {
+                                    _ = try await processor.process(parameters: params)
+                                    enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
+                                    localSuccessCount += 1
+                                    localConsecutiveFailures = 0
+                                    if localSuccessCount == 1 {
+                                        logAsync("[ane] 首帧光流补帧成功（\(activeWidth)×\(activeHeight)）")
+                                    }
+                                    Task { @MainActor [weak self] in
+                                        self?.interpolatedFrameCount += 1
+                                    }
+                                } catch {
+                                    localConsecutiveFailures += 1
+                                    recordInterpolationFailure(
+                                        "process 异常: \(error.localizedDescription)",
+                                        consecutiveFailures: localConsecutiveFailures,
+                                        totalSuccesses: localSuccessCount
+                                    )
+                                }
+                            } else {
+                                localConsecutiveFailures += 1
+                                recordInterpolationFailure(
+                                    "VTLowLatencyFrameInterpolationParameters/destFrame 初始化返回 nil",
+                                    consecutiveFailures: localConsecutiveFailures,
+                                    totalSuccesses: localSuccessCount
+                                )
+                            }
+                        } else {
+                            localConsecutiveFailures += 1
+                            recordInterpolationFailure(
+                                "CVPixelBufferPoolCreatePixelBuffer 失败 (\(poolStatus))",
+                                consecutiveFailures: localConsecutiveFailures,
+                                totalSuccesses: localSuccessCount
+                            )
+                        }
+                    } else {
+                        localConsecutiveFailures += 1
+                        recordInterpolationFailure(
+                            "VTFrameProcessorFrame(prev/curr) 初始化返回 nil",
+                            consecutiveFailures: localConsecutiveFailures,
+                            totalSuccesses: localSuccessCount
+                        )
+                    }
+                }
+
+                let outputBuffer = scaleIfNeeded(currentBuffer, spatial2x: activeSpatial2x, transferSession: transferSession, pool: destPool)
                 enqueueDecodedFrame(pts: currentPTS.seconds, buffer: outputBuffer)
+                if !didStartAudioClock {
+                    didStartAudioClock = true
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isTokenValid(token), let audioPlayer = self.audioPlayer else { return }
+                        self.isPipelineReadyToPlay = true
+                        if !self.isPaused && audioPlayer.rate == 0 {
+                            audioPlayer.rate = self.playbackSpeed
+                        }
+                    }
+                }
                 previousBuffer = currentBuffer
                 previousPTS = currentPTS
             }
         } catch {
             let desc = error.localizedDescription
+            logAsync("[ane][error] 光流插帧运行异常：\(desc)")
             Task { @MainActor [weak self] in
                 self?.errorMessage = "光流插帧运行异常：\(desc)"
             }
@@ -556,6 +667,49 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
 #if !targetEnvironment(simulator)
+    private func createProcessorConfiguration(
+        width: Int,
+        height: Int,
+        requestedSpatial2x: Bool
+    ) -> (configuration: VTLowLatencyFrameInterpolationConfiguration, effectiveSpatial2x: Bool)? {
+        if requestedSpatial2x {
+            if let scaledConfig = VTLowLatencyFrameInterpolationConfiguration(
+                frameWidth: width,
+                frameHeight: height,
+                spatialScaleFactor: 2
+            ) {
+                return (scaledConfig, true)
+            }
+            logAsync("[ane] spatialScaleFactor=2 初始化失败（\(width)×\(height)），自动降级为仅 2× 光流补帧")
+            Task { @MainActor [weak self] in
+                self?.enableSpatial2xUpscale = false
+            }
+        }
+        if let frcConfig = VTLowLatencyFrameInterpolationConfiguration(
+            frameWidth: width,
+            frameHeight: height,
+            numberOfInterpolatedFrames: 1
+        ) {
+            return (frcConfig, false)
+        }
+        return nil
+    }
+
+    private func recordInterpolationFailure(_ reason: String, consecutiveFailures: Int, totalSuccesses: Int) {
+        let shouldSurfaceError = (totalSuccesses == 0 && consecutiveFailures >= 5)
+        if consecutiveFailures == 1 || shouldSurfaceError {
+            logAsync("[ane][warn] 补帧失败(#\(consecutiveFailures)): \(reason)")
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.failedInterpolationCount += 1
+            self.lastInterpolationError = reason
+            if shouldSurfaceError && self.errorMessage == nil {
+                self.errorMessage = "ANE 光流补帧连续失败：\(reason)"
+            }
+        }
+    }
+
     private func resolveSourcePixelFormat(from configuration: VTLowLatencyFrameInterpolationConfiguration) -> OSType {
         let raw = configuration.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String]
         if let num = raw as? NSNumber {
@@ -583,7 +737,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if attrs[kCVPixelBufferHeightKey as String] == nil {
             attrs[kCVPixelBufferHeightKey as String] = fallbackHeight
         }
-        if attrs[kCVPixelBufferPixelFormatTypeKey as String] == nil {
+        if let rawFmt = attrs[kCVPixelBufferPixelFormatTypeKey as String] {
+            if let arr = rawFmt as? [NSNumber] {
+                let fallbackNum = NSNumber(value: fallbackFormat)
+                if arr.contains(fallbackNum) {
+                    attrs[kCVPixelBufferPixelFormatTypeKey as String] = fallbackNum
+                } else if let first = arr.first {
+                    attrs[kCVPixelBufferPixelFormatTypeKey as String] = first
+                } else {
+                    attrs[kCVPixelBufferPixelFormatTypeKey as String] = fallbackFormat
+                }
+            }
+        } else {
             attrs[kCVPixelBufferPixelFormatTypeKey as String] = fallbackFormat
         }
         attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]

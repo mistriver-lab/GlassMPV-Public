@@ -11,6 +11,9 @@
 - **全面切换日期时间版本号体系 (CalVer)**：工作流与构建规则统一采用东八区 `YYYY.MM.DD` 作为 `MARKETING_VERSION`、`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION`，IPA 产物命名为 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。
 - **修复系统 VT ML (`systemML-fi`) `Processor is not initialized` 死循环阻塞**：移除每帧 `usleep(30000)` 同步死等重试，失败时立即销毁重建会话并自动降级 2×；连续失败 3 次触发 15 秒熔断直通冷却，消除 38–39ms/帧零产出白烧发热。
 - **优化 RIFE 多帧缩放与帧预算稳帧**：iOS 端在 `insertedCount >= 2` 时进一步降低推理长边并收紧过载保护阈值，新增多帧帧预算超时自动降倍（3× → 2×），防止 24fps 4K 视频因超预算阻塞把输入帧率拖垮至 ~13fps。
+- **修复 MPV 120Hz 时域平滑与 ANE 光流真补帧不生效**：`MPVPlayerController` 启用 `interpolation-threshold=-1` 与 `tscale=linear`（解除整数倍刷新率如 24fps@120Hz 不插帧限制）；`OpticalFlowPlayerController` 修复 `destinationPixelBufferAttributes` 数组像素格式、自动降级 `spatialScaleFactor=2` 失败回退、按首帧实测分辨率重建会话、延迟音频时钟启动至首帧入队并补全完整诊断日志采集。
+- **新增 4K 片源自动禁用超分门控 (`SuperResolutionPolicy`)**：片源长边 ≥ 3840 或短边 ≥ 2160 时自动禁用 MPV GLSL 超分与 ANE 2× 空间超分，UI 控制台与 HUD 同步提示门控原因。
+- **新增默认横屏、返回主界面与 `.txt` 诊断日志导出 (`OrientationController` + `DiagnosticLogExporter`)**：进入播放页默认横屏并支持手动旋转切换；支持一键返回主界面并恢复竖屏；诊断中心支持导出包含自检报告、MPV 日志与 ANE 光流日志的 `.txt` 文件并调起系统分享表单。
 
 ## [v1.1.0] - 2026-11-24
 

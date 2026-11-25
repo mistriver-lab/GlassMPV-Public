@@ -4,13 +4,13 @@
 ## 📌 项目基本元数据
 - **工程名称**：`ipa开发`（主线 `GlassMPV 2026.11.25` CalVer 已接入 | 衍生 `mistriver-lab/CinePlayer` `glassmpv-ios` 分支交付 `GlassMPV-2026.11.25-202611250952-unsigned.ipa`）
 - **当前阶段**：`GlassMPV 2026.11.25（日期时间版本号 + System VT ML 死循环熔断修复 + RIFE 多帧降边稳帧）已通过 5 轮模拟器冒烟与 Release 构建并交付 dist/`
-- **最后活跃时间**：`2026-11-25 10:28:57` | **最近安全快照**：`feb753a`（`mistriver-lab/CinePlayer` `glassmpv-ios` CI Run `45527540874`）
+- **最后活跃时间**：`2026-11-25 11:03:03` | **最近安全快照**：`feb753a`（`mistriver-lab/CinePlayer` `glassmpv-ios` CI Run `45527540874`）
 - **运行环境**：`Swift 6.0 / iOS 26+ / XcodeGen + GitHub Actions macOS CI (无本地 Xcode)`
 
 ---
 
 ## 🎯 当前核心推进焦点 (Active Focus)
-`修复GlassMPV本地视频选择器点击无反应`
+`续修GlassMPV的MPV与ANE光流补帧不生效、4K禁超分、默认横屏、返回主界面与日志导出(已完成OrientationController/DiagnosticLogExporter/SuperResolutionPolicy/AppDelegate,待改MPVPlayerCore/VTOpticalFlowEngine/LiquidGlassPlayerView/测试并出IPA)`
 - 最近交付闭环（更早的历史里程碑已归档至 [CHANGELOG.md](file:///C:/Users/21920/Desktop/ipa开发/CHANGELOG.md)）：
   * [x] **全面切换东八区日期时间版本号（CalVer）**：主仓（`VERSION`、`project.yml`、`.github/workflows/build-ios.yml`、`CHANGELOG.md`、`.agents/rules/GEMINI.md`）与 `CinePlayer-repo`（`project.pbxproj`、`.github/workflows/build-ios-ipa.yml`）统一以 `TZ=Asia/Shanghai` 的 `YYYY.MM.DD` 作为 `MARKETING_VERSION`、`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION`，IPA 命名 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。
   * [x] **修复 System VT ML (`systemML-fi`) `Processor is not initialized` 死循环与每帧 `usleep(30ms)` 阻塞**：移除 `SystemVideoEnhancementAdapter.swift` 同步 `usleep(30000)` 重试，错误后立即 `resetLLFISessionOnQueue()`、多帧初始化失败自动降级 2×，连续失败 3 次触发 15 秒直通冷却熔断。

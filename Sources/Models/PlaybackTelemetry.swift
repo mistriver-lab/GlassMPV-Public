@@ -183,3 +183,18 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
         return String(format: "%.1f", fps)
     }
 }
+
+/// 4K 超分自适应门控策略：片源已达 4K（3840×2160 或更高）时自动禁用超分，避免无效开销与过热降频
+enum SuperResolutionPolicy: Sendable {
+    static func isAlready4K(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        let longSide = max(width, height)
+        let shortSide = min(width, height)
+        return longSide >= 3840 || shortSide >= 2160
+    }
+
+    static func disabledReason(width: Int, height: Int) -> String? {
+        guard isAlready4K(width: width, height: height) else { return nil }
+        return "片源已达 4K（\(width)×\(height)），自动禁用超分以节省算力与功耗"
+    }
+}

@@ -29,7 +29,10 @@ enum AppReleaseInfo {
                 "修复 iOS 26 本地视频选择器点击无反应：切换原生 UIDocumentPickerViewController(asCopy: true) 并补齐相册权限描述与 Inbox 安全拷贝",
                 "新增 MPV 风格常驻关键信息 HUD：未开补帧也能实时显示编码、分辨率、源/输出帧率、色深/HDR、硬解状态、丢帧与设备温度",
                 "打通 MPVUI 真实解码帧率与光流核 1s 滑动窗口实测帧率遥测，支持一键显隐状态角标",
-                "全面切换东八区日期时间版本号体系（CalVer：YYYY.MM.DD / YYYYMMDDHHMM）"
+                "全面切换东八区日期时间版本号体系（CalVer：YYYY.MM.DD / YYYYMMDDHHMM）",
+                "修复 MPV 120Hz 时域平滑插帧（interpolation-threshold=-1 + tscale=linear）与 ANE 光流核会话参数/像素格式池/首帧时钟竞态，新增 ANE 诊断日志采集",
+                "新增 4K 片源自动禁用超分门控（SuperResolutionPolicy）：≥3840×2160 时自动屏蔽 GLSL 与 ANE 2× 超分",
+                "新增默认横屏起播与手动旋转切换（OrientationController）、一键返回主界面及一键导出 .txt 完整诊断日志"
             ]
         ),
         ReleaseNoteEntry(

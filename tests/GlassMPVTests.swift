@@ -258,4 +258,72 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertNotNil(photoUsage)
         XCTAssertFalse((photoUsage ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
+
+    func testSuperResolutionPolicy4KGating() {
+        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 3840, height: 2160))
+        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 2160, height: 3840))
+        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 4096, height: 2160))
+        XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 1920, height: 1080))
+        XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 2560, height: 1440))
+        XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 0, height: 0))
+
+        XCTAssertNotNil(SuperResolutionPolicy.disabledReason(width: 3840, height: 2160))
+        XCTAssertNil(SuperResolutionPolicy.disabledReason(width: 1920, height: 1080))
+    }
+
+    func testDiagnosticLogExporterBuildAndWrite() throws {
+        let report = DiagnosticLogExporter.buildReport(
+            version: "v2026.11.25",
+            engineName: "MPV 超分核",
+            playbackState: "播放中",
+            resolution: "1920×1080",
+            fpsSummary: "24.0 → 120.0 fps",
+            decoderSummary: "HEVC / 硬解 VT",
+            is4KGated: false,
+            selfCheck: "self-check-ok",
+            mpvLogs: ["[mpv] ready"],
+            opticalLogs: ["[ane] idle"]
+        )
+        XCTAssertTrue(report.contains("GlassMPV v2026.11.25"))
+        XCTAssertTrue(report.contains("4K Super-Res Gated: NO"))
+        XCTAssertTrue(report.contains("--- Self Check ---"))
+        XCTAssertTrue(report.contains("self-check-ok"))
+        XCTAssertTrue(report.contains("--- MPV Logs (1) ---"))
+        XCTAssertTrue(report.contains("[mpv] ready"))
+        XCTAssertTrue(report.contains("--- Optical Flow Logs (1) ---"))
+        XCTAssertTrue(report.contains("[ane] idle"))
+
+        let fileURL = try DiagnosticLogExporter.writeLogFile(content: report)
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
+        XCTAssertEqual(fileURL.pathExtension.lowercased(), "txt")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        let readBack = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertEqual(readBack, report)
+    }
+
+    @MainActor
+    func testOrientationControllerStateTransitions() {
+        let controller = OrientationController.shared
+        defer {
+            controller.returnToHomeOrientation()
+        }
+
+        controller.enterVideoLandscape()
+        XCTAssertEqual(controller.supportedMask, .landscape)
+        XCTAssertTrue(controller.isLandscapeLocked)
+
+        controller.toggleVideoOrientation()
+        XCTAssertEqual(controller.supportedMask, .portrait)
+        XCTAssertFalse(controller.isLandscapeLocked)
+
+        controller.toggleVideoOrientation()
+        XCTAssertEqual(controller.supportedMask, .landscape)
+        XCTAssertTrue(controller.isLandscapeLocked)
+
+        controller.returnToHomeOrientation()
+        XCTAssertEqual(controller.supportedMask, .allButUpsideDown)
+        XCTAssertFalse(controller.isLandscapeLocked)
+    }
 }

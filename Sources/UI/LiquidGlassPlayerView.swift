@@ -44,13 +44,25 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
+    var activeVideoWidth: Int {
+        engineMode == .mpv ? mpvController.videoWidth : opticalFlowController.videoWidth
+    }
+
+    var activeVideoHeight: Int {
+        engineMode == .mpv ? mpvController.videoHeight : opticalFlowController.videoHeight
+    }
+
+    var isSuperResolutionDisabledBy4K: Bool {
+        SuperResolutionPolicy.isAlready4K(width: activeVideoWidth, height: activeVideoHeight)
+    }
+
+    var superResolutionDisabledReason: String? {
+        SuperResolutionPolicy.disabledReason(width: activeVideoWidth, height: activeVideoHeight)
+    }
+
     var hudMetrics: PlaybackHUDMetrics {
         let thermal = ThermalLevel(state: thermalState)
         if engineMode == .mpv {
-            let shaderCount = SingleShaderOption.resolvedShaderPaths(
-                preset: selectedPreset,
-                extras: selectedExtras
-            ).count
             return PlaybackHUDMetrics(
                 engineBadge: "MPV",
                 interpolationBadge: interpolationMode.shortBadge,
@@ -65,7 +77,7 @@ final class PlayerCoordinator: ObservableObject {
                 isHDRActive: mpvController.isHDRActive,
                 decoderBadge: PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: mpvController.hardwareDecoder),
                 droppedFrames: mpvController.droppedFrames,
-                activeShaderCount: shaderCount,
+                activeShaderCount: mpvController.activeShaderCount,
                 thermalLevel: thermal
             )
         } else {
@@ -113,8 +125,7 @@ final class PlayerCoordinator: ObservableObject {
         mpvController.clearError()
 
         if !url.isFileURL {
-            currentURL = url
-            startPlaybackForCurrentEngine()
+            beginPlayback(url: url)
             return
         }
 
@@ -130,8 +141,7 @@ final class PlayerCoordinator: ObservableObject {
                 )
                 self.isImportingFile = false
                 self.mpvController.appendLog("[file] 本地视频已就绪: \(playableURL.lastPathComponent)")
-                self.currentURL = playableURL
-                self.startPlaybackForCurrentEngine()
+                self.beginPlayback(url: playableURL)
             } catch {
                 self.isImportingFile = false
                 self.mpvController.recordExternalError("无法读取本地视频（\(url.lastPathComponent)）：\(error.localizedDescription)")
@@ -155,13 +165,30 @@ final class PlayerCoordinator: ObservableObject {
                 }
                 self.isImportingFile = false
                 self.mpvController.appendLog("[photos] 相册视频已拷贝至沙盒: \(movie.url.lastPathComponent)")
-                self.currentURL = movie.url
-                self.startPlaybackForCurrentEngine()
+                self.beginPlayback(url: movie.url)
             } catch {
                 self.isImportingFile = false
                 self.mpvController.recordExternalError("相册视频导入失败：\(error.localizedDescription)")
             }
         }
+    }
+
+    func closeToHome() {
+        mpvController.stopPlayback()
+        opticalFlowController.stop()
+        currentURL = nil
+        isImportingFile = false
+        isGeneratingSample = false
+        OrientationController.shared.returnToHomeOrientation()
+    }
+
+    private func beginPlayback(url: URL) {
+        let enteringFromHome = (currentURL == nil)
+        currentURL = url
+        if enteringFromHome {
+            OrientationController.shared.enterVideoLandscape()
+        }
+        startPlaybackForCurrentEngine()
     }
 
     func playBuiltInSampleVideo() {
@@ -236,9 +263,10 @@ final class PlayerCoordinator: ObservableObject {
 
         let opticalStatus = "\(opticalFlowController.capabilityDescription) | 成功补帧=\(opticalFlowController.interpolatedFrameCount) | 失败=\(opticalFlowController.failedInterpolationCount) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
 
+        let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许超分"
         let lines = [
             "=== GlassMPV 真机 5 项体检报告 ===",
-            "版本: \(AppReleaseInfo.displayVersion) | 当前引擎: \(engineMode.rawValue)",
+            "版本: \(AppReleaseInfo.displayVersion) | 当前引擎: \(engineMode.rawValue) | 4K超分门控: \(gateStatus)",
             "1. 屏幕 ProMotion 上限: \(maxScreenFPS) Hz \(maxScreenFPS >= 120 ? "(PASS)" : "(非120Hz)")",
             "2. GLSL 着色器包校验: \(shaderCount)/58 个 (\(shaderCount == 58 ? "PASS" : "FAIL")), 当前激活=\(resolvedShaderCount) 个",
             "3. 本地/相册导入沙盒通道: \(importCheck)",
@@ -265,11 +293,21 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func applyPreset(_ preset: ShaderPreset) {
+        if isSuperResolutionDisabledBy4K && preset.id != ShaderPreset.off.id {
+            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用超分"
+            mpvController.appendLog("[shader] \(reason)")
+            return
+        }
         selectedPreset = preset
         mpvController.applyShaders(preset: preset, extras: selectedExtras)
     }
 
     func toggleExtraShader(_ id: String) {
+        if isSuperResolutionDisabledBy4K && !selectedExtras.contains(id) {
+            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用超分"
+            mpvController.appendLog("[shader] \(reason)")
+            return
+        }
         if selectedExtras.contains(id) {
             selectedExtras.remove(id)
         } else {
@@ -295,6 +333,12 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func setVTSpatial2x(_ enabled: Bool) {
+        if enabled && isSuperResolutionDisabledBy4K {
+            vtSpatial2x = false
+            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用 ANE 2× 超分"
+            opticalFlowController.appendLog("[ane] \(reason)")
+            return
+        }
         vtSpatial2x = enabled
         if engineMode == .opticalFlow, let url = currentURL {
             let t = opticalFlowController.currentTime
@@ -739,13 +783,37 @@ struct LiquidGlassPlayerView: View {
     }
 
     private var toolbarActionButtons: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
+            Button {
+                coordinator.closeToHome()
+            } label: {
+                Image(systemName: "chevron.backward")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .contentShape(Circle())
+            .glassEffect(.regular.interactive(), in: .circle)
+
+            Button {
+                OrientationController.shared.toggleVideoOrientation()
+            } label: {
+                Image(systemName: "rotate.right")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .contentShape(Circle())
+            .glassEffect(.regular.interactive(), in: .circle)
+
             Button {
                 coordinator.presentLocalVideoPicker()
             } label: {
                 Image(systemName: "folder")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
@@ -755,7 +823,7 @@ struct LiquidGlassPlayerView: View {
             PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
                 Image(systemName: "photo.on.rectangle")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
@@ -765,7 +833,7 @@ struct LiquidGlassPlayerView: View {
             } label: {
                 Image(systemName: "link")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
@@ -775,7 +843,7 @@ struct LiquidGlassPlayerView: View {
             } label: {
                 Image(systemName: "stethoscope")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
@@ -787,7 +855,7 @@ struct LiquidGlassPlayerView: View {
             } label: {
                 Image(systemName: showStatsHUD ? "info.circle.fill" : "info.circle")
                     .font(.body.weight(.semibold))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
             .glassEffect(
@@ -943,6 +1011,17 @@ struct LiquidGlassPlayerView: View {
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.regular.interactive(), in: .capsule)
+
+                Button {
+                    coordinator.closeToHome()
+                } label: {
+                    Text("返回主界面")
+                        .font(.subheadline.weight(.medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .capsule)
             }
         }
         .padding(20)
@@ -960,16 +1039,29 @@ struct LiquidGlassPlayerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button {
-                    coordinator.switchEngine(to: .mpv)
-                } label: {
-                    Text("一键切回 MPV 超分核")
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
+                HStack(spacing: 10) {
+                    Button {
+                        coordinator.switchEngine(to: .mpv)
+                    } label: {
+                        Text("一键切回 MPV 超分核")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+
+                    Button {
+                        coordinator.closeToHome()
+                    } label: {
+                        Text("返回主界面")
+                            .font(.subheadline.weight(.medium))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
             }
             .padding(20)
             .glassEffect(.regular, in: .rect(cornerRadius: 22))
@@ -1052,16 +1144,28 @@ struct EnhancementControlSheet: View {
                         }
                     }
 
+                    if let gatedReason = coordinator.superResolutionDisabledReason {
+                        Label(gatedReason, systemImage: "4k.tv.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
                     if coordinator.engineMode == .opticalFlow {
                         Toggle("同步开启 ANE 2× 硬件超分", isOn: Binding(
                             get: { coordinator.vtSpatial2x },
                             set: { coordinator.setVTSpatial2x($0) }
                         ))
+                        .disabled(coordinator.isSuperResolutionDisabledBy4K)
                     }
                 }
 
                 if coordinator.engineMode == .mpv {
                     Section("Anime4K 组合预设（源自原包 input.conf）") {
+                        if let gatedReason = coordinator.superResolutionDisabledReason {
+                            Label(gatedReason, systemImage: "4k.tv.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                         ForEach(ShaderPreset.allPresets) { preset in
                             Button {
                                 coordinator.applyPreset(preset)
@@ -1091,6 +1195,7 @@ struct EnhancementControlSheet: View {
                                     }
                                 }
                             }
+                            .disabled(coordinator.isSuperResolutionDisabledBy4K && preset.id != ShaderPreset.off.id)
                         }
                     }
 
@@ -1107,6 +1212,7 @@ struct EnhancementControlSheet: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
+                            .disabled(coordinator.isSuperResolutionDisabledBy4K)
                         }
                     }
                 }
@@ -1194,6 +1300,8 @@ struct DiagnosticLogSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var copiedFeedback: Bool = false
     @State private var copiedSelfCheckFeedback: Bool = false
+    @State private var exportedFeedback: Bool = false
+    @State private var exportErrorMessage: String?
 
     init(mpv: MPVPlayerController, coordinator: PlayerCoordinator) {
         self.mpv = mpv
@@ -1280,27 +1388,37 @@ struct DiagnosticLogSheet: View {
                     }
 
                     Button {
-                        if coordinator.selfCheckReport.isEmpty {
-                            coordinator.runRealDeviceSelfCheck()
-                        }
-                        let summary = [
-                            "GlassMPV \(AppReleaseInfo.displayVersion)",
-                            "Engine: \(coordinator.engineMode.rawValue)",
-                            "State: \(mpv.playbackState)",
-                            "Video: \(mpv.videoWidth)x\(mpv.videoHeight) @ \(mpv.sourceFPS)fps",
-                            "Decoder: \(mpv.videoCodec) / \(mpv.hardwareDecoder)",
-                            "Error: \(mpv.lastErrorMessage ?? "none")",
-                            "--- Self Check ---",
-                            coordinator.selfCheckReport,
-                            "--- Logs ---"
-                        ] + mpv.diagnosticLogs
-                        UIPasteboard.general.string = summary.joined(separator: "\n")
+                        UIPasteboard.general.string = buildFullDiagnosticReport()
                         copiedFeedback = true
                     } label: {
                         Label(
                             copiedFeedback ? "已复制全部诊断日志" : "一键复制全部诊断日志",
                             systemImage: copiedFeedback ? "checkmark.circle.fill" : "doc.on.doc"
                         )
+                    }
+
+                    Button {
+                        exportErrorMessage = nil
+                        do {
+                            let fileURL = try DiagnosticLogExporter.writeLogFile(content: buildFullDiagnosticReport())
+                            NativeShareSheetPresenter.present(fileURL: fileURL) { err in
+                                exportErrorMessage = err
+                            }
+                            exportedFeedback = true
+                        } catch {
+                            exportErrorMessage = "写入日志文件失败：\(error.localizedDescription)"
+                        }
+                    } label: {
+                        Label(
+                            exportedFeedback ? "已生成 .txt 诊断日志文件" : "导出诊断日志 (.txt)",
+                            systemImage: exportedFeedback ? "checkmark.circle.fill" : "square.and.arrow.up"
+                        )
+                    }
+
+                    if let exportErrorMessage {
+                        Text(exportErrorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
                     }
                 }
 
@@ -1311,6 +1429,20 @@ struct DiagnosticLogSheet: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(Array(mpv.diagnosticLogs.reversed().enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                Section("ANE 光流核日志（最近 \(optical.diagnosticLogs.count) 条）") {
+                    if optical.diagnosticLogs.isEmpty {
+                        Text("暂无光流核日志（切换至 ANE 光流核后将自动采集）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(optical.diagnosticLogs.reversed().enumerated()), id: \.offset) { _, line in
                             Text(line)
                                 .font(.caption2.monospaced())
                                 .textSelection(.enabled)
@@ -1329,5 +1461,30 @@ struct DiagnosticLogSheet: View {
                 }
             }
         }
+    }
+
+    private func buildFullDiagnosticReport() -> String {
+        if coordinator.selfCheckReport.isEmpty {
+            coordinator.runRealDeviceSelfCheck()
+        }
+        let metrics = coordinator.hudMetrics
+        let resolution = (metrics.width > 0 && metrics.height > 0)
+            ? "\(metrics.width)×\(metrics.height)"
+            : "暂无"
+        let stateText = coordinator.engineMode == .mpv
+            ? mpv.playbackState
+            : (optical.isPaused ? "已暂停" : "播放中")
+        return DiagnosticLogExporter.buildReport(
+            version: AppReleaseInfo.displayVersion,
+            engineName: coordinator.engineMode.rawValue,
+            playbackState: stateText,
+            resolution: resolution,
+            fpsSummary: metrics.fpsSummary,
+            decoderSummary: "\(metrics.codec) / \(metrics.decoderBadge)",
+            is4KGated: coordinator.isSuperResolutionDisabledBy4K,
+            selfCheck: coordinator.selfCheckReport,
+            mpvLogs: mpv.diagnosticLogs,
+            opticalLogs: optical.diagnosticLogs
+        )
     }
 }

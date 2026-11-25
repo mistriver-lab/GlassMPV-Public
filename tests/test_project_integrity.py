@@ -209,6 +209,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "MPVVideoPlayer" in mpv_core
     assert "videoOutput: .metal" in mpv_core
     assert "display-fps-override" in mpv_core
+    assert "interpolation-threshold" in mpv_core
+    assert "SuperResolutionPolicy" in mpv_core
     assert "setDiagnosticsEnabled(true)" in mpv_core
     assert 'joined(separator: ":")' in mpv_core
     assert 'joined(separator: ";")' not in mpv_core
@@ -218,6 +220,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "kCMSampleAttachmentKey_DisplayImmediately" in vt_engine
     assert "interpolatedFrameCount" in vt_engine
     assert "failedInterpolationCount" in vt_engine
+    assert "diagnosticLogs" in vt_engine
+    assert "SuperResolutionPolicy" in vt_engine
     assert "#if targetEnvironment(simulator)" in vt_engine
 
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
@@ -228,6 +232,22 @@ def test_swift_sources_non_empty_and_balanced():
     assert "runRealDeviceSelfCheck()" in player_view
     assert "compactStatsHUD" in player_view
     assert "showStatsHUD" in player_view
+    assert "closeToHome()" in player_view
+    assert "OrientationController" in player_view
+    assert "DiagnosticLogExporter" in player_view
+    assert "NativeShareSheetPresenter" in player_view
+
+    orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
+    assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"
+    orientation_src = orientation_ctrl.read_text(encoding="utf-8")
+    assert "enterVideoLandscape" in orientation_src
+    assert "returnToHomeOrientation" in orientation_src
+
+    log_exporter = ROOT / "Sources" / "UI" / "DiagnosticLogExporter.swift"
+    assert log_exporter.is_file(), f"Missing {log_exporter}"
+    log_exporter_src = log_exporter.read_text(encoding="utf-8")
+    assert "DiagnosticLogExporter" in log_exporter_src
+    assert "NativeShareSheetPresenter" in log_exporter_src
 
     doc_picker = ROOT / "Sources" / "UI" / "NativeDocumentPickerPresenter.swift"
     assert doc_picker.is_file(), f"Missing {doc_picker}"
