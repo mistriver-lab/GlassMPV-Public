@@ -18,6 +18,7 @@
 - **根治 ANE 光流核黑屏失效并升级 MPV 时域平滑 (`VTOpticalFlowEngine` + `MPVPlayerCore`)**：为 `AVSampleBufferDisplayLayer` 绑定 `controlTimebase` 并对齐送显 PTS，修复切换引擎时 `load()` 与 `seek()` 竞态、规范源像素格式选择、检查 `AVAssetReader.startReading()`、传播 `CVBufferPropagateAttachments` 色彩附件并加入追帧跳过插帧保护；HUD 如实显示实测帧率；MPV 核升级 `tscale=mitchell` + `interpolation-preserve=yes`。
 - **双引擎补帧架构深度重构与真实遥测闭环 (`VTOpticalFlowEngine` + `MPVPlayerCore` + `LiquidGlassPlayerView`)**：ANE 光流核改用子图层宿主支持 `preferredTransform` 旋转排版、新增无音轨单调合成时钟 (`OpticalFlowSyntheticClock`) 与自动循环重播、修复首帧早于图层挂载的竞态 (`pendingFirstFrame`)、补齐 `requiresFlushToResumeDecoding` 自动恢复、10-bit 像素格式与对齐属性继承及 6 帧预缓冲；MPV 核新增播放期 `ProMotionDisplayLinkKeeper` 120Hz 刷新率保活，移除 `displaySyncFPS` 屏幕上限伪造兜底，透出重绘 Pass/失步帧/延迟帧及 ANE 加载态与平均耗时遥测。
 - **运行期黑匣子采样、MPV 探针判定与 ANE 解码链路加固 (`PlaybackTelemetry` + `MPVPlayerCore` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：新增每 2 秒采集一次且停播不清空的 `RuntimeTelemetrySample` 黑匣子时间轴；`MPVPlayerController` 启用 `logLevel: .info` 过滤采样 `[mpv-probe]`（`display-sync-active`/`interpolation`/`tscale`/`vsync-ratio`）与客观判定 `InterpolationVerdict`，4K 片源自适应切为 `tscale=linear`，切入 ANE 时调用 `releaseMediaForExternalEngine()` 彻底释放硬解会话；`OpticalFlowPlayerController` 改用纯音轨 `AVMutableComposition`、移除违规对齐键的 5 级 `AVAssetReader` 安全回退与源帧标准化缓冲池。
+- **ANE `-11833/-12906` 压缩透传硬解兜底与双核补帧语义澄清 (`VTOpticalFlowEngine` + `PlaybackTelemetry` + `MPVPlayerCore` + `LiquidGlassPlayerView`)**：在常规 `AVAssetReader` 全档位失败时自动切换为压缩透传（`outputSettings=nil`）+ `HEVCFormatNormalizer`（`hev1→hvc1`/参数集重建）+ `VTDecompressionSession` 硬解兜底与 `OpticalFlowPTSReorderBuffer` B 帧 PTS 重排；新增轨道 `describeFormat` 日志、去重 `stopInternal()`/`releaseMediaForExternalEngine()` 重复日志，并将 `InterpolationVerdict` 与控制台文案明确区分为「MPV 时域平滑」与「ANE 硬件光流真补帧」。
 
 ## [v1.1.0] - 2026-11-24
 
@@ -106,3 +107,9 @@
 - [x] **新增默认横屏起播、手动旋转、返回主界面与 `.txt` 诊断日志导出 (`OrientationController` + `DiagnosticLogExporter` + `LiquidGlassPlayerView`)**：打开视频默认进横屏并支持工具栏旋转切换；支持一键返回主界面与错误横幅返回；诊断中心支持分享/导出完整 `.txt` 日志文件。
 
 - [x] **已验证交付（`fe9fdf4` / CI Run `45558978591`）**：修复 `VTOpticalFlowEngine.swift` Swift 6 `noasync` 锁与 `nonisolated` 并发编译，CI 全绿（`10m17s`，`GlassMPVTests` 15/15 PASS），产出并校验 `dist/GlassMPV-2026.11.25-202611251421-unsigned.ipa`。
+
+- [x] **最新实机日志（[GlassMPV-Log-20261125-153115.txt](file:///C:/Users/21920/Documents/xwechat_files/wxid_8mhh4tfklkan22_9a3a/msg/file/2026-11/GlassMPV-Log-20261125-153115.txt)）双根因定位结论**：
+  1. **MPV 120Hz 模式**：实机探针 `sync_active=yes video_sync=display-resample interp=yes tscale=linear vsync_ratio=5.00 disp_fps=120.0Hz est_disp=119.5Hz` 已实际运行，但 `libmpv` 的 `tscale` 属于无运动矢量时域帧混合（去 3:2 抖动），24fps 在 120Hz（精确 5 倍整数倍）下无运动补偿光流果冻感且 HUD `estimated-vf-fps` 恒报 `24.0`，旧标签“MPV补帧生效”造成误解。
+  2. **ANE 光流真补帧核**：`VTFrameProcessor` 已为 `2960×2160` 成功启动，但 `AVAssetReader` 4 个输出档位均报 `-11833 / NSOSStatusErrorDomain(-12906)`；原因是该 HEVC MP4 容器标签为 `hev1`（苹果 `AVAssetReader` 要求 `hvc1`），须通过 `outputSettings: nil` 压缩透传 + `HEVCFormatNormalizer`（`hev1→hvc1`）+ `VTDecompressionSession` + `OpticalFlowPTSReorderBuffer` 硬解兜底。
+
+- [x] **当前代码改动进度（工作区未提交 WIP，新窗可直接接续，无需从头重读文件）**：

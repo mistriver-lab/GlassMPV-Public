@@ -315,9 +315,9 @@ enum InterpolationVerdict: Equatable, Sendable {
         case .off:
             return "未开启"
         case .mpvActive:
-            return "MPV补帧生效"
+            return "MPV平滑生效"
         case .mpvInactive:
-            return "MPV补帧未生效"
+            return "MPV平滑未生效"
         case .mpvPending:
             return "MPV等待探针"
         case .aneActive:
@@ -371,7 +371,7 @@ enum InterpolationVerdict: Equatable, Sendable {
             let dispText = probe.displayFPS.map { String(format: "%.1fHz", $0) } ?? "--"
 
             if probe.displaySyncActive == true && probe.interpolation == true {
-                return .mpvActive(detail: "sync_active=yes, interp=yes, tscale=\(tscaleText), vsync_ratio=\(vsyncText), disp_fps=\(dispText)")
+                return .mpvActive(detail: "sync_active=yes, interp=yes, tscale=\(tscaleText), vsync_ratio=\(vsyncText), disp_fps=\(dispText) (时域平滑·非光流)")
             }
             if probe.displaySyncActive == false || probe.interpolation == false {
                 return .mpvInactive(reason: "sync_active=\(syncText), video_sync=\(videoSyncText), interp=\(interpText), vsync_ratio=\(vsyncText)")

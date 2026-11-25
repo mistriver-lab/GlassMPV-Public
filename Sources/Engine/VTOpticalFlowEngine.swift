@@ -123,6 +123,492 @@ struct OpticalFlowSyntheticClock: Sendable {
     }
 }
 
+/// 用于将解码顺序的 B 帧输出重排为严格单调递增的显示顺序 (PTS)
+struct OpticalFlowPTSReorderBuffer<Frame> {
+    let maxDepth: Int
+    private var entries: [(pts: Double, frame: Frame)] = []
+
+    init(maxDepth: Int = 6) {
+        self.maxDepth = max(1, maxDepth)
+    }
+
+    var count: Int { entries.count }
+
+    mutating func insert(pts: Double, frame: Frame) {
+        let insertionIndex = entries.firstIndex(where: { $0.pts > pts }) ?? entries.endIndex
+        entries.insert((pts: pts, frame: frame), at: insertionIndex)
+    }
+
+    mutating func popNextIfReady() -> (pts: Double, frame: Frame)? {
+        guard entries.count > maxDepth else { return nil }
+        return entries.removeFirst()
+    }
+
+    mutating func drainAll() -> [(pts: Double, frame: Frame)] {
+        let all = entries
+        entries.removeAll(keepingCapacity: false)
+        return all
+    }
+}
+
+/// 将 hev1 / avc3 等非苹果默认描述重写为 VideoToolbox 可直接硬解的 hvc1 / avc1 FormatDescription
+enum HEVCFormatNormalizer {
+    private static let safeColorExtensionKeys: [String] = [
+        kCMFormatDescriptionExtension_ColorPrimaries as String,
+        kCMFormatDescriptionExtension_TransferFunction as String,
+        kCMFormatDescriptionExtension_YCbCrMatrix as String,
+        kCMFormatDescriptionExtension_FullRangeVideo as String,
+        kCMFormatDescriptionExtension_PixelAspectRatio as String,
+        kCMFormatDescriptionExtension_CleanAperture as String,
+        kCMFormatDescriptionExtension_BitsPerComponent as String
+    ]
+
+    static func fourCCCode(_ string: String) -> FourCharCode {
+        let bytes = Array(string.utf8.prefix(4))
+        var result: FourCharCode = 0
+        for index in 0..<4 {
+            let b: UInt8 = index < bytes.count ? bytes[index] : 0x20
+            result = (result << 8) | FourCharCode(b)
+        }
+        return result
+    }
+
+    static func fourCCString(_ code: FourCharCode) -> String {
+        let bytes: [UInt8] = [
+            UInt8((code >> 24) & 0xFF),
+            UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF),
+            UInt8(code & 0xFF)
+        ]
+        let chars = bytes.map { byte -> Character in
+            (32...126).contains(byte) ? Character(UnicodeScalar(byte)) : "?"
+        }
+        return String(chars).trimmingCharacters(in: .whitespaces)
+    }
+
+    static func describeFormat(_ desc: CMFormatDescription) -> String {
+        let subType = CMFormatDescriptionGetMediaSubType(desc)
+        let dims = CMFormatDescriptionGetDimensions(desc)
+        let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any]
+        let atoms = exts?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
+        let atomKeys = atoms.map { Array($0.keys).sorted().joined(separator: ",") } ?? "none"
+        let hvccLen = (atoms?["hvcC"] as? Data)?.count ?? 0
+        return "fourCC=\(fourCCString(subType)), dims=\(dims.width)x\(dims.height), atoms=[\(atomKeys)], hvcC=\(hvccLen)B"
+    }
+
+    static func parseHEVCParameterSets(fromHVCC data: Data) -> (nalLengthSize: Int32, parameterSets: [Data])? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 23 else { return nil }
+        let nalLengthSize = Int32((bytes[21] & 0x03) + 1)
+        guard nalLengthSize == 1 || nalLengthSize == 2 || nalLengthSize == 4 else { return nil }
+        let numArrays = Int(bytes[22])
+        var offset = 23
+        var parameterSets: [Data] = []
+
+        for _ in 0..<numArrays {
+            guard offset + 3 <= bytes.count else { return nil }
+            let arrayNalType = bytes[offset] & 0x3F
+            offset += 1
+            let numNalus = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
+            offset += 2
+            for _ in 0..<numNalus {
+                guard offset + 2 <= bytes.count else { return nil }
+                let naluLength = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
+                offset += 2
+                guard naluLength > 0, naluLength <= bytes.count - offset else { return nil }
+                let nalu = Array(bytes[offset..<(offset + naluLength)])
+                offset += naluLength
+                let naluType = (nalu[0] >> 1) & 0x3F
+                if (32...34).contains(naluType) || (32...34).contains(arrayNalType) {
+                    parameterSets.append(Data(nalu))
+                }
+            }
+        }
+
+        guard !parameterSets.isEmpty else { return nil }
+        return (nalLengthSize: nalLengthSize, parameterSets: parameterSets)
+    }
+
+    static func extractHEVCParameterSets(fromLengthPrefixed data: Data, nalLengthSize: Int = 4) -> [Data] {
+        guard nalLengthSize == 1 || nalLengthSize == 2 || nalLengthSize == 4 else { return [] }
+        let bytes = [UInt8](data)
+        var offset = 0
+        var seen = Set<Data>()
+        var result: [Data] = []
+
+        while offset + nalLengthSize <= bytes.count {
+            var length = 0
+            for index in 0..<nalLengthSize {
+                length = (length << 8) | Int(bytes[offset + index])
+            }
+            offset += nalLengthSize
+            guard length > 0, length <= bytes.count - offset else { break }
+            let naluSlice = bytes[offset..<(offset + length)]
+            let nalType = (naluSlice[naluSlice.startIndex] >> 1) & 0x3F
+            if nalType == 32 || nalType == 33 || nalType == 34 {
+                let naluData = Data(naluSlice)
+                if seen.insert(naluData).inserted {
+                    result.append(naluData)
+                }
+            }
+            offset += length
+        }
+        return result
+    }
+
+    static func copyLeadingData(from sample: CMSampleBuffer, maxBytes: Int = 512 * 1024) -> Data? {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        let totalLength = CMBlockBufferGetDataLength(blockBuffer)
+        let copyLength = min(totalLength, maxBytes)
+        guard copyLength > 0 else { return nil }
+
+        var data = Data(count: copyLength)
+        let status = data.withUnsafeMutableBytes { rawBuffer -> OSStatus in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return kCMBlockBufferBadArgumentErr
+            }
+            return CMBlockBufferCopyDataBytes(
+                blockBuffer,
+                atOffset: 0,
+                dataLength: copyLength,
+                destination: baseAddress
+            )
+        }
+        return status == kCMBlockBufferNoErr ? data : nil
+    }
+
+    static func makeNormalizedFormatDescriptionCandidates(
+        from rawDesc: CMVideoFormatDescription,
+        fallbackSampleData: Data? = nil
+    ) -> [(strategy: String, description: CMVideoFormatDescription)] {
+        var candidates: [(strategy: String, description: CMVideoFormatDescription)] = []
+        let subType = CMFormatDescriptionGetMediaSubType(rawDesc)
+        let dims = CMFormatDescriptionGetDimensions(rawDesc)
+        let rawExtensions = CMFormatDescriptionGetExtensions(rawDesc) as? [String: Any]
+        let atoms = rawExtensions?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
+
+        var safeColorExtensions: [String: Any] = [:]
+        if let rawExtensions {
+            for key in safeColorExtensionKeys {
+                if let value = rawExtensions[key] {
+                    safeColorExtensions[key] = value
+                }
+            }
+        }
+
+        var parsedHVCC: (nalLengthSize: Int32, parameterSets: [Data])?
+        if let hvcCData = atoms?["hvcC"] as? Data, !hvcCData.isEmpty {
+            parsedHVCC = parseHEVCParameterSets(fromHVCC: hvcCData)
+
+            var cleanExt = safeColorExtensions
+            cleanExt[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] = ["hvcC": hvcCData]
+            var hvc1Desc: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                codecType: kCMVideoCodecType_HEVC,
+                width: dims.width,
+                height: dims.height,
+                extensions: cleanExt as CFDictionary,
+                formatDescriptionOut: &hvc1Desc
+            )
+            if status == noErr, let hvc1Desc {
+                candidates.append((strategy: "hvcC-to-hvc1", description: hvc1Desc))
+            }
+
+            if let parsed = parsedHVCC,
+               let paramDesc = createHEVCDescription(
+                   parameterSets: parsed.parameterSets,
+                   nalLengthSize: parsed.nalLengthSize,
+                   extensions: safeColorExtensions
+               ) {
+                candidates.append((strategy: "hvcc-param-sets", description: paramDesc))
+            }
+        }
+
+        let isHEVC = (subType == fourCCCode("hev1") || subType == fourCCCode("hvc1") || atoms?["hvcC"] != nil)
+        if isHEVC, let sampleData = fallbackSampleData, !sampleData.isEmpty {
+            let nalLen = Int(parsedHVCC?.nalLengthSize ?? 4)
+            let inbandSets = extractHEVCParameterSets(fromLengthPrefixed: sampleData, nalLengthSize: nalLen)
+            if inbandSets.count >= 2,
+               let inbandDesc = createHEVCDescription(
+                   parameterSets: inbandSets,
+                   nalLengthSize: Int32(nalLen),
+                   extensions: safeColorExtensions
+               ) {
+                candidates.append((strategy: "inband-param-sets", description: inbandDesc))
+            }
+        }
+
+        if subType == fourCCCode("avc3"),
+           let avcCData = atoms?["avcC"] as? Data,
+           !avcCData.isEmpty {
+            var cleanExt = safeColorExtensions
+            cleanExt[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] = ["avcC": avcCData]
+            var avc1Desc: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                codecType: kCMVideoCodecType_H264,
+                width: dims.width,
+                height: dims.height,
+                extensions: cleanExt as CFDictionary,
+                formatDescriptionOut: &avc1Desc
+            )
+            if status == noErr, let avc1Desc {
+                candidates.append((strategy: "avcC-to-avc1", description: avc1Desc))
+            }
+        }
+
+        candidates.append((strategy: "passthrough", description: rawDesc))
+        return candidates
+    }
+
+    static func rewriteSampleBuffer(
+        _ sample: CMSampleBuffer,
+        with formatDescription: CMFormatDescription
+    ) -> CMSampleBuffer? {
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        let sampleCount = CMSampleBufferGetNumSamples(sample)
+        guard sampleCount >= 1 else { return nil }
+
+        var timingCount: CMItemCount = 0
+        let timingQueryStatus = CMSampleBufferGetSampleTimingInfoArray(
+            sample,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &timingCount
+        )
+        var timingArray: [CMSampleTimingInfo]
+        if timingQueryStatus == noErr && timingCount > 0 {
+            timingArray = [CMSampleTimingInfo](
+                repeating: CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid),
+                count: Int(timingCount)
+            )
+            let fillStatus = timingArray.withUnsafeMutableBufferPointer { buf in
+                CMSampleBufferGetSampleTimingInfoArray(
+                    sample,
+                    entryCount: timingCount,
+                    arrayToFill: buf.baseAddress,
+                    entriesNeededOut: &timingCount
+                )
+            }
+            if fillStatus != noErr {
+                timingArray = [
+                    CMSampleTimingInfo(
+                        duration: CMSampleBufferGetDuration(sample),
+                        presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+                        decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(sample)
+                    )
+                ]
+            }
+        } else {
+            timingArray = [
+                CMSampleTimingInfo(
+                    duration: CMSampleBufferGetDuration(sample),
+                    presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+                    decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(sample)
+                )
+            ]
+        }
+
+        var sizeCount: CMItemCount = 0
+        let sizeQueryStatus = CMSampleBufferGetSampleSizeArray(
+            sample,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &sizeCount
+        )
+        var sizeArray: [Int] = []
+        if sizeQueryStatus == noErr && sizeCount > 0 {
+            var filledSizes = [Int](repeating: 0, count: Int(sizeCount))
+            let fillSizeStatus = filledSizes.withUnsafeMutableBufferPointer { buf in
+                CMSampleBufferGetSampleSizeArray(
+                    sample,
+                    entryCount: sizeCount,
+                    arrayToFill: buf.baseAddress,
+                    entriesNeededOut: &sizeCount
+                )
+            }
+            if fillSizeStatus == noErr {
+                sizeArray = filledSizes
+            }
+        } else if sampleCount == 1 {
+            let singleSize = CMSampleBufferGetSampleSize(sample, at: 0)
+            if singleSize > 0 {
+                sizeArray = [singleSize]
+            } else {
+                let blockLen = CMBlockBufferGetDataLength(dataBuffer)
+                if blockLen > 0 {
+                    sizeArray = [blockLen]
+                }
+            }
+        }
+
+        return timingArray.withUnsafeBufferPointer { timingPtr in
+            if sizeArray.isEmpty {
+                var outSample: CMSampleBuffer?
+                let status = CMSampleBufferCreateReady(
+                    allocator: kCFAllocatorDefault,
+                    dataBuffer: dataBuffer,
+                    formatDescription: formatDescription,
+                    sampleCount: sampleCount,
+                    sampleTimingEntryCount: timingArray.count,
+                    sampleTimingArray: timingPtr.baseAddress,
+                    sampleSizeEntryCount: 0,
+                    sampleSizeArray: nil,
+                    sampleBufferOut: &outSample
+                )
+                return status == noErr ? outSample : nil
+            } else {
+                return sizeArray.withUnsafeBufferPointer { sizePtr in
+                    var outSample: CMSampleBuffer?
+                    let status = CMSampleBufferCreateReady(
+                        allocator: kCFAllocatorDefault,
+                        dataBuffer: dataBuffer,
+                        formatDescription: formatDescription,
+                        sampleCount: sampleCount,
+                        sampleTimingEntryCount: timingArray.count,
+                        sampleTimingArray: timingPtr.baseAddress,
+                        sampleSizeEntryCount: sizeArray.count,
+                        sampleSizeArray: sizePtr.baseAddress,
+                        sampleBufferOut: &outSample
+                    )
+                    return status == noErr ? outSample : nil
+                }
+            }
+        }
+    }
+
+    private static func createHEVCDescription(
+        parameterSets: [Data],
+        nalLengthSize: Int32,
+        extensions: [String: Any]
+    ) -> CMVideoFormatDescription? {
+        let nonEmptySets = parameterSets.filter { !$0.isEmpty }
+        let totalBytes = nonEmptySets.reduce(0) { $0 + $1.count }
+        guard !nonEmptySets.isEmpty, totalBytes > 0 else { return nil }
+
+        let flatBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: totalBytes)
+        defer { flatBuffer.deallocate() }
+
+        var pointers: [UnsafePointer<UInt8>] = []
+        var sizes: [Int] = []
+        pointers.reserveCapacity(nonEmptySets.count)
+        sizes.reserveCapacity(nonEmptySets.count)
+
+        var offset = 0
+        for ps in nonEmptySets {
+            ps.withUnsafeBytes { rawBuffer in
+                guard let src = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                flatBuffer.advanced(by: offset).initialize(from: src, count: ps.count)
+            }
+            pointers.append(UnsafePointer(flatBuffer.advanced(by: offset)))
+            sizes.append(ps.count)
+            offset += ps.count
+        }
+
+        func invokeCreate(withExtensions extDict: CFDictionary?) -> CMVideoFormatDescription? {
+            var outDesc: CMVideoFormatDescription?
+            let status = pointers.withUnsafeBufferPointer { ptrBuf in
+                sizes.withUnsafeBufferPointer { sizeBuf in
+                    CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: pointers.count,
+                        parameterSetPointers: ptrBuf.baseAddress!,
+                        parameterSetSizes: sizeBuf.baseAddress!,
+                        nalUnitHeaderLength: nalLengthSize,
+                        extensions: extDict,
+                        formatDescriptionOut: &outDesc
+                    )
+                }
+            }
+            return status == noErr ? outDesc : nil
+        }
+
+        if !extensions.isEmpty, let withExt = invokeCreate(withExtensions: extensions as CFDictionary) {
+            return withExt
+        }
+        return invokeCreate(withExtensions: nil)
+    }
+}
+
+private final class VTDecodedFrameCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frames: [(pts: CMTime, buffer: CVPixelBuffer)] = []
+    private var lastStatus: OSStatus = noErr
+
+    func record(status: OSStatus, infoFlags: VTDecodeInfoFlags, imageBuffer: CVImageBuffer?, pts: CMTime) {
+        lock.lock()
+        if status != noErr {
+            lastStatus = status
+        } else if !infoFlags.contains(.frameDropped), let buffer = imageBuffer {
+            frames.append((pts: pts, buffer: buffer))
+        }
+        lock.unlock()
+    }
+
+    func drain() -> (frames: [(pts: CMTime, buffer: CVPixelBuffer)], lastStatus: OSStatus) {
+        lock.lock()
+        let outFrames = frames
+        let status = lastStatus
+        frames.removeAll(keepingCapacity: true)
+        lastStatus = noErr
+        lock.unlock()
+        return (outFrames, status)
+    }
+}
+
+private final class VTDecompressionSessionHolder: @unchecked Sendable {
+    private(set) var session: VTDecompressionSession?
+    let formatDescription: CMVideoFormatDescription
+    let strategy: String
+    let collector = VTDecodedFrameCollector()
+
+    init(session: VTDecompressionSession, formatDescription: CMVideoFormatDescription, strategy: String) {
+        self.session = session
+        self.formatDescription = formatDescription
+        self.strategy = strategy
+    }
+
+    func decode(sampleBuffer: CMSampleBuffer) -> (decodeStatus: OSStatus, drained: (frames: [(pts: CMTime, buffer: CVPixelBuffer)], lastStatus: OSStatus)) {
+        guard let session else {
+            return (kVTInvalidSessionErr, ([], kVTInvalidSessionErr))
+        }
+        guard let rewritten = HEVCFormatNormalizer.rewriteSampleBuffer(sampleBuffer, with: formatDescription) else {
+            return (paramErr, ([], paramErr))
+        }
+        let localCollector = collector
+        let decodeStatus = VTDecompressionSessionDecodeFrame(
+            session,
+            sampleBuffer: rewritten,
+            flags: [],
+            infoFlagsOut: nil
+        ) { status, infoFlags, imageBuffer, pts, _ in
+            localCollector.record(status: status, infoFlags: infoFlags, imageBuffer: imageBuffer, pts: pts)
+        }
+        let drained = collector.drain()
+        return (decodeStatus, drained)
+    }
+
+    func waitForAsyncFrames() -> (frames: [(pts: CMTime, buffer: CVPixelBuffer)], lastStatus: OSStatus) {
+        if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+        return collector.drain()
+    }
+
+    func invalidate() {
+        if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+            self.session = nil
+        }
+    }
+
+    deinit {
+        invalidate()
+    }
+}
+
 /// Apple Silicon ANE 硬件光流真补帧播放控制器（基于 VideoToolbox VTFrameProcessor）
 final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isPaused: Bool = true
@@ -322,6 +808,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let naturalSize = try await videoTrack.load(.naturalSize)
                 let formatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
                 guard self.isTokenValid(token) else { return }
+                if let firstDesc = formatDescriptions.first {
+                    self.appendLog("[ane] 轨道格式: \(HEVCFormatNormalizer.describeFormat(firstDesc))")
+                }
 
                 self.videoTransform = preferredTransform
                 self.displayContainer?.applyVideoTransform(preferredTransform)
@@ -551,6 +1040,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func stopInternal() {
+        let hadActiveSession = (
+            currentURL != nil
+            || displayLink != nil
+            || audioPlayer != nil
+            || isLoadingPipeline
+            || isPipelineReadyToPlay
+            || !isPaused
+        )
+        currentURL = nil
         _ = rotateToken()
         displayLink?.invalidate()
         displayLink = nil
@@ -594,7 +1092,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         pipelineStatusText = ""
         isPipelineReadyToPlay = false
         isPaused = true
-        appendLog("[ane] 光流核已停止")
+        if hadActiveSession {
+            appendLog("[ane] 光流核已停止")
+        }
     }
 
     @MainActor
@@ -661,6 +1161,71 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
 #if !targetEnvironment(simulator)
+    private struct SendablePixelBuffer: @unchecked Sendable {
+        let buffer: CVPixelBuffer
+    }
+
+    private final class OpticalFlowPipelineState: @unchecked Sendable {
+        var configuration: VTLowLatencyFrameInterpolationConfiguration
+        var processor: VTFrameProcessor
+        var activeWidth: Int
+        var activeHeight: Int
+        var activeSpatial2x: Bool
+        let pixelFormat: OSType
+        var forceNormalizeSource: Bool
+        var sourceNormPool: CVPixelBufferPool?
+        var sourceTransferSession: VTPixelTransferSession?
+        var destPool: CVPixelBufferPool
+        var transferSession: VTPixelTransferSession?
+        var previousBuffer: CVPixelBuffer?
+        var previousPTS: CMTime = .invalid
+        var localSuccessCount: Int = 0
+        var localConsecutiveFailures: Int = 0
+        var totalInterpolationMs: Double = 0
+        var didCheckActualDimensions: Bool = false
+        var didStartAudioClock: Bool = false
+        var didLogCatchUp: Bool = false
+        var didCachePendingFirstFrame: Bool = false
+
+        init(
+            configuration: VTLowLatencyFrameInterpolationConfiguration,
+            processor: VTFrameProcessor,
+            activeWidth: Int,
+            activeHeight: Int,
+            activeSpatial2x: Bool,
+            pixelFormat: OSType,
+            forceNormalizeSource: Bool,
+            sourceNormPool: CVPixelBufferPool?,
+            sourceTransferSession: VTPixelTransferSession?,
+            destPool: CVPixelBufferPool,
+            transferSession: VTPixelTransferSession?
+        ) {
+            self.configuration = configuration
+            self.processor = processor
+            self.activeWidth = activeWidth
+            self.activeHeight = activeHeight
+            self.activeSpatial2x = activeSpatial2x
+            self.pixelFormat = pixelFormat
+            self.forceNormalizeSource = forceNormalizeSource
+            self.sourceNormPool = sourceNormPool
+            self.sourceTransferSession = sourceTransferSession
+            self.destPool = destPool
+            self.transferSession = transferSession
+        }
+
+        func cleanup() {
+            processor.endSession()
+            if let sourceTransferSession {
+                VTPixelTransferSessionInvalidate(sourceTransferSession)
+                self.sourceTransferSession = nil
+            }
+            if let transferSession {
+                VTPixelTransferSessionInvalidate(transferSession)
+                self.transferSession = nil
+            }
+        }
+    }
+
     private func runOpticalFlowTask(
         url: URL,
         width: Int,
@@ -681,35 +1246,36 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
                 return
             }
+            let trackFormatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
+            let fallbackTrackDesc = trackFormatDescriptions.first
 
-            var activeWidth = width
-            var activeHeight = height
-            var activeSpatial2x = spatial2x && !SuperResolutionPolicy.isAlready4K(width: width, height: height)
+            let initialWidth = width
+            let initialHeight = height
+            let initialSpatial2x = spatial2x && !SuperResolutionPolicy.isAlready4K(width: width, height: height)
 
             guard let initialSetup = createProcessorConfiguration(
-                width: activeWidth,
-                height: activeHeight,
-                requestedSpatial2x: activeSpatial2x
+                width: initialWidth,
+                height: initialHeight,
+                requestedSpatial2x: initialSpatial2x
             ) else {
-                logAsync("[ane] 无法初始化 VideoToolbox 光流配置（\(activeWidth)×\(activeHeight)）")
+                logAsync("[ane] 无法初始化 VideoToolbox 光流配置（\(initialWidth)×\(initialHeight)）")
                 Task { @MainActor [weak self] in
                     self?.isLoadingPipeline = false
                     self?.pipelineStatusText = ""
-                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(activeWidth)x\(activeHeight)）。"
+                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(initialWidth)x\(initialHeight)）。"
                 }
                 return
             }
 
-            var configuration = initialSetup.configuration
-            activeSpatial2x = initialSetup.effectiveSpatial2x
+            let configuration = initialSetup.configuration
+            let effectiveSpatial2x = initialSetup.effectiveSpatial2x
 
-            var processor = VTFrameProcessor()
+            let processor = VTFrameProcessor()
             try processor.startSession(configuration: configuration)
-            defer { processor.endSession() }
 
             let pixelFormat = resolveSourcePixelFormat(from: configuration, prefer10Bit: prefer10Bit)
             let resolvedPixFmtString = Self.fourCCString(pixelFormat)
-            logAsync("[ane] 光流会话启动: \(activeWidth)×\(activeHeight), pixFmt=\(resolvedPixFmtString), spatial2x=\(activeSpatial2x), prefer10Bit=\(prefer10Bit)")
+            logAsync("[ane] 光流会话启动: \(initialWidth)×\(initialHeight), pixFmt=\(resolvedPixFmtString), spatial2x=\(effectiveSpatial2x), prefer10Bit=\(prefer10Bit)")
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -721,242 +1287,220 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             }
 
-            let openedReader = try openAssetReaderWithFallback(
-                asset: asset,
-                videoTrack: videoTrack,
-                startSeconds: startSeconds,
-                preferredPixelFormat: pixelFormat,
-                prefer10Bit: prefer10Bit
-            )
-            let reader = openedReader.reader
-            let trackOutput = openedReader.output
-            var forceNormalizeSource = (openedReader.pixelFormat != pixelFormat)
-            var sourceNormPool = try? makeSourceNormalizationPool(
+            let sourceNormPool = try? makeSourceNormalizationPool(
                 configuration: configuration,
-                width: activeWidth,
-                height: activeHeight,
+                width: initialWidth,
+                height: initialHeight,
                 pixelFormat: pixelFormat
             )
             var sourceTransferSession: VTPixelTransferSession?
             VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &sourceTransferSession)
-            defer {
-                if let sourceTransferSession {
-                    VTPixelTransferSessionInvalidate(sourceTransferSession)
-                }
-            }
 
-            var destPool = try makeDestinationPool(
+            let destPool = try makeDestinationPool(
                 configuration: configuration,
-                fallbackWidth: activeSpatial2x ? activeWidth * 2 : activeWidth,
-                fallbackHeight: activeSpatial2x ? activeHeight * 2 : activeHeight,
+                fallbackWidth: effectiveSpatial2x ? initialWidth * 2 : initialWidth,
+                fallbackHeight: effectiveSpatial2x ? initialHeight * 2 : initialHeight,
                 fallbackFormat: pixelFormat
             )
 
             var transferSession: VTPixelTransferSession?
-            if activeSpatial2x {
+            if effectiveSpatial2x {
                 VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferSession)
             }
-            defer {
-                if let transferSession {
-                    VTPixelTransferSessionInvalidate(transferSession)
-                }
+
+            let state = OpticalFlowPipelineState(
+                configuration: configuration,
+                processor: processor,
+                activeWidth: initialWidth,
+                activeHeight: initialHeight,
+                activeSpatial2x: effectiveSpatial2x,
+                pixelFormat: pixelFormat,
+                forceNormalizeSource: false,
+                sourceNormPool: sourceNormPool,
+                sourceTransferSession: sourceTransferSession,
+                destPool: destPool,
+                transferSession: transferSession
+            )
+            defer { state.cleanup() }
+
+            var primaryError: Error?
+            var openedReader: (reader: AVAssetReader, output: AVAssetReaderTrackOutput, tierLabel: String, pixelFormat: OSType)?
+            do {
+                openedReader = try openAssetReaderWithFallback(
+                    asset: asset,
+                    videoTrack: videoTrack,
+                    startSeconds: startSeconds,
+                    preferredPixelFormat: pixelFormat,
+                    prefer10Bit: prefer10Bit
+                )
+            } catch {
+                primaryError = error
             }
 
-            var previousBuffer: CVPixelBuffer?
-            var previousPTS: CMTime = .invalid
-            var localSuccessCount = 0
-            var localConsecutiveFailures = 0
-            var totalInterpolationMs: Double = 0
-            var didCheckActualDimensions = false
-            var didStartAudioClock = false
-            var didLogCatchUp = false
-            var didCachePendingFirstFrame = false
+            var activeReader: AVAssetReader?
+            var decodedAnyPrimaryFrame = false
 
-            while reader.status == .reading {
-                if !isTokenValid(token) {
-                    reader.cancelReading()
-                    return
-                }
+            if let openedReader {
+                let reader = openedReader.reader
+                let trackOutput = openedReader.output
+                activeReader = reader
+                state.forceNormalizeSource = (openedReader.pixelFormat != pixelFormat)
 
-                while queuedCount() >= maxQueuedFrames {
+                while reader.status == .reading {
                     if !isTokenValid(token) {
                         reader.cancelReading()
                         return
                     }
-                    try? await Task.sleep(for: .milliseconds(8))
-                }
 
-                guard let sample = trackOutput.copyNextSampleBuffer(),
-                      let currentBuffer = CMSampleBufferGetImageBuffer(sample) else {
-                    break
-                }
-                let currentPTS = CMSampleBufferGetPresentationTimeStamp(sample)
-
-                if !didCheckActualDimensions {
-                    didCheckActualDimensions = true
-                    let actualW = CVPixelBufferGetWidth(currentBuffer)
-                    let actualH = CVPixelBufferGetHeight(currentBuffer)
-                    if actualW >= 2, actualH >= 2, (actualW != activeWidth || actualH != activeHeight) {
-                        logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(activeWidth)×\(activeHeight) 不一致，重建光流会话")
-                        let rebuiltSpatial2x = activeSpatial2x && !SuperResolutionPolicy.isAlready4K(width: actualW, height: actualH)
-                        if let rebuilt = createProcessorConfiguration(
-                            width: actualW,
-                            height: actualH,
-                            requestedSpatial2x: rebuiltSpatial2x
-                        ) {
-                            processor.endSession()
-                            let nextProcessor = VTFrameProcessor()
-                            try nextProcessor.startSession(configuration: rebuilt.configuration)
-                            processor = nextProcessor
-                            configuration = rebuilt.configuration
-                            activeWidth = actualW
-                            activeHeight = actualH
-                            activeSpatial2x = rebuilt.effectiveSpatial2x
-                            sourceNormPool = try? makeSourceNormalizationPool(
-                                configuration: configuration,
-                                width: activeWidth,
-                                height: activeHeight,
-                                pixelFormat: pixelFormat
-                            )
-                            destPool = try makeDestinationPool(
-                                configuration: configuration,
-                                fallbackWidth: activeSpatial2x ? activeWidth * 2 : activeWidth,
-                                fallbackHeight: activeSpatial2x ? activeHeight * 2 : activeHeight,
-                                fallbackFormat: pixelFormat
-                            )
-                            Task { @MainActor [weak self] in
-                                guard let self else { return }
-                                self.enableSpatial2xUpscale = rebuilt.effectiveSpatial2x
-                            }
+                    while queuedCount() >= maxQueuedFrames {
+                        if !isTokenValid(token) {
+                            reader.cancelReading()
+                            return
                         }
+                        try? await Task.sleep(for: .milliseconds(8))
                     }
+
+                    guard let sample = trackOutput.copyNextSampleBuffer(),
+                          let currentBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                        break
+                    }
+                    decodedAnyPrimaryFrame = true
+                    let currentPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                    try await processDecodedFrame(
+                        SendablePixelBuffer(buffer: currentBuffer),
+                        currentPTS: currentPTS,
+                        state: state,
+                        token: token
+                    )
                 }
 
-                let workingBuffer = normalizeSourceBufferIfNeeded(
-                    currentBuffer,
-                    targetPixelFormat: pixelFormat,
-                    forceNormalize: forceNormalizeSource,
-                    transferSession: sourceTransferSession,
-                    pool: sourceNormPool
+                if !decodedAnyPrimaryFrame && reader.status == .failed && isTokenValid(token) {
+                    primaryError = reader.error ?? primaryError
+                }
+            }
+
+            let shouldUsePassthroughFallback = (openedReader == nil)
+                || (!decodedAnyPrimaryFrame && activeReader?.status == .failed && isTokenValid(token))
+
+            if shouldUsePassthroughFallback {
+                let reasonText = Self.formatDetailedError(primaryError)
+                logAsync("[ane][warn] 常规 AVAssetReader 全档位失败，切换压缩透传 + VTDecompressionSession 硬解兜底: \(reasonText)")
+
+                let passthrough = try openCompressedPassthroughReader(
+                    asset: asset,
+                    videoTrack: videoTrack,
+                    startSeconds: startSeconds
                 )
+                let passthroughReader = passthrough.reader
+                let passthroughOutput = passthrough.output
+                activeReader = passthroughReader
 
-                let behindAudioClock = didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.18)
-                if behindAudioClock {
-                    if !didLogCatchUp {
-                        didLogCatchUp = true
-                        logAsync("[ane][perf] 光流处理落后时钟，临时跳过部分帧插帧以保持音画同步")
-                    }
-                    Task { @MainActor [weak self] in
-                        self?.skippedInterpolationCount += 1
-                    }
-                } else if let prevBuf = previousBuffer,
-                          previousPTS.isValid,
-                          currentPTS > previousPTS,
-                          Self.isValidInterpolationDelta(currentPTS.seconds - previousPTS.seconds) {
-                    if let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: previousPTS),
-                       let currFrame = VTFrameProcessorFrame(buffer: workingBuffer, presentationTimeStamp: currentPTS) {
-                        var destBufOpt: CVPixelBuffer?
-                        let poolStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, destPool, &destBufOpt)
+                var holder: VTDecompressionSessionHolder?
+                defer { holder?.invalidate() }
+                var reorderBuffer = OpticalFlowPTSReorderBuffer<CVPixelBuffer>(maxDepth: 6)
+                var decodedSuccessFrames = 0
+                var loggedDecodeFailure = false
 
-                        if poolStatus == kCVReturnSuccess, let destBuf = destBufOpt {
-                            let midSeconds = (previousPTS.seconds + currentPTS.seconds) * 0.5
-                            let midPTS = CMTime(seconds: midSeconds, preferredTimescale: 600)
-                            if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS),
-                               let params = VTLowLatencyFrameInterpolationParameters(
-                                   sourceFrame: currFrame,
-                                   previousFrame: prevFrame,
-                                   interpolationPhase: [0.5],
-                                   destinationFrames: [destFrame]
-                               ) {
-                                do {
-                                    let processStart = CACurrentMediaTime()
-                                    _ = try await processor.process(parameters: params)
-                                    let elapsedMs = (CACurrentMediaTime() - processStart) * 1000.0
-                                    totalInterpolationMs += elapsedMs
-                                    CVBufferPropagateAttachments(workingBuffer, destBuf)
-                                    enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
-                                    localSuccessCount += 1
-                                    localConsecutiveFailures = 0
-                                    let avgMs = totalInterpolationMs / Double(localSuccessCount)
-                                    if localSuccessCount == 1 {
-                                        logAsync("[ane] 首帧光流补帧成功（\(activeWidth)×\(activeHeight), 耗时 \(String(format: "%.1f", elapsedMs))ms）")
-                                    }
-                                    Task { @MainActor [weak self] in
-                                        guard let self else { return }
-                                        self.interpolatedFrameCount += 1
-                                        self.averageInterpolationMs = avgMs
-                                    }
-                                } catch {
-                                    localConsecutiveFailures += 1
-                                    let detailed = Self.formatDetailedError(error)
-                                    if !forceNormalizeSource && localSuccessCount == 0 && sourceNormPool != nil {
-                                        forceNormalizeSource = true
-                                        logAsync("[ane][warn] 检测到源帧属性不匹配，自动启用源帧标准化池重试: \(detailed)")
-                                    }
-                                    recordInterpolationFailure(
-                                        "process 异常: \(detailed)",
-                                        consecutiveFailures: localConsecutiveFailures,
-                                        totalSuccesses: localSuccessCount
-                                    )
-                                }
-                            } else {
-                                localConsecutiveFailures += 1
-                                recordInterpolationFailure(
-                                    "VTLowLatencyFrameInterpolationParameters/destFrame 初始化返回 nil",
-                                    consecutiveFailures: localConsecutiveFailures,
-                                    totalSuccesses: localSuccessCount
-                                )
+                while passthroughReader.status == .reading {
+                    if !isTokenValid(token) {
+                        passthroughReader.cancelReading()
+                        return
+                    }
+
+                    while queuedCount() >= maxQueuedFrames {
+                        if !isTokenValid(token) {
+                            passthroughReader.cancelReading()
+                            return
+                        }
+                        try? await Task.sleep(for: .milliseconds(8))
+                    }
+
+                    guard let sample = passthroughOutput.copyNextSampleBuffer() else {
+                        break
+                    }
+                    guard CMSampleBufferGetDataBuffer(sample) != nil else {
+                        continue
+                    }
+
+                    if holder == nil {
+                        guard let rawDesc = CMSampleBufferGetFormatDescription(sample) ?? fallbackTrackDesc else {
+                            passthroughReader.cancelReading()
+                            throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -202, userInfo: [
+                                NSLocalizedDescriptionKey: "压缩透传流缺少视频格式描述，无法建立硬解兜底"
+                            ])
+                        }
+                        let leadingData = HEVCFormatNormalizer.copyLeadingData(from: sample)
+                        guard let created = createDecompressionSessionWithFallback(
+                            rawDesc: rawDesc,
+                            fallbackSampleData: leadingData,
+                            preferredPixelFormat: pixelFormat,
+                            prefer10Bit: prefer10Bit
+                        ) else {
+                            passthroughReader.cancelReading()
+                            throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -203, userInfo: [
+                                NSLocalizedDescriptionKey: "VTDecompressionSession 硬解兜底全部候选均失败 (\(HEVCFormatNormalizer.describeFormat(rawDesc)))"
+                            ])
+                        }
+                        holder = created
+                    }
+
+                    guard let activeHolder = holder else { continue }
+                    let decodeResult = activeHolder.decode(sampleBuffer: sample)
+                    if (decodeResult.decodeStatus != noErr || decodeResult.drained.lastStatus != noErr),
+                       !loggedDecodeFailure,
+                       decodedSuccessFrames == 0 {
+                        loggedDecodeFailure = true
+                        logAsync("[ane][warn] VTDecompressionSession 解码异常状态 decode=\(decodeResult.decodeStatus), callback=\(decodeResult.drained.lastStatus), strategy=\(activeHolder.strategy)")
+                    }
+
+                    for frame in decodeResult.drained.frames {
+                        guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
+                        decodedSuccessFrames += 1
+                        reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
+                        while let ready = reorderBuffer.popNextIfReady() {
+                            if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
+                                continue
                             }
-                        } else {
-                            localConsecutiveFailures += 1
-                            recordInterpolationFailure(
-                                "CVPixelBufferPoolCreatePixelBuffer 失败 (\(poolStatus))",
-                                consecutiveFailures: localConsecutiveFailures,
-                                totalSuccesses: localSuccessCount
+                            try await processDecodedFrame(
+                                SendablePixelBuffer(buffer: ready.frame),
+                                currentPTS: CMTime(seconds: ready.pts, preferredTimescale: 600),
+                                state: state,
+                                token: token
                             )
                         }
-                    } else {
-                        localConsecutiveFailures += 1
-                        recordInterpolationFailure(
-                            "VTFrameProcessorFrame(prev/curr) 初始化返回 nil",
-                            consecutiveFailures: localConsecutiveFailures,
-                            totalSuccesses: localSuccessCount
+                    }
+                }
+
+                if passthroughReader.status != .failed && isTokenValid(token) {
+                    if let activeHolder = holder {
+                        let tail = activeHolder.waitForAsyncFrames()
+                        for frame in tail.frames {
+                            guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
+                            decodedSuccessFrames += 1
+                            reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
+                        }
+                    }
+                    for ready in reorderBuffer.drainAll() {
+                        if !isTokenValid(token) {
+                            return
+                        }
+                        if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
+                            continue
+                        }
+                        try await processDecodedFrame(
+                            SendablePixelBuffer(buffer: ready.frame),
+                            currentPTS: CMTime(seconds: ready.pts, preferredTimescale: 600),
+                            state: state,
+                            token: token
                         )
                     }
                 }
-
-                let finalSourceBuffer = forceNormalizeSource
-                    ? normalizeSourceBufferIfNeeded(
-                        currentBuffer,
-                        targetPixelFormat: pixelFormat,
-                        forceNormalize: true,
-                        transferSession: sourceTransferSession,
-                        pool: sourceNormPool
-                    )
-                    : workingBuffer
-                let outputBuffer = scaleIfNeeded(finalSourceBuffer, spatial2x: activeSpatial2x, transferSession: transferSession, pool: destPool)
-                if !didCachePendingFirstFrame {
-                    didCachePendingFirstFrame = true
-                    cachePendingFirstFrame(outputBuffer, ptsSeconds: currentPTS.seconds)
-                }
-                enqueueDecodedFrame(pts: currentPTS.seconds, buffer: outputBuffer)
-                if !didStartAudioClock && queuedCount() >= prebufferFrameTarget {
-                    didStartAudioClock = true
-                    Task { @MainActor [weak self] in
-                        guard let self, self.isTokenValid(token) else { return }
-                        self.isPipelineReadyToPlay = true
-                        self.pipelineStatusText = ""
-                        self.startActiveClockIfNeeded()
-                    }
-                }
-                previousBuffer = finalSourceBuffer
-                previousPTS = currentPTS
             }
 
-            if reader.status == .failed && isTokenValid(token) {
-                let errDesc = Self.formatDetailedError(reader.error)
+            if let activeReader, activeReader.status == .failed && isTokenValid(token) {
+                let errDesc = Self.formatDetailedError(activeReader.error)
                 logAsync("[ane][error] AVAssetReader 读取异常终止: \(errDesc)")
-                if !didStartAudioClock {
+                if !state.didStartAudioClock {
                     Task { @MainActor [weak self] in
                         self?.isLoadingPipeline = false
                         self?.pipelineStatusText = ""
@@ -966,15 +1510,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             } else if isTokenValid(token) {
                 markReaderEOF()
 
-                if !didStartAudioClock && queuedCount() > 0 {
-                    didStartAudioClock = true
+                if !state.didStartAudioClock && queuedCount() > 0 {
+                    state.didStartAudioClock = true
                     Task { @MainActor [weak self] in
                         guard let self, self.isTokenValid(token) else { return }
                         self.isPipelineReadyToPlay = true
                         self.pipelineStatusText = ""
                         self.startActiveClockIfNeeded()
                     }
-                } else if queuedCount() == 0 && !didStartAudioClock {
+                } else if queuedCount() == 0 && !state.didStartAudioClock {
                     Task { @MainActor [weak self] in
                         self?.isLoadingPipeline = false
                         self?.pipelineStatusText = ""
@@ -1264,6 +1808,270 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         throw NSError(domain: "GlassMPV.OpticalFlow.Reader", code: -201, userInfo: [
             NSLocalizedDescriptionKey: "所有 AVAssetReader 解码档位均失败: \(summary)"
         ])
+    }
+
+    private func openCompressedPassthroughReader(
+        asset: AVURLAsset,
+        videoTrack: AVAssetTrack,
+        startSeconds: Double
+    ) throws -> (reader: AVAssetReader, output: AVAssetReaderTrackOutput) {
+        let reader = try AVAssetReader(asset: asset)
+        if startSeconds > 0 {
+            reader.timeRange = CMTimeRange(
+                start: CMTime(seconds: startSeconds, preferredTimescale: 600),
+                duration: .positiveInfinity
+            )
+        }
+        let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw NSError(domain: "GlassMPV.OpticalFlow.Passthrough", code: -211, userInfo: [
+                NSLocalizedDescriptionKey: "压缩透传 AVAssetReaderTrackOutput(outputSettings: nil) 无法挂载"
+            ])
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            let errStr = Self.formatDetailedError(reader.error)
+            reader.cancelReading()
+            throw NSError(domain: "GlassMPV.OpticalFlow.Passthrough", code: -212, userInfo: [
+                NSLocalizedDescriptionKey: "压缩透传 AVAssetReader.startReading 失败: \(errStr)"
+            ])
+        }
+        logAsync("[ane] 压缩透传 AVAssetReader 启动成功 (outputSettings=nil, start=\(String(format: "%.2f", startSeconds))s)")
+        return (reader: reader, output: output)
+    }
+
+    private func createDecompressionSessionWithFallback(
+        rawDesc: CMVideoFormatDescription,
+        fallbackSampleData: Data?,
+        preferredPixelFormat: OSType,
+        prefer10Bit: Bool
+    ) -> VTDecompressionSessionHolder? {
+        let candidates = HEVCFormatNormalizer.makeNormalizedFormatDescriptionCandidates(
+            from: rawDesc,
+            fallbackSampleData: fallbackSampleData
+        )
+        var pixelFormats: [OSType] = [preferredPixelFormat]
+        let format10Bit = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        let format8Bit = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let formatBGRA = kCVPixelFormatType_32BGRA
+        if prefer10Bit && !pixelFormats.contains(format10Bit) {
+            pixelFormats.append(format10Bit)
+        }
+        for candidateFmt in [format8Bit, formatBGRA] where !pixelFormats.contains(candidateFmt) {
+            pixelFormats.append(candidateFmt)
+        }
+
+        var failures: [String] = []
+        for candidate in candidates {
+            for fmt in pixelFormats {
+                let attrs: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: fmt),
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                    kCVPixelBufferMetalCompatibilityKey as String: true
+                ]
+                var session: VTDecompressionSession?
+                let status = VTDecompressionSessionCreate(
+                    allocator: kCFAllocatorDefault,
+                    formatDescription: candidate.description,
+                    videoDecoderSpecification: nil,
+                    imageBufferAttributes: attrs as CFDictionary,
+                    outputCallback: nil,
+                    decompressionSessionOut: &session
+                )
+                if status == noErr, let session {
+                    VTSessionSetProperty(
+                        session,
+                        key: kVTDecompressionPropertyKey_RealTime,
+                        value: kCFBooleanTrue
+                    )
+                    logAsync("[ane] VTDecompressionSession 硬解兜底已启动 (strategy=\(candidate.strategy), pixFmt=\(Self.fourCCString(fmt)))")
+                    return VTDecompressionSessionHolder(
+                        session: session,
+                        formatDescription: candidate.description,
+                        strategy: candidate.strategy
+                    )
+                }
+                failures.append("\(candidate.strategy)/\(Self.fourCCString(fmt))=\(status)")
+            }
+        }
+        logAsync("[ane][error] VTDecompressionSession 硬解兜底全部创建失败: \(failures.joined(separator: ", "))")
+        return nil
+    }
+
+    private func processDecodedFrame(
+        _ frameBox: SendablePixelBuffer,
+        currentPTS: CMTime,
+        state: OpticalFlowPipelineState,
+        token: UUID
+    ) async throws {
+        guard isTokenValid(token) else { return }
+        let currentBuffer = frameBox.buffer
+
+        if !state.didCheckActualDimensions {
+            state.didCheckActualDimensions = true
+            let actualW = CVPixelBufferGetWidth(currentBuffer)
+            let actualH = CVPixelBufferGetHeight(currentBuffer)
+            if actualW >= 2, actualH >= 2, (actualW != state.activeWidth || actualH != state.activeHeight) {
+                logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(state.activeWidth)×\(state.activeHeight) 不一致，重建光流会话")
+                let rebuiltSpatial2x = state.activeSpatial2x && !SuperResolutionPolicy.isAlready4K(width: actualW, height: actualH)
+                if let rebuilt = createProcessorConfiguration(
+                    width: actualW,
+                    height: actualH,
+                    requestedSpatial2x: rebuiltSpatial2x
+                ) {
+                    state.processor.endSession()
+                    let nextProcessor = VTFrameProcessor()
+                    try nextProcessor.startSession(configuration: rebuilt.configuration)
+                    state.processor = nextProcessor
+                    state.configuration = rebuilt.configuration
+                    state.activeWidth = actualW
+                    state.activeHeight = actualH
+                    state.activeSpatial2x = rebuilt.effectiveSpatial2x
+                    state.sourceNormPool = try? makeSourceNormalizationPool(
+                        configuration: state.configuration,
+                        width: state.activeWidth,
+                        height: state.activeHeight,
+                        pixelFormat: state.pixelFormat
+                    )
+                    state.destPool = try makeDestinationPool(
+                        configuration: state.configuration,
+                        fallbackWidth: state.activeSpatial2x ? state.activeWidth * 2 : state.activeWidth,
+                        fallbackHeight: state.activeSpatial2x ? state.activeHeight * 2 : state.activeHeight,
+                        fallbackFormat: state.pixelFormat
+                    )
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.enableSpatial2xUpscale = rebuilt.effectiveSpatial2x
+                    }
+                }
+            }
+        }
+
+        let workingBuffer = normalizeSourceBufferIfNeeded(
+            currentBuffer,
+            targetPixelFormat: state.pixelFormat,
+            forceNormalize: state.forceNormalizeSource,
+            transferSession: state.sourceTransferSession,
+            pool: state.sourceNormPool
+        )
+
+        let behindAudioClock = state.didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.18)
+        if behindAudioClock {
+            if !state.didLogCatchUp {
+                state.didLogCatchUp = true
+                logAsync("[ane][perf] 光流处理落后时钟，临时跳过部分帧插帧以保持音画同步")
+            }
+            Task { @MainActor [weak self] in
+                self?.skippedInterpolationCount += 1
+            }
+        } else if let prevBuf = state.previousBuffer,
+                  state.previousPTS.isValid,
+                  currentPTS > state.previousPTS,
+                  Self.isValidInterpolationDelta(currentPTS.seconds - state.previousPTS.seconds) {
+            if let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: state.previousPTS),
+               let currFrame = VTFrameProcessorFrame(buffer: workingBuffer, presentationTimeStamp: currentPTS) {
+                var destBufOpt: CVPixelBuffer?
+                let poolStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, state.destPool, &destBufOpt)
+
+                if poolStatus == kCVReturnSuccess, let destBuf = destBufOpt {
+                    let midSeconds = (state.previousPTS.seconds + currentPTS.seconds) * 0.5
+                    let midPTS = CMTime(seconds: midSeconds, preferredTimescale: 600)
+                    if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS),
+                       let params = VTLowLatencyFrameInterpolationParameters(
+                           sourceFrame: currFrame,
+                           previousFrame: prevFrame,
+                           interpolationPhase: [0.5],
+                           destinationFrames: [destFrame]
+                       ) {
+                        do {
+                            let processStart = CACurrentMediaTime()
+                            _ = try await state.processor.process(parameters: params)
+                            let elapsedMs = (CACurrentMediaTime() - processStart) * 1000.0
+                            state.totalInterpolationMs += elapsedMs
+                            CVBufferPropagateAttachments(workingBuffer, destBuf)
+                            enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
+                            state.localSuccessCount += 1
+                            state.localConsecutiveFailures = 0
+                            let avgMs = state.totalInterpolationMs / Double(state.localSuccessCount)
+                            if state.localSuccessCount == 1 {
+                                logAsync("[ane] 首帧光流补帧成功（\(state.activeWidth)×\(state.activeHeight), 耗时 \(String(format: "%.1f", elapsedMs))ms）")
+                            }
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                self.interpolatedFrameCount += 1
+                                self.averageInterpolationMs = avgMs
+                            }
+                        } catch {
+                            state.localConsecutiveFailures += 1
+                            let detailed = Self.formatDetailedError(error)
+                            if !state.forceNormalizeSource && state.localSuccessCount == 0 && state.sourceNormPool != nil {
+                                state.forceNormalizeSource = true
+                                logAsync("[ane][warn] 检测到源帧属性不匹配，自动启用源帧标准化池重试: \(detailed)")
+                            }
+                            recordInterpolationFailure(
+                                "process 异常: \(detailed)",
+                                consecutiveFailures: state.localConsecutiveFailures,
+                                totalSuccesses: state.localSuccessCount
+                            )
+                        }
+                    } else {
+                        state.localConsecutiveFailures += 1
+                        recordInterpolationFailure(
+                            "VTLowLatencyFrameInterpolationParameters/destFrame 初始化返回 nil",
+                            consecutiveFailures: state.localConsecutiveFailures,
+                            totalSuccesses: state.localSuccessCount
+                        )
+                    }
+                } else {
+                    state.localConsecutiveFailures += 1
+                    recordInterpolationFailure(
+                        "CVPixelBufferPoolCreatePixelBuffer 失败 (\(poolStatus))",
+                        consecutiveFailures: state.localConsecutiveFailures,
+                        totalSuccesses: state.localSuccessCount
+                    )
+                }
+            } else {
+                state.localConsecutiveFailures += 1
+                recordInterpolationFailure(
+                    "VTFrameProcessorFrame(prev/curr) 初始化返回 nil",
+                    consecutiveFailures: state.localConsecutiveFailures,
+                    totalSuccesses: state.localSuccessCount
+                )
+            }
+        }
+
+        let finalSourceBuffer = state.forceNormalizeSource
+            ? normalizeSourceBufferIfNeeded(
+                currentBuffer,
+                targetPixelFormat: state.pixelFormat,
+                forceNormalize: true,
+                transferSession: state.sourceTransferSession,
+                pool: state.sourceNormPool
+            )
+            : workingBuffer
+        let outputBuffer = scaleIfNeeded(
+            finalSourceBuffer,
+            spatial2x: state.activeSpatial2x,
+            transferSession: state.transferSession,
+            pool: state.destPool
+        )
+        if !state.didCachePendingFirstFrame {
+            state.didCachePendingFirstFrame = true
+            cachePendingFirstFrame(outputBuffer, ptsSeconds: currentPTS.seconds)
+        }
+        enqueueDecodedFrame(pts: currentPTS.seconds, buffer: outputBuffer)
+        if !state.didStartAudioClock && queuedCount() >= prebufferFrameTarget {
+            state.didStartAudioClock = true
+            Task { @MainActor [weak self] in
+                guard let self, self.isTokenValid(token) else { return }
+                self.isPipelineReadyToPlay = true
+                self.pipelineStatusText = ""
+                self.startActiveClockIfNeeded()
+            }
+        }
+        state.previousBuffer = finalSourceBuffer
+        state.previousPTS = currentPTS
     }
 
     private func makeSourceNormalizationPool(

@@ -506,7 +506,7 @@ final class GlassMPVTests: XCTestCase {
             measuredProMotionFPS: 120
         )
         XCTAssertTrue(activeMPV.isEffective)
-        XCTAssertEqual(activeMPV.shortLabel, "MPV补帧生效")
+        XCTAssertEqual(activeMPV.shortLabel, "MPV平滑生效")
 
         let inactiveProbe = try XCTUnwrap(
             MPVProbeSnapshot.parse(from: "[mpv-probe] sync_active=no video_sync=audio interp=yes tscale=mitchell vsync_ratio=1.00 disp_fps=60.0 est_disp=60.0")
@@ -519,7 +519,7 @@ final class GlassMPVTests: XCTestCase {
             measuredProMotionFPS: 120
         )
         XCTAssertFalse(inactiveMPV.isEffective)
-        XCTAssertEqual(inactiveMPV.shortLabel, "MPV补帧未生效")
+        XCTAssertEqual(inactiveMPV.shortLabel, "MPV平滑未生效")
 
         let pendingMPV = InterpolationVerdict.evaluateMPV(
             mode: .mpvSmooth120Hz,
@@ -599,7 +599,7 @@ final class GlassMPVTests: XCTestCase {
             aneFailed: 0,
             anePresented: 0,
             aneAvgMs: 0,
-            verdictLabel: "MPV补帧生效",
+            verdictLabel: "MPV平滑生效",
             thermalLevel: .nominal
         )
         let aneSample = RuntimeTelemetrySample(
@@ -629,7 +629,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(mpvLine.contains("[14:32:42] [MPV]"))
         XCTAssertTrue(mpvLine.contains("1920x1080"))
         XCTAssertTrue(mpvLine.contains("probe(sync=yes,interp=yes,tscale=mitchell,vsync=5.00)"))
-        XCTAssertTrue(mpvLine.contains("verdict=MPV补帧生效"))
+        XCTAssertTrue(mpvLine.contains("verdict=MPV平滑生效"))
 
         let aneLine = aneSample.formatLogLine(timeString: "14:32:44")
         XCTAssertTrue(aneLine.contains("[14:32:44] [ANE]"))
@@ -644,7 +644,7 @@ final class GlassMPVTests: XCTestCase {
             fpsSummary: "24.0 → 120.0 fps",
             decoderSummary: "HEVC / 硬解 VT",
             is4KGated: false,
-            telemetrySummary: ["Interpolation Verdict: MPV补帧生效"],
+            telemetrySummary: ["Interpolation Verdict: MPV平滑生效"],
             runtimeTimeline: [mpvLine, aneLine],
             selfCheck: "ok",
             mpvLogs: [],
@@ -694,5 +694,57 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(formatted.contains("Operation Stopped"))
         XCTAssertTrue(formatted.contains("Unsupported pixel attributes"))
         XCTAssertTrue(formatted.contains("-12909"))
+    }
+
+    func testOpticalFlowPTSReorderBufferAndHEVCFormatNormalizer() throws {
+        var reorderBuffer = OpticalFlowPTSReorderBuffer<Double>(maxDepth: 3)
+        let inputs: [Double] = [0.0, 0.16, 0.08, 0.04, 0.12, 0.24, 0.20]
+        var reordered: [Double] = []
+        for pts in inputs {
+            reorderBuffer.insert(pts: pts, frame: pts)
+            while let ready = reorderBuffer.popNextIfReady() {
+                reordered.append(ready.pts)
+            }
+        }
+        reordered.append(contentsOf: reorderBuffer.drainAll().map(\.pts))
+        XCTAssertEqual(reorderBuffer.count, 0)
+        XCTAssertEqual(reordered, [0.0, 0.04, 0.08, 0.12, 0.16, 0.20, 0.24])
+
+        for tag in ["hev1", "hvc1", "avc3"] {
+            let code = HEVCFormatNormalizer.fourCCCode(tag)
+            XCTAssertEqual(HEVCFormatNormalizer.fourCCString(code), tag)
+        }
+
+        let vps = Data([0x40, 0x01, 0x0C, 0x01])
+        let sps = Data([0x42, 0x01, 0x01, 0x01, 0x60])
+        let pps = Data([0x44, 0x01, 0xC1, 0x73])
+        let idrSlice = Data([0x26, 0x01, 0xAF, 0x00])
+
+        var hvcc = Data(repeating: 0, count: 23)
+        hvcc[0] = 1
+        hvcc[21] = 0x03
+        hvcc[22] = 3
+        for (nalType, payload) in [(UInt8(32), vps), (UInt8(33), sps), (UInt8(34), pps)] {
+            hvcc.append(0x80 | nalType)
+            hvcc.append(0x00)
+            hvcc.append(0x01)
+            hvcc.append(UInt8((payload.count >> 8) & 0xFF))
+            hvcc.append(UInt8(payload.count & 0xFF))
+            hvcc.append(payload)
+        }
+
+        let parsedHVCC = try XCTUnwrap(HEVCFormatNormalizer.parseHEVCParameterSets(fromHVCC: hvcc))
+        XCTAssertEqual(parsedHVCC.nalLengthSize, 4)
+        XCTAssertEqual(parsedHVCC.parameterSets.count, 3)
+        XCTAssertEqual(parsedHVCC.parameterSets, [vps, sps, pps])
+
+        var lengthPrefixed = Data()
+        for nalu in [vps, sps, pps, idrSlice, vps] {
+            var bigLen = UInt32(nalu.count).bigEndian
+            withUnsafeBytes(of: &bigLen) { lengthPrefixed.append(contentsOf: $0) }
+            lengthPrefixed.append(nalu)
+        }
+        let extracted = HEVCFormatNormalizer.extractHEVCParameterSets(fromLengthPrefixed: lengthPrefixed, nalLengthSize: 4)
+        XCTAssertEqual(extracted, [vps, sps, pps])
     }
 }

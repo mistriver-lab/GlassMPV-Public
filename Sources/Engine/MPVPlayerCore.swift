@@ -375,6 +375,9 @@ final class MPVPlayerController: ObservableObject {
     }
 
     func releaseMediaForExternalEngine() {
+        if isStoppedByUser && isPaused {
+            return
+        }
         isStoppedByUser = true
         player.stop()
         isPaused = true

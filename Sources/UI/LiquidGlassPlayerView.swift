@@ -1349,9 +1349,9 @@ struct EnhancementControlSheet: View {
         case .off:
             return "按片源原生帧率输出"
         case .mpvSmooth120Hz:
-            return "display-resample + 自适应 tscale (≤2K mitchell / 4K linear)，消除24p抖动并与GLSL超分共存"
+            return "display-resample + 自适应 tscale (≤2K mitchell / 4K linear)，时间轴去抖动（非运动光流，24p→120Hz 整数倍体感接近原帧率）；真补帧请切 ANE 光流核"
         case .vtOpticalFlow2x:
-            return "Apple VideoToolbox 神经网络真光流插帧（仅 MP4/MOV）"
+            return "Apple VideoToolbox ANE 硬件光流真补帧（生成运动中间帧，支持常规与 hev1 透传硬解兜底，仅 MP4/MOV）"
         }
     }
 }
