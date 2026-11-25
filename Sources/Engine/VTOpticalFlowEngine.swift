@@ -188,7 +188,7 @@ enum HEVCFormatNormalizer {
 
     static func describeFormat(_ desc: CMFormatDescription) -> String {
         let subType = CMFormatDescriptionGetMediaSubType(desc)
-        let dims = CMFormatDescriptionGetDimensions(desc)
+        let dims = CMVideoFormatDescriptionGetDimensions(desc)
         let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any]
         let atoms = exts?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
         let atomKeys = atoms.map { Array($0.keys).sorted().joined(separator: ",") } ?? "none"
@@ -265,7 +265,7 @@ enum HEVCFormatNormalizer {
         var data = Data(count: copyLength)
         let status = data.withUnsafeMutableBytes { rawBuffer -> OSStatus in
             guard let baseAddress = rawBuffer.baseAddress else {
-                return kCMBlockBufferBadArgumentErr
+                return OSStatus(-12701)
             }
             return CMBlockBufferCopyDataBytes(
                 blockBuffer,
@@ -283,7 +283,7 @@ enum HEVCFormatNormalizer {
     ) -> [(strategy: String, description: CMVideoFormatDescription)] {
         var candidates: [(strategy: String, description: CMVideoFormatDescription)] = []
         let subType = CMFormatDescriptionGetMediaSubType(rawDesc)
-        let dims = CMFormatDescriptionGetDimensions(rawDesc)
+        let dims = CMVideoFormatDescriptionGetDimensions(rawDesc)
         let rawExtensions = CMFormatDescriptionGetExtensions(rawDesc) as? [String: Any]
         let atoms = rawExtensions?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
 
@@ -574,7 +574,8 @@ private final class VTDecompressionSessionHolder: @unchecked Sendable {
             return (kVTInvalidSessionErr, ([], kVTInvalidSessionErr))
         }
         guard let rewritten = HEVCFormatNormalizer.rewriteSampleBuffer(sampleBuffer, with: formatDescription) else {
-            return (paramErr, ([], paramErr))
+            let errStatus: OSStatus = -12902
+            return (errStatus, ([], errStatus))
         }
         let localCollector = collector
         let decodeStatus = VTDecompressionSessionDecodeFrame(
@@ -1880,7 +1881,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     decompressionSessionOut: &session
                 )
                 if status == noErr, let session {
-                    VTSessionSetProperty(
+                    _ = VTSessionSetProperty(
                         session,
                         key: kVTDecompressionPropertyKey_RealTime,
                         value: kCFBooleanTrue
