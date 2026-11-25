@@ -357,10 +357,44 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 } else {
                     self.usesSyntheticClock = false
                     self.clockSourceLabel = "AVPlayer音频"
-                    let item = AVPlayerItem(url: url)
-                    for pTrack in item.tracks where pTrack.assetTrack?.mediaType == .video {
-                        pTrack.isEnabled = false
+                    let item: AVPlayerItem
+                    if let sourceAudio = audioTracks.first {
+                        do {
+                            let audioComposition = AVMutableComposition()
+                            guard let compTrack = audioComposition.addMutableTrack(
+                                withMediaType: .audio,
+                                preferredTrackID: kCMPersistentTrackID_Invalid
+                            ) else {
+                                throw NSError(domain: "GlassMPV.OpticalFlow", code: -101, userInfo: [
+                                    NSLocalizedDescriptionKey: "无法创建纯音频合成轨道"
+                                ])
+                            }
+                            let loadedRange = (try? await sourceAudio.load(.timeRange)) ?? CMTimeRange(start: .zero, duration: assetDuration)
+                            let validRange: CMTimeRange
+                            if loadedRange.duration.isValid && loadedRange.duration.seconds > 0 {
+                                validRange = loadedRange
+                            } else {
+                                validRange = CMTimeRange(start: .zero, duration: assetDuration)
+                            }
+                            try compTrack.insertTimeRange(validRange, of: sourceAudio, at: .zero)
+                            item = AVPlayerItem(asset: audioComposition)
+                            self.appendLog("[ane] 已构建纯音轨 AVMutableComposition，避免音频播放器抢占硬解会话")
+                        } catch {
+                            self.appendLog("[ane][warn] 纯音轨合成失败，回退 URL 并禁用视频轨: \(Self.formatDetailedError(error))")
+                            let fallbackItem = AVPlayerItem(url: url)
+                            for pTrack in fallbackItem.tracks where pTrack.assetTrack?.mediaType == .video {
+                                pTrack.isEnabled = false
+                            }
+                            item = fallbackItem
+                        }
+                    } else {
+                        let fallbackItem = AVPlayerItem(url: url)
+                        for pTrack in fallbackItem.tracks where pTrack.assetTrack?.mediaType == .video {
+                            pTrack.isEnabled = false
+                        }
+                        item = fallbackItem
                     }
+                    guard self.isTokenValid(token) else { return }
                     let player = AVPlayer(playerItem: item)
                     player.rate = 0
                     self.audioPlayer = player
@@ -403,8 +437,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.isPaused = true
                 self.isLoadingPipeline = false
                 self.pipelineStatusText = ""
-                self.appendLog("[ane][error] 加载轨道信息失败: \(error.localizedDescription)")
-                self.errorMessage = "光流核加载失败（\(error.localizedDescription)），建议切换回「MPV 超分核」。"
+                let detailed = Self.formatDetailedError(error)
+                self.appendLog("[ane][error] 加载轨道信息失败: \(detailed)")
+                self.errorMessage = "光流核加载失败（\(detailed)），建议切换回「MPV 超分核」。"
             }
         }
 #endif
@@ -686,45 +721,28 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             }
 
-            let reader = try AVAssetReader(asset: asset)
-            if startSeconds > 0 {
-                reader.timeRange = CMTimeRange(
-                    start: CMTime(seconds: startSeconds, preferredTimescale: 600),
-                    duration: .positiveInfinity
-                )
-            }
-
-            let preferredSettings = Self.buildReaderOutputSettings(from: configuration, pixelFormat: pixelFormat)
-            var trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: preferredSettings)
-            trackOutput.alwaysCopiesSampleData = false
-            if !reader.canAdd(trackOutput) {
-                let minimalSettings: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                    kCVPixelBufferMetalCompatibilityKey as String: true
-                ]
-                trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: minimalSettings)
-                trackOutput.alwaysCopiesSampleData = false
-                guard reader.canAdd(trackOutput) else {
-                    logAsync("[ane] 无法添加 AVAssetReaderTrackOutput，建议切换 MPV 超分核")
-                    Task { @MainActor [weak self] in
-                        self?.isLoadingPipeline = false
-                        self?.pipelineStatusText = ""
-                        self?.errorMessage = "无法读取视频轨道，建议切换「MPV 超分核」。"
-                    }
-                    return
+            let openedReader = try openAssetReaderWithFallback(
+                asset: asset,
+                videoTrack: videoTrack,
+                startSeconds: startSeconds,
+                preferredPixelFormat: pixelFormat,
+                prefer10Bit: prefer10Bit
+            )
+            let reader = openedReader.reader
+            let trackOutput = openedReader.output
+            var forceNormalizeSource = (openedReader.pixelFormat != pixelFormat)
+            var sourceNormPool = try? makeSourceNormalizationPool(
+                configuration: configuration,
+                width: activeWidth,
+                height: activeHeight,
+                pixelFormat: pixelFormat
+            )
+            var sourceTransferSession: VTPixelTransferSession?
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &sourceTransferSession)
+            defer {
+                if let sourceTransferSession {
+                    VTPixelTransferSessionInvalidate(sourceTransferSession)
                 }
-            }
-            reader.add(trackOutput)
-            guard reader.startReading() else {
-                let errDesc = reader.error?.localizedDescription ?? "AVAssetReader 启动失败"
-                logAsync("[ane][error] AVAssetReader startReading 失败: \(errDesc)")
-                Task { @MainActor [weak self] in
-                    self?.isLoadingPipeline = false
-                    self?.pipelineStatusText = ""
-                    self?.errorMessage = "光流读取视频失败：\(errDesc)"
-                }
-                return
             }
 
             var destPool = try makeDestinationPool(
@@ -794,6 +812,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                             activeWidth = actualW
                             activeHeight = actualH
                             activeSpatial2x = rebuilt.effectiveSpatial2x
+                            sourceNormPool = try? makeSourceNormalizationPool(
+                                configuration: configuration,
+                                width: activeWidth,
+                                height: activeHeight,
+                                pixelFormat: pixelFormat
+                            )
                             destPool = try makeDestinationPool(
                                 configuration: configuration,
                                 fallbackWidth: activeSpatial2x ? activeWidth * 2 : activeWidth,
@@ -807,6 +831,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         }
                     }
                 }
+
+                let workingBuffer = normalizeSourceBufferIfNeeded(
+                    currentBuffer,
+                    targetPixelFormat: pixelFormat,
+                    forceNormalize: forceNormalizeSource,
+                    transferSession: sourceTransferSession,
+                    pool: sourceNormPool
+                )
 
                 let behindAudioClock = didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.18)
                 if behindAudioClock {
@@ -822,7 +854,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                           currentPTS > previousPTS,
                           Self.isValidInterpolationDelta(currentPTS.seconds - previousPTS.seconds) {
                     if let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: previousPTS),
-                       let currFrame = VTFrameProcessorFrame(buffer: currentBuffer, presentationTimeStamp: currentPTS) {
+                       let currFrame = VTFrameProcessorFrame(buffer: workingBuffer, presentationTimeStamp: currentPTS) {
                         var destBufOpt: CVPixelBuffer?
                         let poolStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, destPool, &destBufOpt)
 
@@ -841,7 +873,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                     _ = try await processor.process(parameters: params)
                                     let elapsedMs = (CACurrentMediaTime() - processStart) * 1000.0
                                     totalInterpolationMs += elapsedMs
-                                    CVBufferPropagateAttachments(currentBuffer, destBuf)
+                                    CVBufferPropagateAttachments(workingBuffer, destBuf)
                                     enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
                                     localSuccessCount += 1
                                     localConsecutiveFailures = 0
@@ -856,8 +888,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                     }
                                 } catch {
                                     localConsecutiveFailures += 1
+                                    let detailed = Self.formatDetailedError(error)
+                                    if !forceNormalizeSource && localSuccessCount == 0 && sourceNormPool != nil {
+                                        forceNormalizeSource = true
+                                        logAsync("[ane][warn] 检测到源帧属性不匹配，自动启用源帧标准化池重试: \(detailed)")
+                                    }
                                     recordInterpolationFailure(
-                                        "process 异常: \(error.localizedDescription)",
+                                        "process 异常: \(detailed)",
                                         consecutiveFailures: localConsecutiveFailures,
                                         totalSuccesses: localSuccessCount
                                     )
@@ -888,7 +925,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     }
                 }
 
-                let outputBuffer = scaleIfNeeded(currentBuffer, spatial2x: activeSpatial2x, transferSession: transferSession, pool: destPool)
+                let finalSourceBuffer = forceNormalizeSource
+                    ? normalizeSourceBufferIfNeeded(
+                        currentBuffer,
+                        targetPixelFormat: pixelFormat,
+                        forceNormalize: true,
+                        transferSession: sourceTransferSession,
+                        pool: sourceNormPool
+                    )
+                    : workingBuffer
+                let outputBuffer = scaleIfNeeded(finalSourceBuffer, spatial2x: activeSpatial2x, transferSession: transferSession, pool: destPool)
                 if !didCachePendingFirstFrame {
                     didCachePendingFirstFrame = true
                     cachePendingFirstFrame(outputBuffer, ptsSeconds: currentPTS.seconds)
@@ -903,12 +949,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         self.startActiveClockIfNeeded()
                     }
                 }
-                previousBuffer = currentBuffer
+                previousBuffer = finalSourceBuffer
                 previousPTS = currentPTS
             }
 
             if reader.status == .failed && isTokenValid(token) {
-                let errDesc = reader.error?.localizedDescription ?? "读取中断"
+                let errDesc = Self.formatDetailedError(reader.error)
                 logAsync("[ane][error] AVAssetReader 读取异常终止: \(errDesc)")
                 if !didStartAudioClock {
                     Task { @MainActor [weak self] in
@@ -936,7 +982,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             }
         } catch {
-            let desc = error.localizedDescription
+            let desc = Self.formatDetailedError(error)
             logAsync("[ane][error] 光流插帧运行异常：\(desc)")
             Task { @MainActor [weak self] in
                 self?.isLoadingPipeline = false
@@ -1177,28 +1223,113 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     }
 
-    private static func buildReaderOutputSettings(
-        from configuration: VTLowLatencyFrameInterpolationConfiguration,
-        pixelFormat: OSType
-    ) -> [String: Any] {
-        var settings: [String: Any] = [:]
-        let inheritedKeys: [String] = [
-            kCVPixelBufferBytesPerRowAlignmentKey as String,
-            kCVPixelBufferPlaneAlignmentKey as String,
-            kCVPixelBufferExtendedPixelsLeftKey as String,
-            kCVPixelBufferExtendedPixelsRightKey as String,
-            kCVPixelBufferExtendedPixelsTopKey as String,
-            kCVPixelBufferExtendedPixelsBottomKey as String
-        ]
-        for key in inheritedKeys {
-            if let value = configuration.sourcePixelBufferAttributes[key] {
-                settings[key] = value
+    private func openAssetReaderWithFallback(
+        asset: AVURLAsset,
+        videoTrack: AVAssetTrack,
+        startSeconds: Double,
+        preferredPixelFormat: OSType,
+        prefer10Bit: Bool
+    ) throws -> (reader: AVAssetReader, output: AVAssetReaderTrackOutput, tierLabel: String, pixelFormat: OSType) {
+        let tiers = Self.buildReaderSettingsTiers(preferredFormat: preferredPixelFormat, prefer10Bit: prefer10Bit)
+        var failures: [String] = []
+        for tier in tiers {
+            let reader = try AVAssetReader(asset: asset)
+            if startSeconds > 0 {
+                reader.timeRange = CMTimeRange(
+                    start: CMTime(seconds: startSeconds, preferredTimescale: 600),
+                    duration: .positiveInfinity
+                )
+            }
+            let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: tier.settings)
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else {
+                let msg = "tier=\(tier.label): canAdd=false"
+                failures.append(msg)
+                logAsync("[ane][warn] AVAssetReader \(msg)")
+                continue
+            }
+            reader.add(output)
+            if reader.startReading() {
+                logAsync("[ane] AVAssetReader 启动成功 (tier=\(tier.label), pixFmt=\(Self.fourCCString(tier.pixelFormat)))")
+                return (reader: reader, output: output, tierLabel: tier.label, pixelFormat: tier.pixelFormat)
+            } else {
+                let errStr = Self.formatDetailedError(reader.error)
+                let msg = "tier=\(tier.label): startReading=false (\(errStr))"
+                failures.append(msg)
+                logAsync("[ane][warn] AVAssetReader \(msg)")
+                reader.cancelReading()
             }
         }
-        settings[kCVPixelBufferPixelFormatTypeKey as String] = pixelFormat
-        settings[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
-        settings[kCVPixelBufferMetalCompatibilityKey as String] = true
-        return settings
+        let summary = failures.joined(separator: " | ")
+        throw NSError(domain: "GlassMPV.OpticalFlow.Reader", code: -201, userInfo: [
+            NSLocalizedDescriptionKey: "所有 AVAssetReader 解码档位均失败: \(summary)"
+        ])
+    }
+
+    private func makeSourceNormalizationPool(
+        configuration: VTLowLatencyFrameInterpolationConfiguration,
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) throws -> CVPixelBufferPool {
+        var attrs: [String: Any] = [:]
+        for (k, v) in configuration.sourcePixelBufferAttributes {
+            attrs[k] = v
+        }
+        attrs[kCVPixelBufferWidthKey as String] = width
+        attrs[kCVPixelBufferHeightKey as String] = height
+        if let rawFmt = attrs[kCVPixelBufferPixelFormatTypeKey as String],
+           let arr = rawFmt as? [NSNumber] {
+            let targetNum = NSNumber(value: pixelFormat)
+            if arr.contains(targetNum) {
+                attrs[kCVPixelBufferPixelFormatTypeKey as String] = targetNum
+            } else if let first = arr.first {
+                attrs[kCVPixelBufferPixelFormatTypeKey as String] = first
+            } else {
+                attrs[kCVPixelBufferPixelFormatTypeKey as String] = pixelFormat
+            }
+        } else {
+            attrs[kCVPixelBufferPixelFormatTypeKey as String] = pixelFormat
+        }
+        attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+        attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+
+        var pool: CVPixelBufferPool?
+        let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
+        guard status == kCVReturnSuccess, let pool else {
+            throw NSError(domain: "GlassMPV.OpticalFlow", code: Int(status), userInfo: [
+                NSLocalizedDescriptionKey: "无法创建源帧标准化 CVPixelBufferPool (\(status))"
+            ])
+        }
+        return pool
+    }
+
+    private func normalizeSourceBufferIfNeeded(
+        _ buffer: CVPixelBuffer,
+        targetPixelFormat: OSType,
+        forceNormalize: Bool,
+        transferSession: VTPixelTransferSession?,
+        pool: CVPixelBufferPool?
+    ) -> CVPixelBuffer {
+        let currentFmt = CVPixelBufferGetPixelFormatType(buffer)
+        let hasIOSurface = CVPixelBufferGetIOSurface(buffer) != nil
+        if !forceNormalize && currentFmt == targetPixelFormat && hasIOSurface {
+            return buffer
+        }
+        guard let transferSession, let pool else {
+            return buffer
+        }
+        var normalizedOpt: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &normalizedOpt) == kCVReturnSuccess,
+              let normalized = normalizedOpt else {
+            return buffer
+        }
+        let status = VTPixelTransferSessionTransferImage(transferSession, from: buffer, to: normalized)
+        if status == noErr {
+            CVBufferPropagateAttachments(buffer, normalized)
+            return normalized
+        }
+        return buffer
     }
 
     private func makeDestinationPool(
@@ -1357,7 +1488,64 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         return (width, height, codec, bitDepth, hdrTag)
     }
 
-    private static func fourCCString(_ code: FourCharCode) -> String {
+    nonisolated static func formatDetailedError(_ error: Error?) -> String {
+        guard let error else { return "未知错误" }
+        let nsErr = error as NSError
+        var parts = ["\(nsErr.domain)(\(nsErr.code)): \(nsErr.localizedDescription)"]
+        if let reason = nsErr.localizedFailureReason,
+           !reason.isEmpty,
+           !nsErr.localizedDescription.contains(reason) {
+            parts.append("reason: \(reason)")
+        }
+        if let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("[underlying: \(underlying.domain)(\(underlying.code)): \(underlying.localizedDescription)]")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    nonisolated static func buildReaderSettingsTiers(
+        preferredFormat: OSType,
+        prefer10Bit: Bool
+    ) -> [(label: String, pixelFormat: OSType, settings: [String: Any])] {
+        var tiers: [(label: String, pixelFormat: OSType, settings: [String: Any])] = []
+        let ioMetalBase: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        func appendTier(label: String, format: OSType, includeIOMetal: Bool) {
+            var settings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: format
+            ]
+            if includeIOMetal {
+                for (k, v) in ioMetalBase {
+                    settings[k] = v
+                }
+            }
+            tiers.append((label: label, pixelFormat: format, settings: settings))
+        }
+
+        appendTier(label: "preferred(\(fourCCString(preferredFormat)))", format: preferredFormat, includeIOMetal: true)
+
+        let format8Bit = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        if preferredFormat != format8Bit {
+            appendTier(label: "fallback-420v", format: format8Bit, includeIOMetal: true)
+        } else if prefer10Bit {
+            let format10Bit = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            appendTier(label: "fallback-p010", format: format10Bit, includeIOMetal: true)
+        }
+
+        let formatBGRA = kCVPixelFormatType_32BGRA
+        if preferredFormat != formatBGRA {
+            appendTier(label: "fallback-BGRA", format: formatBGRA, includeIOMetal: true)
+        }
+
+        appendTier(label: "minimal-420v", format: format8Bit, includeIOMetal: false)
+        appendTier(label: "minimal-BGRA", format: formatBGRA, includeIOMetal: false)
+        return tiers
+    }
+
+    nonisolated private static func fourCCString(_ code: FourCharCode) -> String {
         let bytes: [UInt8] = [
             UInt8((code >> 24) & 0xFF),
             UInt8((code >> 16) & 0xFF),

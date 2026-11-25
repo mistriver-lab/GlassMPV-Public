@@ -140,7 +140,7 @@ final class MPVPlayerController: ObservableObject {
     static let defaultConfiguration = MPVPlayerConfiguration(
         automaticallyPlays: true,
         hardwareDecoding: .automatic,
-        logLevel: .warning,
+        logLevel: .info,
         isLoopingEnabled: true,
         videoOutput: .metal
     )
@@ -174,6 +174,8 @@ final class MPVPlayerController: ObservableObject {
     @Published var lastErrorMessage: String?
     @Published var diagnosticLogs: [String] = []
     @Published var isInitialized: Bool = false
+    @Published var latestMPVProbe: MPVProbeSnapshot?
+    @Published var lastMeasuredProMotionFPS: Double = 0
 
     let player: MPVPlayer
 
@@ -191,16 +193,22 @@ final class MPVPlayerController: ObservableObject {
     private var currentSpeed: Double = 1.0
     private var lastAppliedReadyGeneration: UInt64?
     private var last4KGateLoggedSize: (Int, Int)?
+    private var isStoppedByUser: Bool = false
+    private var lastAppliedTscale: String = ""
+    private var lastProbeLoggedSignature: String?
 
     init(configuration: MPVPlayerConfiguration = MPVPlayerController.defaultConfiguration) {
         self.player = MPVPlayer(configuration: configuration)
         self.player.setDiagnosticsEnabled(true)
         self.player.logHandler = { [weak self] logMsg in
-            self?.appendLog("[\(logMsg.level.rawValue)][\(logMsg.prefix)] \(logMsg.message)")
+            self?.handleIncomingLog(logMsg)
         }
 
         self.proMotionKeeper.onMeasuredRefreshUpdate = { [weak self] hz in
             self?.measuredProMotionFPS = hz
+            if hz > 0 {
+                self?.lastMeasuredProMotionFPS = hz
+            }
         }
 
         self.isInitialized = true
@@ -216,6 +224,11 @@ final class MPVPlayerController: ObservableObject {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
 
+        isStoppedByUser = false
+        latestMPVProbe = nil
+        lastProbeLoggedSignature = nil
+        lastAppliedTscale = ""
+        lastMeasuredProMotionFPS = 0
         lastErrorMessage = nil
         statusMessage = ""
         currentTime = 0
@@ -316,16 +329,25 @@ final class MPVPlayerController: ObservableObject {
                 .compactMap { $0 as? UIWindowScene }
                 .first?.screen.maximumFramesPerSecond ?? 120
             let targetDisplayFPS = max(screenMaxFPS, 60)
+            let is4K = SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight)
+            let tscale = is4K ? "linear" : "mitchell"
+            lastAppliedTscale = tscale
+
             player.setProperty("video-sync", to: "display-resample")
             player.setProperty("interpolation", to: "yes")
             player.setProperty("interpolation-threshold", to: "-1")
             player.setProperty("interpolation-preserve", to: "yes")
-            player.setProperty("tscale", to: "mitchell")
+            player.setProperty("tscale", to: tscale)
             player.setProperty("display-fps-override", to: "\(targetDisplayFPS)")
             targetDisplaySyncFPS = Double(targetDisplayFPS)
             syncProMotionKeeper()
-            appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑 (display-resample + interpolation-threshold=-1 + interpolation-preserve=yes + tscale=mitchell + display-fps-override=\(targetDisplayFPS))")
+            let scaleHint = is4K ? " (4K自适应tscale=linear)" : ""
+            appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑\(scaleHint) (display-resample + interpolation-threshold=-1 + interpolation-preserve=yes + tscale=\(tscale) + display-fps-override=\(targetDisplayFPS))")
+            if !isStoppedByUser {
+                probeInterpolationState()
+            }
         case .off, .vtOpticalFlow2x:
+            lastAppliedTscale = ""
             player.setProperty("interpolation", to: "no")
             player.setProperty("interpolation-preserve", to: "no")
             player.setProperty("interpolation-threshold", to: "0.01")
@@ -336,6 +358,29 @@ final class MPVPlayerController: ObservableObject {
             syncProMotionKeeper()
             appendLog("[interp] 关闭时域插值 (video-sync=audio)")
         }
+    }
+
+    func probeInterpolationState() {
+        guard isInitialized, !isStoppedByUser,
+              (player.isPlaybackReady || player.hasVideoFrame || videoWidth > 0) else {
+            return
+        }
+        player.executeCommand(
+            "expand-properties",
+            arguments: [
+                "print-text",
+                "[mpv-probe] sync_active=${display-sync-active} video_sync=${video-sync} interp=${interpolation} tscale=${tscale} vsync_ratio=${vsync-ratio} disp_fps=${display-fps} est_disp=${estimated-display-fps}"
+            ]
+        )
+    }
+
+    func releaseMediaForExternalEngine() {
+        isStoppedByUser = true
+        player.stop()
+        isPaused = true
+        syncProMotionKeeper()
+        playbackState = "已释放(外部引擎接管)"
+        appendLog("[lifecycle] 已停止 MPV 并释放硬解会话，交由 ANE 光流核接管")
     }
 
     func clearError() {
@@ -414,6 +459,7 @@ final class MPVPlayerController: ObservableObject {
     }
 
     func stopPlayback() {
+        isStoppedByUser = true
         player.stop()
         isPaused = true
         syncProMotionKeeper()
@@ -441,6 +487,7 @@ final class MPVPlayerController: ObservableObject {
         isSuperResolutionGatedBy4K = false
         last4KGateLoggedSize = nil
         lastAppliedReadyGeneration = nil
+        lastAppliedTscale = ""
         lastErrorMessage = nil
         statusMessage = ""
         playbackState = "待机"
@@ -448,6 +495,7 @@ final class MPVPlayerController: ObservableObject {
     }
 
     func shutdown() {
+        isStoppedByUser = true
         player.stop()
         isPaused = true
         isInitialized = false
@@ -485,6 +533,7 @@ final class MPVPlayerController: ObservableObject {
         let timingTask = Task { @MainActor [weak self] in
             for await timing in timingStream {
                 guard let self, !Task.isCancelled else { break }
+                guard self.isInitialized, !self.isStoppedByUser else { continue }
                 self.currentTime = Self.seconds(from: timing.position)
                 let dur = Self.seconds(from: timing.duration)
                 if dur > 0 {
@@ -496,7 +545,48 @@ final class MPVPlayerController: ObservableObject {
         taskBag.store(timingTask)
     }
 
+    private func handleIncomingLog(_ logMsg: MPVLogMessage) {
+        if logMsg.message.contains("[mpv-probe]") {
+            if let parsed = MPVProbeSnapshot.parse(from: logMsg.message) {
+                latestMPVProbe = parsed
+                if parsed.stateSignature != lastProbeLoggedSignature {
+                    lastProbeLoggedSignature = parsed.stateSignature
+                    appendLog("[probe] \(parsed.summaryText)")
+                }
+            }
+            return
+        }
+
+        let shouldLog: Bool
+        switch logMsg.level {
+        case .fatal, .error, .warning:
+            shouldLog = true
+        case .info, .status, .verbose, .debug, .trace:
+            let combined = "\(logMsg.prefix) \(logMsg.message)".lowercased()
+            let keywords = [
+                "display-sync",
+                "interpolation",
+                "tscale",
+                "videotoolbox",
+                "gpu-next",
+                "vsync",
+                "swapchain",
+                "shader",
+                "error",
+                "fail",
+                "drop",
+                "vo/"
+            ]
+            shouldLog = keywords.contains(where: { combined.contains($0) })
+        case .none:
+            shouldLog = false
+        }
+        guard shouldLog else { return }
+        appendLog("[\(logMsg.level.rawValue)][\(logMsg.prefix)] \(logMsg.message)")
+    }
+
     private func handlePlaybackEvent(_ event: MPVPlaybackEvent) {
+        guard !isStoppedByUser else { return }
         switch event.change {
         case .snapshot(let snapshot):
             isPaused = snapshot.isPaused
@@ -578,6 +668,12 @@ final class MPVPlayerController: ObservableObject {
             let is4K = SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight)
             if is4K != isSuperResolutionGatedBy4K || (is4K && activeShaderCount > 0) {
                 applyShaders(preset: currentPreset, extras: currentExtras)
+            }
+            if currentInterpolation == .mpvSmooth120Hz {
+                let desiredTscale = is4K ? "linear" : "mitchell"
+                if desiredTscale != lastAppliedTscale {
+                    applyInterpolation(.mpvSmooth120Hz)
+                }
             }
         }
         if let fps = info.framesPerSecond, fps > 0 {

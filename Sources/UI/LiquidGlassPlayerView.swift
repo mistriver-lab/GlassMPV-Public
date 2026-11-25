@@ -13,6 +13,14 @@ private final class ThermalObserverToken: @unchecked Sendable {
     }
 }
 
+private final class TelemetryLoopToken: @unchecked Sendable {
+    var task: Task<Void, Never>?
+
+    deinit {
+        task?.cancel()
+    }
+}
+
 @MainActor
 final class PlayerCoordinator: ObservableObject {
     @Published var engineMode: PlayerEngineMode = .mpv
@@ -26,10 +34,12 @@ final class PlayerCoordinator: ObservableObject {
     @Published var isImportingFile: Bool = false
     @Published var selfCheckReport: String = ""
     @Published var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+    @Published var runtimeTimeline: [RuntimeTelemetrySample] = []
 
     let mpvController = MPVPlayerController()
     let opticalFlowController = OpticalFlowPlayerController()
     private let thermalToken = ThermalObserverToken()
+    private let telemetryLoopToken = TelemetryLoopToken()
 
     init() {
         thermalToken.observer = NotificationCenter.default.addObserver(
@@ -174,6 +184,10 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func closeToHome() {
+        if currentURL != nil {
+            captureRuntimeTelemetrySample()
+        }
+        stopRuntimeTelemetrySampling()
         mpvController.stopPlayback()
         opticalFlowController.stop()
         currentURL = nil
@@ -185,10 +199,94 @@ final class PlayerCoordinator: ObservableObject {
     private func beginPlayback(url: URL) {
         let enteringFromHome = (currentURL == nil)
         currentURL = url
+        runtimeTimeline.removeAll()
         if enteringFromHome {
             OrientationController.shared.enterVideoLandscape()
         }
         startPlaybackForCurrentEngine()
+        startRuntimeTelemetrySampling()
+    }
+
+    var currentInterpolationVerdict: InterpolationVerdict {
+        switch engineMode {
+        case .mpv:
+            let measuredPM = mpvController.measuredProMotionFPS > 0
+                ? mpvController.measuredProMotionFPS
+                : mpvController.lastMeasuredProMotionFPS
+            return InterpolationVerdict.evaluateMPV(
+                mode: interpolationMode,
+                probe: mpvController.latestMPVProbe,
+                targetDisplaySyncFPS: mpvController.targetDisplaySyncFPS,
+                reportedDisplayFPS: mpvController.displaySyncFPS,
+                measuredProMotionFPS: measuredPM
+            )
+        case .opticalFlow:
+            return InterpolationVerdict.evaluateANE(
+                interpolatedCount: opticalFlowController.interpolatedFrameCount,
+                failedCount: opticalFlowController.failedInterpolationCount,
+                presentedCount: opticalFlowController.presentedFrameCount,
+                actualOutputFPS: opticalFlowController.actualOutputFPS,
+                sourceFPS: opticalFlowController.sourceFPS,
+                errorMessage: opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError
+            )
+        }
+    }
+
+    func startRuntimeTelemetrySampling() {
+        telemetryLoopToken.task?.cancel()
+        let loopTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, self.currentURL != nil else { break }
+                if self.engineMode == .mpv {
+                    self.mpvController.refreshDiagnosticsSnapshot()
+                    self.mpvController.probeInterpolationState()
+                    try? await Task.sleep(for: .milliseconds(150))
+                    guard !Task.isCancelled, self.currentURL != nil else { break }
+                }
+                self.captureRuntimeTelemetrySample()
+            }
+        }
+        telemetryLoopToken.task = loopTask
+    }
+
+    func stopRuntimeTelemetrySampling() {
+        telemetryLoopToken.task?.cancel()
+        telemetryLoopToken.task = nil
+    }
+
+    func captureRuntimeTelemetrySample() {
+        let verdict = currentInterpolationVerdict
+        let metrics = hudMetrics
+        let pmFPS = mpvController.measuredProMotionFPS > 0
+            ? mpvController.measuredProMotionFPS
+            : mpvController.lastMeasuredProMotionFPS
+        let sample = RuntimeTelemetrySample(
+            engine: engineMode.rawValue,
+            playbackState: engineMode == .mpv ? mpvController.playbackState : (opticalFlowController.isPaused ? "已暂停" : "播放中"),
+            mediaTime: activeCurrentTime,
+            width: metrics.width,
+            height: metrics.height,
+            sourceFPS: metrics.sourceFPS,
+            outputFPS: metrics.outputFPS,
+            displayFPS: mpvController.displaySyncFPS,
+            proMotionFPS: pmFPS,
+            droppedFrames: metrics.droppedFrames,
+            mistimedFrames: mpvController.mistimedFrames,
+            delayedFrames: mpvController.delayedFrames,
+            mpvProbe: mpvController.latestMPVProbe,
+            aneInterpolated: opticalFlowController.interpolatedFrameCount,
+            aneSkipped: opticalFlowController.skippedInterpolationCount,
+            aneFailed: opticalFlowController.failedInterpolationCount,
+            anePresented: opticalFlowController.presentedFrameCount,
+            aneAvgMs: opticalFlowController.averageInterpolationMs,
+            verdictLabel: verdict.shortLabel,
+            thermalLevel: ThermalLevel(state: thermalState)
+        )
+        runtimeTimeline.append(sample)
+        if runtimeTimeline.count > 180 {
+            runtimeTimeline.removeFirst(runtimeTimeline.count - 180)
+        }
     }
 
     func playBuiltInSampleVideo() {
@@ -224,6 +322,8 @@ final class PlayerCoordinator: ObservableObject {
 
     func runRealDeviceSelfCheck() {
         mpvController.refreshDiagnosticsSnapshot()
+        mpvController.probeInterpolationState()
+        let verdict = currentInterpolationVerdict
 
         let maxScreenFPS = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
@@ -260,12 +360,18 @@ final class PlayerCoordinator: ObservableObject {
         let mpvDisplayText = mpvController.displaySyncFPS > 0
             ? String(format: "%.1fHz", mpvController.displaySyncFPS)
             : "未上报"
-        let proMotionText = mpvController.isProMotionKeeperActive
-            ? "保活中(\(String(format: "%.1f", mpvController.measuredProMotionFPS))Hz)"
-            : "未保活"
+        let proMotionText: String
+        if mpvController.isProMotionKeeperActive {
+            proMotionText = "保活中(\(String(format: "%.1f", mpvController.measuredProMotionFPS))Hz)"
+        } else if mpvController.lastMeasuredProMotionFPS > 0 {
+            proMotionText = "已停止(最近峰值\(String(format: "%.1f", mpvController.lastMeasuredProMotionFPS))Hz)"
+        } else {
+            proMotionText = "未保活"
+        }
+        let probeText = mpvController.latestMPVProbe?.summaryText ?? "未采到"
 
         let mpvStatus = mpvController.isInitialized
-            ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | targetSync=\(String(format: "%.0f", mpvController.targetDisplaySyncFPS))Hz | mpvDisplay=\(mpvDisplayText) | proMotion=\(proMotionText) | pass(fresh/redraw)=\(mpvController.freshRenderPassCount)/\(mpvController.redrawRenderPassCount) | mistimed=\(mpvController.mistimedFrames) | delayed=\(mpvController.delayedFrames) | err=\(mpvController.lastErrorMessage ?? "none")"
+            ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | targetSync=\(String(format: "%.0f", mpvController.targetDisplaySyncFPS))Hz | mpvDisplay=\(mpvDisplayText) | proMotion=\(proMotionText) | pass(fresh/redraw)=\(mpvController.freshRenderPassCount)/\(mpvController.redrawRenderPassCount) | mistimed=\(mpvController.mistimedFrames) | delayed=\(mpvController.delayedFrames) | probe=\(probeText) | err=\(mpvController.lastErrorMessage ?? "none")"
             : "未初始化"
 
         let opticalStatus = "\(opticalFlowController.capabilityDescription) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
@@ -273,12 +379,13 @@ final class PlayerCoordinator: ObservableObject {
         let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许超分"
         let lines = [
             "=== GlassMPV 真机 5 项体检报告 ===",
-            "版本: \(AppReleaseInfo.displayVersion) | 当前引擎: \(engineMode.rawValue) | 4K超分门控: \(gateStatus)",
+            "版本: \(AppReleaseInfo.displayVersion) | 当前引擎: \(engineMode.rawValue) | 4K超分门控: \(gateStatus) | 补帧判定: \(verdict.shortLabel) (\(verdict.detailText))",
             "1. 屏幕 ProMotion 上限: \(maxScreenFPS) Hz \(maxScreenFPS >= 120 ? "(PASS)" : "(非120Hz)")",
             "2. GLSL 着色器包校验: \(shaderCount)/58 个 (\(shaderCount == 58 ? "PASS" : "FAIL")), 当前激活=\(resolvedShaderCount) 个",
             "3. 本地/相册导入沙盒通道: \(importCheck)",
             "4. MPVUI 播放内核: \(mpvStatus)",
-            "5. ANE 光流真补帧核: \(opticalStatus)"
+            "5. ANE 光流真补帧核: \(opticalStatus)",
+            "黑匣子采样: 共 \(runtimeTimeline.count) 条（最近判定=\(runtimeTimeline.last?.verdictLabel ?? "无")）"
         ]
         selfCheckReport = lines.joined(separator: "\n")
     }
@@ -286,7 +393,14 @@ final class PlayerCoordinator: ObservableObject {
     func switchEngine(to target: PlayerEngineMode) {
         guard target != engineMode else { return }
         let resumeTime = activeCurrentTime
-        mpvController.pause()
+        if currentURL != nil {
+            captureRuntimeTelemetrySample()
+        }
+        if target == .opticalFlow {
+            mpvController.releaseMediaForExternalEngine()
+        } else {
+            mpvController.pause()
+        }
         opticalFlowController.stop()
 
         engineMode = target
@@ -411,7 +525,7 @@ final class PlayerCoordinator: ObservableObject {
                 mpvController.seek(to: seekTo)
             }
         case .opticalFlow:
-            mpvController.pause()
+            mpvController.releaseMediaForExternalEngine()
             opticalFlowController.load(url: url, spatial2x: vtSpatial2x, startAt: seekTo)
             opticalFlowController.setSpeed(speed)
         }
@@ -1235,7 +1349,7 @@ struct EnhancementControlSheet: View {
         case .off:
             return "按片源原生帧率输出"
         case .mpvSmooth120Hz:
-            return "display-resample + tscale=mitchell，消除24p抖动并与GLSL超分共存"
+            return "display-resample + 自适应 tscale (≤2K mitchell / 4K linear)，消除24p抖动并与GLSL超分共存"
         case .vtOpticalFlow2x:
             return "Apple VideoToolbox 神经网络真光流插帧（仅 MP4/MOV）"
         }
@@ -1324,10 +1438,19 @@ struct DiagnosticLogSheet: View {
                     let activeBitDepth = coordinator.engineMode == .mpv ? mpv.bitDepthLabel : optical.bitDepthLabel
                     let activeHDR = coordinator.engineMode == .mpv ? mpv.hdrLabel : optical.hdrLabel
                     let activeState = coordinator.engineMode == .mpv ? mpv.playbackState : (optical.isPaused ? "已暂停" : "播放中")
+                    let verdict = coordinator.currentInterpolationVerdict
+                    let pmText = mpv.measuredProMotionFPS > 0
+                        ? String(format: "%.1f Hz", mpv.measuredProMotionFPS)
+                        : (mpv.lastMeasuredProMotionFPS > 0 ? String(format: "最近 %.1f Hz", mpv.lastMeasuredProMotionFPS) : "--")
 
                     LabeledContent("当前引擎", value: coordinator.engineMode.rawValue)
                     LabeledContent("初始化状态", value: mpv.isInitialized ? "已就绪" : "未初始化")
                     LabeledContent("运行阶段", value: activeState)
+                    LabeledContent("补帧生效判定", value: verdict.shortLabel)
+                    Text(verdict.detailText)
+                        .font(.caption2)
+                        .foregroundStyle(verdict.isEffective ? .green : .secondary)
+                    LabeledContent("MPV 探针快照", value: mpv.latestMPVProbe?.summaryText ?? "等待播放中采样...")
                     LabeledContent("视频分辨率", value: activeW > 0 ? "\(activeW)×\(activeH)" : "暂无")
                     LabeledContent("色深 / HDR", value: "\(activeBitDepth) · \(activeHDR)")
                     LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", activeSrcFPS)) / \(String(format: "%.1f", activeOutFPS)) fps")
@@ -1343,7 +1466,7 @@ struct DiagnosticLogSheet: View {
                     )
                     LabeledContent(
                         "ProMotion 保活 / 实测",
-                        value: "\(mpv.isProMotionKeeperActive ? "开启" : "关闭") / \(mpv.measuredProMotionFPS > 0 ? String(format: "%.1f Hz", mpv.measuredProMotionFPS) : "--")"
+                        value: "\(mpv.isProMotionKeeperActive ? "开启" : "关闭") / \(pmText)"
                     )
                     LabeledContent(
                         "渲染 Pass (新帧 / 重绘)",
@@ -1422,6 +1545,20 @@ struct DiagnosticLogSheet: View {
                     }
                 }
 
+                Section("运行期黑匣子采样（最近 \(coordinator.runtimeTimeline.count) 条，停播保留）") {
+                    if coordinator.runtimeTimeline.isEmpty {
+                        Text("暂无运行期采样（播放视频后每 2 秒自动采集，返回主界面后依然保留）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(coordinator.runtimeTimeline.suffix(30).reversed())) { sample in
+                            Text(sample.formatLogLine())
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
                 Section("libmpv 事件与警告日志（最近 \(mpv.diagnosticLogs.count) 条）") {
                     if mpv.diagnosticLogs.isEmpty {
                         Text("暂无日志（打开视频或触发测试视频后将自动采集）")
@@ -1474,10 +1611,16 @@ struct DiagnosticLogSheet: View {
         let stateText = coordinator.engineMode == .mpv
             ? mpv.playbackState
             : (optical.isPaused ? "已暂停" : "播放中")
+        let verdict = coordinator.currentInterpolationVerdict
+        let pmDisplay = mpv.measuredProMotionFPS > 0
+            ? String(format: "%.1f Hz", mpv.measuredProMotionFPS)
+            : (mpv.lastMeasuredProMotionFPS > 0 ? String(format: "last %.1f Hz", mpv.lastMeasuredProMotionFPS) : "--")
         let telemetrySummary = [
+            "Interpolation Verdict: \(verdict.shortLabel) | \(verdict.detailText)",
+            "MPV Probe: \(mpv.latestMPVProbe?.summaryText ?? "none")",
             "MPV Target Sync: \(mpv.targetDisplaySyncFPS > 0 ? String(format: "%.0f Hz", mpv.targetDisplaySyncFPS) : "OFF")",
             "MPV Reported Display Sync: \(mpv.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpv.displaySyncFPS) : "unreported")",
-            "ProMotion Keeper: \(mpv.isProMotionKeeperActive ? "active" : "inactive") (\(mpv.measuredProMotionFPS > 0 ? String(format: "%.1f Hz", mpv.measuredProMotionFPS) : "--"))",
+            "ProMotion Keeper: \(mpv.isProMotionKeeperActive ? "active" : "inactive") (\(pmDisplay))",
             "MPV Passes (fresh/redraw): \(mpv.freshRenderPassCount) / \(mpv.redrawRenderPassCount) | mistimed=\(mpv.mistimedFrames) | delayed=\(mpv.delayedFrames)",
             "ANE Clock: \(optical.clockSourceLabel) | spatial2x=\(optical.enableSpatial2xUpscale ? "ON" : "OFF")",
             "ANE Counters: interpolated=\(optical.interpolatedFrameCount) | skipped=\(optical.skippedInterpolationCount) | failed=\(optical.failedInterpolationCount) | presented=\(optical.presentedFrameCount) | avgMs=\(String(format: "%.1f", optical.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", optical.actualOutputFPS))"
@@ -1491,6 +1634,7 @@ struct DiagnosticLogSheet: View {
             decoderSummary: "\(metrics.codec) / \(metrics.decoderBadge)",
             is4KGated: coordinator.isSuperResolutionDisabledBy4K,
             telemetrySummary: telemetrySummary,
+            runtimeTimeline: coordinator.runtimeTimeline.map { $0.formatLogLine() },
             selfCheck: coordinator.selfCheckReport,
             mpvLogs: mpv.diagnosticLogs,
             opticalLogs: optical.diagnosticLogs

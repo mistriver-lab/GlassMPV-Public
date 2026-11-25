@@ -35,7 +35,8 @@ enum AppReleaseInfo {
                 "新增默认横屏起播与手动旋转切换（OrientationController）、一键返回主界面及一键导出 .txt 完整诊断日志",
                 "消除播放页顶部 Liquid Glass 按钮粘黏并精简顶栏（移除重复的打开文件/相册/串流按钮，引擎切换改为单胶囊分段控件）",
                 "修复 ANE 光流核黑屏失效并升级 MPV 时域平滑：为 AVSampleBufferDisplayLayer 绑定 controlTimebase、规范像素格式与色彩附件传播、增加追帧保护，MPV 升级 tscale=mitchell",
-                "重构双引擎补帧链路与真实遥测：ANE 新增无音轨单调合成时钟、preferredTransform 自动旋转排版、首帧延迟挂载缓存、requiresFlushToResumeDecoding 恢复及 6 帧预缓冲；MPV 新增 ProMotion 120Hz 刷新率保活与无兜底伪造的同步/重绘遥测"
+                "重构双引擎补帧链路与真实遥测：ANE 新增无音轨单调合成时钟、preferredTransform 自动旋转排版、首帧延迟挂载缓存、requiresFlushToResumeDecoding 恢复及 6 帧预缓冲；MPV 新增 ProMotion 120Hz 刷新率保活与无兜底伪造的同步/重绘遥测",
+                "新增运行期 2s 黑匣子遥测时间轴、libmpv 属性探针与补帧客观判定；切入 ANE 时自动释放 MPV 硬解会话，ANE 启用纯音轨合成、5 级 AVAssetReader 回退及源帧标准化，MPV 4K 片源自适应切换 tscale=linear"
             ]
         ),
         ReleaseNoteEntry(

@@ -463,4 +463,236 @@ final class GlassMPVTests: XCTestCase {
         controller.applyInterpolation(.off)
         XCTAssertEqual(controller.targetDisplaySyncFPS, 0)
     }
+
+    func testMPVProbeSnapshotParsingAndVerdictEvaluation() throws {
+        let validLine = "[14:32:42] [mpv-probe] sync_active=yes video_sync=display-resample interp=yes tscale=mitchell vsync_ratio=5.00 disp_fps=120.0 est_disp=119.9"
+        let probe = try XCTUnwrap(MPVProbeSnapshot.parse(from: validLine))
+        XCTAssertEqual(probe.displaySyncActive, true)
+        XCTAssertEqual(probe.videoSync, "display-resample")
+        XCTAssertEqual(probe.interpolation, true)
+        XCTAssertEqual(probe.tscale, "mitchell")
+        XCTAssertEqual(try XCTUnwrap(probe.vsyncRatio), 5.0, accuracy: 1e-4)
+        XCTAssertEqual(try XCTUnwrap(probe.displayFPS), 120.0, accuracy: 1e-4)
+        XCTAssertEqual(try XCTUnwrap(probe.estimatedDisplayFPS), 119.9, accuracy: 1e-4)
+
+        let partialLine = "[mpv-probe] sync_active=${display-sync-active} video_sync=(unavailable) interp=no tscale= vsync_ratio=0 disp_fps=0 est_disp=-1"
+        let partialProbe = try XCTUnwrap(MPVProbeSnapshot.parse(from: partialLine))
+        XCTAssertNil(partialProbe.displaySyncActive)
+        XCTAssertEqual(partialProbe.videoSync, "")
+        XCTAssertEqual(partialProbe.interpolation, false)
+        XCTAssertEqual(partialProbe.tscale, "")
+        XCTAssertEqual(try XCTUnwrap(partialProbe.vsyncRatio), 0.0, accuracy: 1e-6)
+        XCTAssertNil(partialProbe.displayFPS)
+        XCTAssertNil(partialProbe.estimatedDisplayFPS)
+
+        XCTAssertNil(MPVProbeSnapshot.parse(from: "[vo/gpu-next] frame rendered"))
+
+        XCTAssertEqual(
+            InterpolationVerdict.evaluateMPV(
+                mode: .off,
+                probe: probe,
+                targetDisplaySyncFPS: 120,
+                reportedDisplayFPS: 120,
+                measuredProMotionFPS: 120
+            ),
+            .off
+        )
+
+        let activeMPV = InterpolationVerdict.evaluateMPV(
+            mode: .mpvSmooth120Hz,
+            probe: probe,
+            targetDisplaySyncFPS: 120,
+            reportedDisplayFPS: 120,
+            measuredProMotionFPS: 120
+        )
+        XCTAssertTrue(activeMPV.isEffective)
+        XCTAssertEqual(activeMPV.shortLabel, "MPV补帧生效")
+
+        let inactiveProbe = try XCTUnwrap(
+            MPVProbeSnapshot.parse(from: "[mpv-probe] sync_active=no video_sync=audio interp=yes tscale=mitchell vsync_ratio=1.00 disp_fps=60.0 est_disp=60.0")
+        )
+        let inactiveMPV = InterpolationVerdict.evaluateMPV(
+            mode: .mpvSmooth120Hz,
+            probe: inactiveProbe,
+            targetDisplaySyncFPS: 120,
+            reportedDisplayFPS: 60,
+            measuredProMotionFPS: 120
+        )
+        XCTAssertFalse(inactiveMPV.isEffective)
+        XCTAssertEqual(inactiveMPV.shortLabel, "MPV补帧未生效")
+
+        let pendingMPV = InterpolationVerdict.evaluateMPV(
+            mode: .mpvSmooth120Hz,
+            probe: nil,
+            targetDisplaySyncFPS: 120,
+            reportedDisplayFPS: 0,
+            measuredProMotionFPS: 120
+        )
+        XCTAssertFalse(pendingMPV.isEffective)
+        XCTAssertEqual(pendingMPV.shortLabel, "MPV等待探针")
+
+        let aneActive = InterpolationVerdict.evaluateANE(
+            interpolatedCount: 12,
+            failedCount: 0,
+            presentedCount: 24,
+            actualOutputFPS: 48.0,
+            sourceFPS: 24.0,
+            errorMessage: nil
+        )
+        XCTAssertTrue(aneActive.isEffective)
+        XCTAssertEqual(aneActive.shortLabel, "ANE光流生效")
+
+        let aneFailedErr = InterpolationVerdict.evaluateANE(
+            interpolatedCount: 0,
+            failedCount: 0,
+            presentedCount: 0,
+            actualOutputFPS: 0,
+            sourceFPS: 24.0,
+            errorMessage: "reader failed"
+        )
+        XCTAssertFalse(aneFailedErr.isEffective)
+        XCTAssertEqual(aneFailedErr.shortLabel, "ANE光流失败")
+
+        let aneFailedCount = InterpolationVerdict.evaluateANE(
+            interpolatedCount: 0,
+            failedCount: 3,
+            presentedCount: 10,
+            actualOutputFPS: 24.0,
+            sourceFPS: 24.0,
+            errorMessage: nil
+        )
+        XCTAssertFalse(aneFailedCount.isEffective)
+        XCTAssertEqual(aneFailedCount.shortLabel, "ANE光流失败")
+
+        let anePending = InterpolationVerdict.evaluateANE(
+            interpolatedCount: 0,
+            failedCount: 0,
+            presentedCount: 5,
+            actualOutputFPS: 24.0,
+            sourceFPS: 24.0,
+            errorMessage: nil
+        )
+        XCTAssertFalse(anePending.isEffective)
+        XCTAssertEqual(anePending.shortLabel, "ANE预热中")
+    }
+
+    func testRuntimeTelemetrySampleFormattingAndReportInclusion() throws {
+        let probe = try XCTUnwrap(
+            MPVProbeSnapshot.parse(from: "[mpv-probe] sync_active=yes video_sync=display-resample interp=yes tscale=mitchell vsync_ratio=5.00 disp_fps=120.0 est_disp=120.0")
+        )
+        let mpvSample = RuntimeTelemetrySample(
+            engine: "MPV 超分核",
+            playbackState: "播放中",
+            mediaTime: 12.5,
+            width: 1920,
+            height: 1080,
+            sourceFPS: 24.0,
+            outputFPS: 24.0,
+            displayFPS: 120.0,
+            proMotionFPS: 120.0,
+            droppedFrames: 0,
+            mistimedFrames: 1,
+            delayedFrames: 0,
+            mpvProbe: probe,
+            aneInterpolated: 0,
+            aneSkipped: 0,
+            aneFailed: 0,
+            anePresented: 0,
+            aneAvgMs: 0,
+            verdictLabel: "MPV补帧生效",
+            thermalLevel: .nominal
+        )
+        let aneSample = RuntimeTelemetrySample(
+            engine: "ANE 光流核",
+            playbackState: "播放中",
+            mediaTime: 14.0,
+            width: 1920,
+            height: 1080,
+            sourceFPS: 24.0,
+            outputFPS: 48.0,
+            displayFPS: 0,
+            proMotionFPS: 0,
+            droppedFrames: 0,
+            mistimedFrames: 0,
+            delayedFrames: 0,
+            mpvProbe: nil,
+            aneInterpolated: 48,
+            aneSkipped: 0,
+            aneFailed: 0,
+            anePresented: 96,
+            aneAvgMs: 6.2,
+            verdictLabel: "ANE光流生效",
+            thermalLevel: .fair
+        )
+
+        let mpvLine = mpvSample.formatLogLine(timeString: "14:32:42")
+        XCTAssertTrue(mpvLine.contains("[14:32:42] [MPV]"))
+        XCTAssertTrue(mpvLine.contains("1920x1080"))
+        XCTAssertTrue(mpvLine.contains("probe(sync=yes,interp=yes,tscale=mitchell,vsync=5.00)"))
+        XCTAssertTrue(mpvLine.contains("verdict=MPV补帧生效"))
+
+        let aneLine = aneSample.formatLogLine(timeString: "14:32:44")
+        XCTAssertTrue(aneLine.contains("[14:32:44] [ANE]"))
+        XCTAssertTrue(aneLine.contains("ane(interp=48,skip=0,fail=0,pres=96,avg=6.2ms)"))
+        XCTAssertTrue(aneLine.contains("verdict=ANE光流生效"))
+
+        let report = DiagnosticLogExporter.buildReport(
+            version: "v2026.11.25",
+            engineName: "MPV 超分核",
+            playbackState: "播放中",
+            resolution: "1920×1080",
+            fpsSummary: "24.0 → 120.0 fps",
+            decoderSummary: "HEVC / 硬解 VT",
+            is4KGated: false,
+            telemetrySummary: ["Interpolation Verdict: MPV补帧生效"],
+            runtimeTimeline: [mpvLine, aneLine],
+            selfCheck: "ok",
+            mpvLogs: [],
+            opticalLogs: []
+        )
+        XCTAssertTrue(report.contains("--- Runtime Telemetry Timeline (2) ---"))
+        XCTAssertTrue(report.contains(mpvLine))
+        XCTAssertTrue(report.contains(aneLine))
+    }
+
+    func testOpticalFlowReaderSettingsTiersAndDetailedError() {
+        let tiers = OpticalFlowPlayerController.buildReaderSettingsTiers(
+            preferredFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            prefer10Bit: true
+        )
+        XCTAssertEqual(tiers.count, 5)
+
+        let forbiddenKeys = [
+            kCVPixelBufferPlaneAlignmentKey as String,
+            kCVPixelBufferBytesPerRowAlignmentKey as String,
+            kCVPixelBufferExtendedPixelsBottomKey as String,
+            kCVPixelBufferExtendedPixelsRightKey as String
+        ]
+        for (index, tier) in tiers.enumerated() {
+            for forbidden in forbiddenKeys {
+                XCTAssertNil(tier.settings[forbidden], "档位 \(tier.label) 不应包含非法 Reader 键 \(forbidden)")
+            }
+            XCTAssertNotNil(tier.settings[kCVPixelBufferPixelFormatTypeKey as String])
+            if index < 3 {
+                XCTAssertNotNil(tier.settings[kCVPixelBufferIOSurfacePropertiesKey as String])
+            } else {
+                XCTAssertTrue(tier.label.hasPrefix("minimal-"))
+                XCTAssertNil(tier.settings[kCVPixelBufferIOSurfacePropertiesKey as String])
+            }
+        }
+
+        let underlying = NSError(domain: NSOSStatusErrorDomain, code: -12909, userInfo: [
+            NSLocalizedDescriptionKey: "VTDecompression failed"
+        ])
+        let outer = NSError(domain: "AVFoundationErrorDomain", code: -11800, userInfo: [
+            NSLocalizedDescriptionKey: "Operation Stopped",
+            NSLocalizedFailureReasonErrorKey: "Unsupported pixel attributes",
+            NSUnderlyingErrorKey: underlying
+        ])
+        let formatted = OpticalFlowPlayerController.formatDetailedError(outer)
+        XCTAssertTrue(formatted.contains("AVFoundationErrorDomain(-11800)"))
+        XCTAssertTrue(formatted.contains("Operation Stopped"))
+        XCTAssertTrue(formatted.contains("Unsupported pixel attributes"))
+        XCTAssertTrue(formatted.contains("-12909"))
+    }
 }

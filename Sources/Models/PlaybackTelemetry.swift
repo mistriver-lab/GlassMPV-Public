@@ -198,3 +198,323 @@ enum SuperResolutionPolicy: Sendable {
         return "片源已达 4K（\(width)×\(height)），自动禁用超分以节省算力与功耗"
     }
 }
+
+/// libmpv 实时属性探针快照（由 expand-properties print-text 采得）
+struct MPVProbeSnapshot: Equatable, Sendable {
+    let timestamp: Date
+    let displaySyncActive: Bool?
+    let videoSync: String
+    let interpolation: Bool?
+    let tscale: String
+    let vsyncRatio: Double?
+    let displayFPS: Double?
+    let estimatedDisplayFPS: Double?
+    let rawLine: String
+
+    static func parse(from line: String, timestamp: Date = Date()) -> MPVProbeSnapshot? {
+        guard let markerRange = line.range(of: "[mpv-probe]") else {
+            return nil
+        }
+        let payload = line[markerRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else { return nil }
+
+        var fields: [String: String] = [:]
+        for token in payload.split(whereSeparator: { $0.isWhitespace }) {
+            let parts = token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawValue = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            fields[key] = rawValue
+        }
+
+        let recognizedKeys = ["sync_active", "video_sync", "interp", "tscale", "vsync_ratio", "disp_fps", "est_disp"]
+        guard recognizedKeys.contains(where: { fields[$0] != nil }) else {
+            return nil
+        }
+
+        func sanitizedValue(_ key: String) -> String? {
+            guard let value = fields[key],
+                  !value.isEmpty,
+                  !value.hasPrefix("${"),
+                  !value.hasPrefix("(") else {
+                return nil
+            }
+            return value
+        }
+
+        func parseBool(_ key: String) -> Bool? {
+            guard let val = sanitizedValue(key)?.lowercased() else { return nil }
+            switch val {
+            case "yes", "true", "1":
+                return true
+            case "no", "false", "0":
+                return false
+            default:
+                return nil
+            }
+        }
+
+        func parseDouble(_ key: String, requirePositive: Bool = false) -> Double? {
+            guard let str = sanitizedValue(key),
+                  let val = Double(str),
+                  val.isFinite else {
+                return nil
+            }
+            if requirePositive && val <= 0 {
+                return nil
+            }
+            return val
+        }
+
+        return MPVProbeSnapshot(
+            timestamp: timestamp,
+            displaySyncActive: parseBool("sync_active"),
+            videoSync: sanitizedValue("video_sync") ?? "",
+            interpolation: parseBool("interp"),
+            tscale: sanitizedValue("tscale") ?? "",
+            vsyncRatio: parseDouble("vsync_ratio"),
+            displayFPS: parseDouble("disp_fps", requirePositive: true),
+            estimatedDisplayFPS: parseDouble("est_disp", requirePositive: true),
+            rawLine: line
+        )
+    }
+
+    var summaryText: String {
+        let syncStr = displaySyncActive.map { $0 ? "yes" : "no" } ?? "-"
+        let interpStr = interpolation.map { $0 ? "yes" : "no" } ?? "-"
+        let videoSyncStr = videoSync.isEmpty ? "-" : videoSync
+        let tscaleStr = tscale.isEmpty ? "-" : tscale
+        let vsyncStr = vsyncRatio.map { String(format: "%.2f", $0) } ?? "-"
+        let dispStr = displayFPS.map { String(format: "%.1fHz", $0) } ?? "-"
+        let estStr = estimatedDisplayFPS.map { String(format: "%.1fHz", $0) } ?? "-"
+        return "sync_active=\(syncStr) video_sync=\(videoSyncStr) interp=\(interpStr) tscale=\(tscaleStr) vsync_ratio=\(vsyncStr) disp_fps=\(dispStr) est_disp=\(estStr)"
+    }
+
+    var stateSignature: String {
+        let syncStr = displaySyncActive.map { $0 ? "1" : "0" } ?? "-"
+        let interpStr = interpolation.map { $0 ? "1" : "0" } ?? "-"
+        let vsyncStr = vsyncRatio.map { String(format: "%.1f", $0) } ?? "-"
+        let dispStr = displayFPS.map { String(format: "%.1f", $0) } ?? "-"
+        return "\(syncStr)|\(videoSync)|\(interpStr)|\(tscale)|\(vsyncStr)|\(dispStr)"
+    }
+}
+
+/// 补帧是否真正生效的客观判定结果
+enum InterpolationVerdict: Equatable, Sendable {
+    case off
+    case mpvActive(detail: String)
+    case mpvInactive(reason: String)
+    case mpvPending(detail: String)
+    case aneActive(detail: String)
+    case aneFailed(reason: String)
+    case anePending(detail: String)
+
+    var shortLabel: String {
+        switch self {
+        case .off:
+            return "未开启"
+        case .mpvActive:
+            return "MPV补帧生效"
+        case .mpvInactive:
+            return "MPV补帧未生效"
+        case .mpvPending:
+            return "MPV等待探针"
+        case .aneActive:
+            return "ANE光流生效"
+        case .aneFailed:
+            return "ANE光流失败"
+        case .anePending:
+            return "ANE预热中"
+        }
+    }
+
+    var detailText: String {
+        switch self {
+        case .off:
+            return "当前为原帧率直出"
+        case .mpvActive(let detail),
+             .mpvInactive(let detail),
+             .mpvPending(let detail),
+             .aneActive(let detail),
+             .aneFailed(let detail),
+             .anePending(let detail):
+            return detail
+        }
+    }
+
+    var isEffective: Bool {
+        switch self {
+        case .mpvActive, .aneActive:
+            return true
+        case .off, .mpvInactive, .mpvPending, .aneFailed, .anePending:
+            return false
+        }
+    }
+
+    static func evaluateMPV(
+        mode: InterpolationMode,
+        probe: MPVProbeSnapshot?,
+        targetDisplaySyncFPS: Double,
+        reportedDisplayFPS: Double,
+        measuredProMotionFPS: Double
+    ) -> InterpolationVerdict {
+        guard mode == .mpvSmooth120Hz else {
+            return .off
+        }
+        if let probe {
+            let syncText = probe.displaySyncActive.map { $0 ? "yes" : "no" } ?? "unknown"
+            let interpText = probe.interpolation.map { $0 ? "yes" : "no" } ?? "unknown"
+            let videoSyncText = probe.videoSync.isEmpty ? "unknown" : probe.videoSync
+            let tscaleText = probe.tscale.isEmpty ? "unknown" : probe.tscale
+            let vsyncText = probe.vsyncRatio.map { String(format: "%.2f", $0) } ?? "--"
+            let dispText = probe.displayFPS.map { String(format: "%.1fHz", $0) } ?? "--"
+
+            if probe.displaySyncActive == true && probe.interpolation == true {
+                return .mpvActive(detail: "sync_active=yes, interp=yes, tscale=\(tscaleText), vsync_ratio=\(vsyncText), disp_fps=\(dispText)")
+            }
+            if probe.displaySyncActive == false || probe.interpolation == false {
+                return .mpvInactive(reason: "sync_active=\(syncText), video_sync=\(videoSyncText), interp=\(interpText), vsync_ratio=\(vsyncText)")
+            }
+        }
+
+        let targetStr = targetDisplaySyncFPS > 0 ? String(format: "%.0fHz", targetDisplaySyncFPS) : "--"
+        let estStr = reportedDisplayFPS > 0 ? String(format: "%.1fHz", reportedDisplayFPS) : "--"
+        let pmStr = measuredProMotionFPS > 0 ? String(format: "%.1fHz", measuredProMotionFPS) : "--"
+        return .mpvPending(detail: "target=\(targetStr), est=\(estStr), ProMotion=\(pmStr), 等待探针回报")
+    }
+
+    static func evaluateANE(
+        interpolatedCount: Int,
+        failedCount: Int,
+        presentedCount: Int,
+        actualOutputFPS: Double,
+        sourceFPS: Double,
+        errorMessage: String?
+    ) -> InterpolationVerdict {
+        if interpolatedCount > 0 {
+            let outText = actualOutputFPS > 0 ? String(format: "%.1f", actualOutputFPS) : "--"
+            let srcText = sourceFPS > 0 ? String(format: "%.1f", sourceFPS) : "--"
+            return .aneActive(detail: "已生成 \(interpolatedCount) 帧光流中间帧（送显 \(presentedCount) 帧, \(srcText)→\(outText)fps）")
+        }
+        if let errorMessage {
+            let trimmed = errorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return .aneFailed(reason: trimmed)
+            }
+        }
+        if failedCount > 0 {
+            return .aneFailed(reason: "光流补帧连续失败 \(failedCount) 次，送显 \(presentedCount) 帧")
+        }
+        return .anePending(detail: "等待光流首帧完成（已送显 \(presentedCount) 帧）")
+    }
+}
+
+/// 运行期黑匣子周期采样快照（每 2 秒记录一次，停播不清空）
+struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let timestamp: Date
+    let engine: String
+    let playbackState: String
+    let mediaTime: Double
+    let width: Int
+    let height: Int
+    let sourceFPS: Double
+    let outputFPS: Double
+    let displayFPS: Double
+    let proMotionFPS: Double
+    let droppedFrames: Int64
+    let mistimedFrames: Int64
+    let delayedFrames: Int64
+    let mpvProbe: MPVProbeSnapshot?
+    let aneInterpolated: Int
+    let aneSkipped: Int
+    let aneFailed: Int
+    let anePresented: Int
+    let aneAvgMs: Double
+    let verdictLabel: String
+    let thermalLevel: ThermalLevel
+
+    init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
+        engine: String,
+        playbackState: String,
+        mediaTime: Double,
+        width: Int,
+        height: Int,
+        sourceFPS: Double,
+        outputFPS: Double,
+        displayFPS: Double,
+        proMotionFPS: Double,
+        droppedFrames: Int64,
+        mistimedFrames: Int64,
+        delayedFrames: Int64,
+        mpvProbe: MPVProbeSnapshot?,
+        aneInterpolated: Int,
+        aneSkipped: Int,
+        aneFailed: Int,
+        anePresented: Int,
+        aneAvgMs: Double,
+        verdictLabel: String,
+        thermalLevel: ThermalLevel
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.engine = engine
+        self.playbackState = playbackState
+        self.mediaTime = mediaTime
+        self.width = width
+        self.height = height
+        self.sourceFPS = sourceFPS
+        self.outputFPS = outputFPS
+        self.displayFPS = displayFPS
+        self.proMotionFPS = proMotionFPS
+        self.droppedFrames = droppedFrames
+        self.mistimedFrames = mistimedFrames
+        self.delayedFrames = delayedFrames
+        self.mpvProbe = mpvProbe
+        self.aneInterpolated = aneInterpolated
+        self.aneSkipped = aneSkipped
+        self.aneFailed = aneFailed
+        self.anePresented = anePresented
+        self.aneAvgMs = aneAvgMs
+        self.verdictLabel = verdictLabel
+        self.thermalLevel = thermalLevel
+    }
+
+    func formatLogLine(timeString: String? = nil) -> String {
+        let resolvedTime: String
+        if let timeString {
+            resolvedTime = timeString
+        } else {
+            let comps = Calendar.current.dateComponents([.hour, .minute, .second], from: timestamp)
+            resolvedTime = String(format: "%02d:%02d:%02d", comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0)
+        }
+
+        let resText = (width > 0 && height > 0) ? "\(width)x\(height)" : "--"
+        let srcText = sourceFPS > 0 ? String(format: "%.1f", sourceFPS) : "--"
+        let outText = outputFPS > 0 ? String(format: "%.1f", outputFPS) : "--"
+        let dispText = displayFPS > 0 ? String(format: "%.1fHz", displayFPS) : "--"
+        let pmText = proMotionFPS > 0 ? String(format: "%.1fHz", proMotionFPS) : "--"
+        let timeText = String(format: "%.1fs", mediaTime)
+        let isANE = engine.localizedCaseInsensitiveContains("ANE") || engine.localizedCaseInsensitiveContains("光流")
+
+        if isANE {
+            let avgText = String(format: "%.1fms", aneAvgMs)
+            return "[\(resolvedTime)] [ANE] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText) drop=\(droppedFrames) ane(interp=\(aneInterpolated),skip=\(aneSkipped),fail=\(aneFailed),pres=\(anePresented),avg=\(avgText)) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
+        } else {
+            let probeText: String
+            if let mpvProbe {
+                let s = mpvProbe.displaySyncActive.map { $0 ? "yes" : "no" } ?? "-"
+                let i = mpvProbe.interpolation.map { $0 ? "yes" : "no" } ?? "-"
+                let t = mpvProbe.tscale.isEmpty ? "-" : mpvProbe.tscale
+                let v = mpvProbe.vsyncRatio.map { String(format: "%.2f", $0) } ?? "-"
+                probeText = "probe(sync=\(s),interp=\(i),tscale=\(t),vsync=\(v))"
+            } else {
+                probeText = "probe(none)"
+            }
+            return "[\(resolvedTime)] [MPV] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText) disp=\(dispText) pm=\(pmText) drop=\(droppedFrames) mis=\(mistimedFrames) del=\(delayedFrames) \(probeText) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
+        }
+    }
+}

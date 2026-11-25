@@ -12,6 +12,7 @@ enum DiagnosticLogExporter: Sendable {
         decoderSummary: String,
         is4KGated: Bool,
         telemetrySummary: [String] = [],
+        runtimeTimeline: [String] = [],
         selfCheck: String,
         mpvLogs: [String],
         opticalLogs: [String]
@@ -30,6 +31,13 @@ enum DiagnosticLogExporter: Sendable {
             sections.append("")
             sections.append("--- Interpolation Telemetry ---")
             sections.append(contentsOf: telemetrySummary)
+        }
+        sections.append("")
+        sections.append("--- Runtime Telemetry Timeline (\(runtimeTimeline.count)) ---")
+        if runtimeTimeline.isEmpty {
+            sections.append("(no runtime samples captured)")
+        } else {
+            sections.append(contentsOf: runtimeTimeline)
         }
         sections.append(contentsOf: [
             "",

@@ -17,6 +17,7 @@
 - **消除播放页顶部 Liquid Glass 粘黏并精简顶栏 (`LiquidGlassPlayerView`)**：移除导致邻近胶囊融合的 `GlassEffectContainer`，将双核切换改为一体化单胶囊分段控件；移除顶栏中与首页重复的打开文件/相册/串流按钮，保留返回、旋转、诊断与信息显隐 4 颗简洁按钮（10pt 间距）。
 - **根治 ANE 光流核黑屏失效并升级 MPV 时域平滑 (`VTOpticalFlowEngine` + `MPVPlayerCore`)**：为 `AVSampleBufferDisplayLayer` 绑定 `controlTimebase` 并对齐送显 PTS，修复切换引擎时 `load()` 与 `seek()` 竞态、规范源像素格式选择、检查 `AVAssetReader.startReading()`、传播 `CVBufferPropagateAttachments` 色彩附件并加入追帧跳过插帧保护；HUD 如实显示实测帧率；MPV 核升级 `tscale=mitchell` + `interpolation-preserve=yes`。
 - **双引擎补帧架构深度重构与真实遥测闭环 (`VTOpticalFlowEngine` + `MPVPlayerCore` + `LiquidGlassPlayerView`)**：ANE 光流核改用子图层宿主支持 `preferredTransform` 旋转排版、新增无音轨单调合成时钟 (`OpticalFlowSyntheticClock`) 与自动循环重播、修复首帧早于图层挂载的竞态 (`pendingFirstFrame`)、补齐 `requiresFlushToResumeDecoding` 自动恢复、10-bit 像素格式与对齐属性继承及 6 帧预缓冲；MPV 核新增播放期 `ProMotionDisplayLinkKeeper` 120Hz 刷新率保活，移除 `displaySyncFPS` 屏幕上限伪造兜底，透出重绘 Pass/失步帧/延迟帧及 ANE 加载态与平均耗时遥测。
+- **运行期黑匣子采样、MPV 探针判定与 ANE 解码链路加固 (`PlaybackTelemetry` + `MPVPlayerCore` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：新增每 2 秒采集一次且停播不清空的 `RuntimeTelemetrySample` 黑匣子时间轴；`MPVPlayerController` 启用 `logLevel: .info` 过滤采样 `[mpv-probe]`（`display-sync-active`/`interpolation`/`tscale`/`vsync-ratio`）与客观判定 `InterpolationVerdict`，4K 片源自适应切为 `tscale=linear`，切入 ANE 时调用 `releaseMediaForExternalEngine()` 彻底释放硬解会话；`OpticalFlowPlayerController` 改用纯音轨 `AVMutableComposition`、移除违规对齐键的 5 级 `AVAssetReader` 安全回退与源帧标准化缓冲池。
 
 ## [v1.1.0] - 2026-11-24
 
@@ -103,3 +104,5 @@
 - [x] **新增 4K 片源自动禁用超分门控 (`SuperResolutionPolicy`)**：`width/height` 达 `3840×2160` 及以上时自动屏蔽 MPV GLSL 超分与 ANE 2× 空间超分，UI 控制台、HUD 与自检报告同步透出原因。
 
 - [x] **新增默认横屏起播、手动旋转、返回主界面与 `.txt` 诊断日志导出 (`OrientationController` + `DiagnosticLogExporter` + `LiquidGlassPlayerView`)**：打开视频默认进横屏并支持工具栏旋转切换；支持一键返回主界面与错误横幅返回；诊断中心支持分享/导出完整 `.txt` 日志文件。
+
+- [x] **已验证交付（`fe9fdf4` / CI Run `45558978591`）**：修复 `VTOpticalFlowEngine.swift` Swift 6 `noasync` 锁与 `nonisolated` 并发编译，CI 全绿（`10m17s`，`GlassMPVTests` 15/15 PASS），产出并校验 `dist/GlassMPV-2026.11.25-202611251421-unsigned.ipa`。

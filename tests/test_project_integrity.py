@@ -221,6 +221,12 @@ def test_swift_sources_non_empty_and_balanced():
     assert "redrawRenderPassCount" in mpv_core
     assert "mistimedFrames" in mpv_core
     assert "delayedFrames" in mpv_core
+    assert "MPVProbeSnapshot" in mpv_core
+    assert "probeInterpolationState" in mpv_core
+    assert "releaseMediaForExternalEngine" in mpv_core
+    assert "lastMeasuredProMotionFPS" in mpv_core
+    assert "isStoppedByUser" in mpv_core
+    assert "logLevel: .info" in mpv_core
 
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "kCMSampleAttachmentKey_DisplayImmediately" in vt_engine
@@ -239,6 +245,11 @@ def test_swift_sources_non_empty_and_balanced():
     assert "nonisolated static func isQuarterTurnTransform" in vt_engine
     assert "nonisolated static func normalizedRotationTransform" in vt_engine
     assert "private func markReaderEOF()" in vt_engine
+    assert "formatDetailedError" in vt_engine
+    assert "buildReaderSettingsTiers" in vt_engine
+    assert "openAssetReaderWithFallback" in vt_engine
+    assert "AVMutableComposition" in vt_engine
+    assert "normalizeSourceBufferIfNeeded" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
@@ -257,6 +268,11 @@ def test_swift_sources_non_empty_and_balanced():
     assert "OrientationController" in player_view
     assert "DiagnosticLogExporter" in player_view
     assert "NativeShareSheetPresenter" in player_view
+    assert "runtimeTimeline" in player_view
+    assert "currentInterpolationVerdict" in player_view
+    assert "releaseMediaForExternalEngine()" in player_view
+    assert "startRuntimeTelemetrySampling()" in player_view
+    assert "captureRuntimeTelemetrySample()" in player_view
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"
@@ -269,6 +285,8 @@ def test_swift_sources_non_empty_and_balanced():
     log_exporter_src = log_exporter.read_text(encoding="utf-8")
     assert "DiagnosticLogExporter" in log_exporter_src
     assert "NativeShareSheetPresenter" in log_exporter_src
+    assert "runtimeTimeline" in log_exporter_src
+    assert "Runtime Telemetry Timeline" in log_exporter_src
 
     doc_picker = ROOT / "Sources" / "UI" / "NativeDocumentPickerPresenter.swift"
     assert doc_picker.is_file(), f"Missing {doc_picker}"
@@ -281,6 +299,9 @@ def test_swift_sources_non_empty_and_balanced():
     telemetry_src = telemetry_path.read_text(encoding="utf-8")
     assert "PlaybackHUDMetrics" in telemetry_src
     assert "ThermalLevel" in telemetry_src
+    assert "MPVProbeSnapshot" in telemetry_src
+    assert "InterpolationVerdict" in telemetry_src
+    assert "RuntimeTelemetrySample" in telemetry_src
 
 
 def test_lessons_learned_and_research_documented():
