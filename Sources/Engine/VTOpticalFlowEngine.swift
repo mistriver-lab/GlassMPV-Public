@@ -1875,7 +1875,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let status = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
                     formatDescription: candidate.description,
-                    videoDecoderSpecification: nil,
+                    decoderSpecification: nil,
                     imageBufferAttributes: attrs as CFDictionary,
                     outputCallback: nil,
                     decompressionSessionOut: &session

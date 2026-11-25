@@ -255,6 +255,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "VTDecompressionSessionHolder" in vt_engine
     assert "openCompressedPassthroughReader" in vt_engine
     assert "createDecompressionSessionWithFallback" in vt_engine
+    assert "decoderSpecification:" in vt_engine
+    assert "videoDecoderSpecification:" not in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
