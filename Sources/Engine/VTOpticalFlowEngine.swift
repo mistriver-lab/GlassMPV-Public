@@ -34,6 +34,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var duration: Double = 0
     @Published @MainActor var sourceFPS: Double = 0
     @Published @MainActor var interpolatedFPS: Double = 0
+    @Published @MainActor var actualOutputFPS: Double = 0
+    @Published @MainActor var videoWidth: Int = 0
+    @Published @MainActor var videoHeight: Int = 0
+    @Published @MainActor var videoCodec: String = ""
+    @Published @MainActor var bitDepthLabel: String = "--"
+    @Published @MainActor var hdrLabel: String = "SDR"
+    @Published @MainActor var isHDRActive: Bool = false
+    @Published @MainActor var droppedFrames: Int64 = 0
     @Published @MainActor var errorMessage: String?
     @Published @MainActor var isHardwareSupported: Bool = false
     @Published @MainActor var enableSpatial2xUpscale: Bool = false
@@ -64,6 +72,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var currentURL: URL?
     private var sessionToken = UUID()
     private var playbackSpeed: Float = 1.0
+    private var presentedTimestamps: [CFTimeInterval] = []
+    private var lastFPSPublishTimestamp: CFTimeInterval = 0
 
     @MainActor
     func attach(to layer: AVSampleBufferDisplayLayer) {
@@ -134,9 +144,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                 let nominalRate = try await videoTrack.load(.nominalFrameRate)
                 let naturalSize = try await videoTrack.load(.naturalSize)
+                let formatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
+                let trackMetrics = Self.extractTrackMetrics(from: formatDescriptions.first, naturalSize: naturalSize)
                 let srcFps = nominalRate > 0 ? Double(nominalRate) : 24.0
                 self.sourceFPS = srcFps
                 self.interpolatedFPS = srcFps * 2.0
+                self.videoWidth = trackMetrics.width
+                self.videoHeight = trackMetrics.height
+                self.videoCodec = trackMetrics.codec
+                self.bitDepthLabel = trackMetrics.bitDepth
+                self.hdrLabel = trackMetrics.hdrTag
+                self.isHDRActive = false
 
                 self.startPipeline(
                     url: url,
@@ -233,6 +251,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         audioPlayer = nil
         clearBufferedFrames()
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        presentedTimestamps.removeAll()
+        lastFPSPublishTimestamp = 0
+        actualOutputFPS = 0
+        videoWidth = 0
+        videoHeight = 0
+        videoCodec = ""
+        bitDepthLabel = "--"
+        hdrLabel = "SDR"
+        isHDRActive = false
+        droppedFrames = 0
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
         lastInterpolationError = nil
@@ -315,6 +343,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             defer { processor.endSession() }
 
             let pixelFormat = resolveSourcePixelFormat(from: configuration)
+            let resolvedPixFmtString = Self.fourCCString(pixelFormat)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.bitDepthLabel == "--" {
+                    let parsed = PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: resolvedPixFmtString)
+                    if parsed != "--" {
+                        self.bitDepthLabel = parsed
+                    }
+                }
+            }
 
             let reader = try AVAssetReader(asset: asset)
             if startSeconds > 0 {
@@ -451,13 +489,20 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let now = audioPlayer.currentTime().seconds
         guard now.isFinite else { return }
 
+        var droppedInTick = 0
         var frameToPresent: CVPixelBuffer?
         bufferLock.lock()
         while let head = frameQueue.first, head.pts <= now + 0.004 {
+            if frameToPresent != nil {
+                droppedInTick += 1
+            }
             frameToPresent = head.buffer
             frameQueue.removeFirst()
         }
         bufferLock.unlock()
+        if droppedInTick > 0 {
+            droppedFrames += Int64(droppedInTick)
+        }
 
         if let buffer = frameToPresent,
            let sampleBuffer = makeSampleBuffer(from: buffer, ptsSeconds: now) {
@@ -466,6 +511,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
             if layer.sampleBufferRenderer.isReadyForMoreMediaData {
                 layer.sampleBufferRenderer.enqueue(sampleBuffer)
+                let nowMedia = CACurrentMediaTime()
+                presentedTimestamps.append(nowMedia)
+                presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
+                if nowMedia - lastFPSPublishTimestamp >= 0.25 {
+                    lastFPSPublishTimestamp = nowMedia
+                    if presentedTimestamps.count >= 2, let first = presentedTimestamps.first {
+                        let span = nowMedia - first
+                        if span > 0.05 {
+                            actualOutputFPS = Double(presentedTimestamps.count - 1) / span
+                        }
+                    }
+                }
             }
         }
     }
@@ -595,6 +652,53 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             )
         }
         return sampleBuffer
+    }
+
+    private static func extractTrackMetrics(
+        from formatDescription: CMFormatDescription?,
+        naturalSize: CGSize
+    ) -> (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String) {
+        let width = Int(abs(naturalSize.width))
+        let height = Int(abs(naturalSize.height))
+        guard let desc = formatDescription else {
+            return (width, height, "", "--", "SDR")
+        }
+
+        let subType = CMFormatDescriptionGetMediaSubType(desc)
+        let codec = fourCCString(subType)
+        let extensions = CMFormatDescriptionGetExtensions(desc) as? [String: Any]
+        let transfer = extensions?[kCMFormatDescriptionExtension_TransferFunction as String] as? String
+        let transferLower = (transfer ?? "").lowercased()
+        let isHDR = transferLower.contains("2084") || transferLower.contains("pq") || transferLower.contains("hlg")
+        let hdrTag = PlaybackHUDMetrics.formatHDRTag(
+            isHDRContent: isHDR,
+            transferName: transfer,
+            isHDRActive: false
+        )
+
+        let bitDepth: String
+        if let bpc = extensions?[kCMFormatDescriptionExtension_BitsPerComponent as String] as? Int, bpc > 0 {
+            bitDepth = "\(bpc)-bit"
+        } else if isHDR {
+            bitDepth = "10-bit"
+        } else {
+            bitDepth = "--"
+        }
+
+        return (width, height, codec, bitDepth, hdrTag)
+    }
+
+    private static func fourCCString(_ code: FourCharCode) -> String {
+        let bytes: [UInt8] = [
+            UInt8((code >> 24) & 0xFF),
+            UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF),
+            UInt8(code & 0xFF)
+        ]
+        let chars = bytes.map { byte -> Character in
+            (32...126).contains(byte) ? Character(UnicodeScalar(byte)) : "?"
+        }
+        return String(chars).trimmingCharacters(in: .whitespaces)
     }
 }
 

@@ -50,6 +50,11 @@ final class MPVPlayerController: ObservableObject {
     @Published var videoHeight: Int = 0
     @Published var videoCodec: String = ""
     @Published var hardwareDecoder: String = ""
+    @Published var decodedPixelFormat: String = ""
+    @Published var bitDepthLabel: String = "--"
+    @Published var hdrLabel: String = "SDR"
+    @Published var isHDRActive: Bool = false
+    @Published var droppedFrames: Int64 = 0
     @Published var freshRenderPassCount: Int = 0
     @Published var activeShaderCount: Int = 0
     @Published var statusMessage: String = ""
@@ -99,10 +104,16 @@ final class MPVPlayerController: ObservableObject {
         duration = 0
         sourceFPS = 0
         outputFPS = 0
+        displaySyncFPS = 0
         videoWidth = 0
         videoHeight = 0
         videoCodec = ""
         hardwareDecoder = ""
+        decodedPixelFormat = ""
+        bitDepthLabel = "--"
+        hdrLabel = "SDR"
+        isHDRActive = false
+        droppedFrames = 0
         freshRenderPassCount = 0
         lastAppliedReadyGeneration = nil
         isInitialized = true
@@ -194,28 +205,49 @@ final class MPVPlayerController: ObservableObject {
 
     func refreshDiagnosticsSnapshot() {
         let diag = player.playbackDiagnostics
+        let info = player.mediaInformation
+
         if let containerFPS = diag.containerFramesPerSecond, containerFPS > 0 {
             sourceFPS = containerFPS
+        } else if let mediaFPS = info.framesPerSecond, mediaFPS > 0, sourceFPS <= 0 {
+            sourceFPS = mediaFPS
         }
+
         if let vfFPS = diag.estimatedFilterFramesPerSecond, vfFPS > 0 {
             outputFPS = vfFPS
-        } else if let mediaFPS = player.mediaInformation.framesPerSecond, mediaFPS > 0 {
+        } else if let decFPS = diag.estimatedDecodedFramesPerSecond, decFPS > 0 {
+            outputFPS = decFPS
+        } else if let mediaFPS = info.framesPerSecond, mediaFPS > 0 {
             outputFPS = mediaFPS
         }
+
         if let dispFPS = diag.estimatedDisplayFramesPerSecond ?? diag.nominalDisplayFramesPerSecond, dispFPS > 0 {
             displaySyncFPS = dispFPS
         }
         freshRenderPassCount = diag.freshRenderPasses?.count ?? 0
-        if let codec = diag.decoder.codec ?? player.mediaInformation.videoCodec, !codec.isEmpty {
+        droppedFrames = (diag.decoderDroppedFrames ?? 0) + (diag.outputDroppedFrames ?? 0)
+
+        if let codec = diag.decoder.codec ?? info.videoCodec, !codec.isEmpty {
             videoCodec = codec
         }
+        if let pixFmt = diag.decoder.decodedPixelFormat ?? info.hdr.decoded.pixelFormat ?? info.hdr.source.pixelFormat,
+           !pixFmt.isEmpty {
+            decodedPixelFormat = pixFmt
+        }
+        if let bitDepth = info.hdr.decoded.bitDepth ?? info.hdr.source.bitDepth, bitDepth > 0 {
+            bitDepthLabel = "\(bitDepth)-bit"
+        } else if !decodedPixelFormat.isEmpty {
+            bitDepthLabel = PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: decodedPixelFormat)
+        }
+        updateHDRMetadata(from: info.hdr)
+
         switch diag.decoder.session {
         case .hardware(let name):
             hardwareDecoder = name
         case .software:
             hardwareDecoder = "software"
         case .unknown:
-            if let hw = player.mediaInformation.hardwareDecoder, !hw.isEmpty {
+            if let hw = info.hardwareDecoder, !hw.isEmpty {
                 hardwareDecoder = hw
             }
         }
@@ -327,7 +359,7 @@ final class MPVPlayerController: ObservableObject {
     }
 
     private func applyMediaInfo(_ info: MPVMediaInformation) {
-        if let dims = info.dimensions {
+        if let dims = info.presentationDimensions ?? info.dimensions {
             videoWidth = dims.width
             videoHeight = dims.height
         }
@@ -349,6 +381,33 @@ final class MPVPlayerController: ObservableObject {
         if let hw = info.hardwareDecoder, !hw.isEmpty {
             hardwareDecoder = hw
         }
+        if let pixFmt = info.hdr.decoded.pixelFormat ?? info.hdr.source.pixelFormat, !pixFmt.isEmpty {
+            decodedPixelFormat = pixFmt
+        }
+        if let bitDepth = info.hdr.decoded.bitDepth ?? info.hdr.source.bitDepth, bitDepth > 0 {
+            bitDepthLabel = "\(bitDepth)-bit"
+        } else if !decodedPixelFormat.isEmpty {
+            bitDepthLabel = PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: decodedPixelFormat)
+        }
+        updateHDRMetadata(from: info.hdr)
+    }
+
+    private func updateHDRMetadata(from hdr: MPVHDRStatus) {
+        let transferName: String?
+        switch hdr.transferFunction {
+        case .pq:
+            transferName = "pq"
+        case .hlg:
+            transferName = "hlg"
+        default:
+            transferName = hdr.transferFunction.mpvValue
+        }
+        isHDRActive = hdr.isHDRActive
+        hdrLabel = PlaybackHUDMetrics.formatHDRTag(
+            isHDRContent: hdr.isHDRContent,
+            transferName: transferName,
+            isHDRActive: hdr.isHDRActive
+        )
     }
 
     private func reapplyActivePipelineIfNeeded(for generation: UInt64) {

@@ -3,6 +3,16 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+private final class ThermalObserverToken: @unchecked Sendable {
+    var observer: NSObjectProtocol?
+
+    deinit {
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+}
+
 @MainActor
 final class PlayerCoordinator: ObservableObject {
     @Published var engineMode: PlayerEngineMode = .mpv
@@ -15,9 +25,73 @@ final class PlayerCoordinator: ObservableObject {
     @Published var isGeneratingSample: Bool = false
     @Published var isImportingFile: Bool = false
     @Published var selfCheckReport: String = ""
+    @Published var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
     let mpvController = MPVPlayerController()
     let opticalFlowController = OpticalFlowPlayerController()
+    private let thermalToken = ThermalObserverToken()
+
+    init() {
+        thermalToken.observer = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            let current = ProcessInfo.processInfo.thermalState
+            Task { @MainActor [weak self] in
+                self?.thermalState = current
+            }
+        }
+    }
+
+    var hudMetrics: PlaybackHUDMetrics {
+        let thermal = ThermalLevel(state: thermalState)
+        if engineMode == .mpv {
+            let shaderCount = SingleShaderOption.resolvedShaderPaths(
+                preset: selectedPreset,
+                extras: selectedExtras
+            ).count
+            return PlaybackHUDMetrics(
+                engineBadge: "MPV",
+                interpolationBadge: interpolationMode.shortBadge,
+                codec: mpvController.videoCodec,
+                width: mpvController.videoWidth,
+                height: mpvController.videoHeight,
+                sourceFPS: mpvController.sourceFPS,
+                outputFPS: mpvController.outputFPS,
+                displayFPS: mpvController.displaySyncFPS,
+                bitDepth: mpvController.bitDepthLabel,
+                hdrTag: mpvController.hdrLabel,
+                isHDRActive: mpvController.isHDRActive,
+                decoderBadge: PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: mpvController.hardwareDecoder),
+                droppedFrames: mpvController.droppedFrames,
+                activeShaderCount: shaderCount,
+                thermalLevel: thermal
+            )
+        } else {
+            let outFPS = opticalFlowController.actualOutputFPS > 0
+                ? opticalFlowController.actualOutputFPS
+                : opticalFlowController.interpolatedFPS
+            let interpBadge = opticalFlowController.enableSpatial2xUpscale ? "光流2x+超分2x" : interpolationMode.shortBadge
+            return PlaybackHUDMetrics(
+                engineBadge: "ANE",
+                interpolationBadge: interpBadge,
+                codec: opticalFlowController.videoCodec,
+                width: opticalFlowController.videoWidth,
+                height: opticalFlowController.videoHeight,
+                sourceFPS: opticalFlowController.sourceFPS,
+                outputFPS: outFPS,
+                displayFPS: 0,
+                bitDepth: opticalFlowController.bitDepthLabel,
+                hdrTag: opticalFlowController.hdrLabel,
+                isHDRActive: opticalFlowController.isHDRActive,
+                decoderBadge: "硬解 VT+ANE",
+                droppedFrames: opticalFlowController.droppedFrames,
+                activeShaderCount: 0,
+                thermalLevel: thermal
+            )
+        }
+    }
 
     func open(url: URL, isSecurityScoped: Bool = false) {
         mpvController.clearError()
@@ -289,6 +363,7 @@ struct LiquidGlassPlayerView: View {
     @ObservedObject private var optical: OpticalFlowPlayerController
 
     @State private var showHUD: Bool = true
+    @State private var showStatsHUD: Bool = true
     @State private var showFileImporter: Bool = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
@@ -298,6 +373,7 @@ struct LiquidGlassPlayerView: View {
     @State private var showDiagnosticSheet: Bool = false
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     init(coordinator: PlayerCoordinator) {
         self.coordinator = coordinator
@@ -335,6 +411,21 @@ struct LiquidGlassPlayerView: View {
                    mpv.videoWidth == 0,
                    !mpv.playbackState.isEmpty {
                     loadingStatusPill(mpv.playbackState)
+                }
+
+                if showStatsHUD {
+                    VStack {
+                        HStack {
+                            compactStatsHUD(metrics: coordinator.hudMetrics)
+                            Spacer()
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, showHUD ? (horizontalSizeClass == .compact ? 106 : 64) : 12)
+                    .allowsHitTesting(false)
+                    .animation(.easeInOut(duration: 0.22), value: showHUD)
+                    .transition(.opacity)
                 }
 
                 if showHUD {
@@ -519,81 +610,23 @@ struct LiquidGlassPlayerView: View {
         VStack {
             // 顶部液态玻璃状态栏
             GlassEffectContainer(spacing: 12) {
-                HStack(spacing: 10) {
-                    Button {
-                        showFileImporter = true
-                    } label: {
-                        Image(systemName: "folder")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 40, height: 40)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .circle)
+                VStack(alignment: .trailing, spacing: 8) {
+                    HStack(spacing: 8) {
+                        toolbarActionButtons
 
-                    PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
-                        Image(systemName: "photo.on.rectangle")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 40, height: 40)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .circle)
+                        Spacer(minLength: 6)
 
-                    Button {
-                        showURLPrompt = true
-                    } label: {
-                        Image(systemName: "link")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 40, height: 40)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .circle)
-
-                    Button {
-                        showDiagnosticSheet = true
-                    } label: {
-                        Image(systemName: "stethoscope")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 40, height: 40)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .circle)
-
-                    Spacer()
-
-                    // 双核切换胶囊
-                    HStack(spacing: 4) {
-                        ForEach(PlayerEngineMode.allCases) { mode in
-                            Button {
-                                coordinator.switchEngine(to: mode)
-                            } label: {
-                                Text(mode.rawValue)
-                                    .font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(
-                                coordinator.engineMode == mode
-                                    ? .regular.tint(.cyan).interactive()
-                                    : .regular.interactive(),
-                                in: .capsule
-                            )
+                        if horizontalSizeClass != .compact {
+                            engineSwitcherPills
+                            Spacer(minLength: 6)
                         }
+
+                        topRightMetricsBadge
                     }
 
-                    Spacer()
-
-                    // 实时参数徽章
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(activeResolutionText)
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                        Text("\(coordinator.interpolationMode.shortBadge) · \(activeFPSText)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                    if horizontalSizeClass == .compact {
+                        engineSwitcherPills
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .glassEffect(.regular, in: .capsule)
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
@@ -702,6 +735,166 @@ struct LiquidGlassPlayerView: View {
         }
     }
 
+    private var toolbarActionButtons: some View {
+        HStack(spacing: 8) {
+            Button {
+                showFileImporter = true
+            } label: {
+                Image(systemName: "folder")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .circle)
+
+            PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                Image(systemName: "photo.on.rectangle")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .circle)
+
+            Button {
+                showURLPrompt = true
+            } label: {
+                Image(systemName: "link")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .circle)
+
+            Button {
+                showDiagnosticSheet = true
+            } label: {
+                Image(systemName: "stethoscope")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .circle)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showStatsHUD.toggle()
+                }
+            } label: {
+                Image(systemName: showStatsHUD ? "info.circle.fill" : "info.circle")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 38, height: 38)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(
+                showStatsHUD ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                in: .circle
+            )
+        }
+    }
+
+    private var engineSwitcherPills: some View {
+        HStack(spacing: 4) {
+            ForEach(PlayerEngineMode.allCases) { mode in
+                Button {
+                    coordinator.switchEngine(to: mode)
+                } label: {
+                    Text(mode.rawValue)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(
+                    coordinator.engineMode == mode
+                        ? .regular.tint(.cyan).interactive()
+                        : .regular.interactive(),
+                    in: .capsule
+                )
+            }
+        }
+    }
+
+    private var topRightMetricsBadge: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showStatsHUD.toggle()
+            }
+        } label: {
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(activeResolutionText)
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                Text("\(coordinator.interpolationMode.shortBadge) · \(activeFPSText)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .capsule)
+    }
+
+    private func compactStatsHUD(metrics: PlaybackHUDMetrics) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(metrics.engineBadge)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(
+                        Color.cyan.opacity(0.18),
+                        in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    )
+
+                Text(metrics.videoStreamSummary)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(metrics.isHDRActive ? .yellow : .white)
+                    .lineLimit(1)
+            }
+
+            Text("FPS \(metrics.fpsSummary) · 丢帧 \(metrics.droppedFrames)")
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(1)
+
+            Text(metrics.pipelineSummary)
+                .font(.system(size: 10.5, weight: .regular, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.78))
+                .lineLimit(1)
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(thermalColor(metrics.thermalLevel))
+                    .frame(width: 6, height: 6)
+                Text("温度 \(metrics.thermalLevel.rawValue)")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(thermalColor(metrics.thermalLevel))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.62))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.8)
+                )
+        )
+    }
+
+    private func thermalColor(_ level: ThermalLevel) -> Color {
+        switch level {
+        case .nominal: return .green
+        case .fair: return .yellow
+        case .serious: return .orange
+        case .critical: return .red
+        }
+    }
+
     private func loadingStatusPill(_ state: String) -> some View {
         HStack(spacing: 8) {
             ProgressView()
@@ -784,18 +977,17 @@ struct LiquidGlassPlayerView: View {
     }
 
     private var activeResolutionText: String {
-        if coordinator.engineMode == .mpv {
-            return mpv.videoWidth > 0 ? "\(mpv.videoWidth)×\(mpv.videoHeight)" : "MPV"
+        let m = coordinator.hudMetrics
+        if m.width > 0 && m.height > 0 {
+            return "\(m.width)×\(m.height)"
         }
-        return optical.enableSpatial2xUpscale ? "ANE 2×超分" : "ANE 光流"
+        return coordinator.engineMode == .mpv ? "MPV" : (optical.enableSpatial2xUpscale ? "ANE 2×超分" : "ANE 光流")
     }
 
     private var activeFPSText: String {
-        if coordinator.engineMode == .mpv {
-            let fps = mpv.outputFPS > 0 ? mpv.outputFPS : mpv.sourceFPS
-            return fps > 0 ? String(format: "%.1f fps", fps) : "-- fps"
-        }
-        return optical.interpolatedFPS > 0 ? String(format: "%.1f fps", optical.interpolatedFPS) : "-- fps"
+        let m = coordinator.hudMetrics
+        let fps = m.outputFPS > 0 ? m.outputFPS : m.sourceFPS
+        return fps > 0 ? "\(PlaybackHUDMetrics.formatOutputFPS(fps)) fps" : "-- fps"
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -1036,7 +1228,9 @@ struct DiagnosticLogSheet: View {
                     LabeledContent("初始化状态", value: mpv.isInitialized ? "已就绪" : "未初始化")
                     LabeledContent("运行阶段", value: mpv.playbackState)
                     LabeledContent("视频分辨率", value: mpv.videoWidth > 0 ? "\(mpv.videoWidth)×\(mpv.videoHeight)" : "暂无")
+                    LabeledContent("色深 / HDR", value: "\(mpv.bitDepthLabel) · \(mpv.hdrLabel)")
                     LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", mpv.sourceFPS)) / \(String(format: "%.1f", mpv.outputFPS)) fps")
+                    LabeledContent("设备温度状态", value: ThermalLevel(state: coordinator.thermalState).rawValue)
                     LabeledContent("启用着色器数", value: "\(mpv.activeShaderCount)")
                     LabeledContent(
                         "解码器 / 硬解",

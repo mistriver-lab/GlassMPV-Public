@@ -195,4 +195,53 @@ final class GlassMPVTests: XCTestCase {
         controller.shutdown()
         XCTAssertFalse(controller.isInitialized)
     }
+
+    func testPlaybackHUDMetricsFormattingAndParsing() {
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("hvc1"), "HEVC")
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("avc1"), "H.264")
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("av01"), "AV1")
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName(""), "--")
+
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "nv12"), "8-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "yuv420p"), "8-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "p010le"), "10-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "x420"), "10-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "yuv420p12le"), "12-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: "p016"), "16-bit")
+        XCTAssertEqual(PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: ""), "--")
+
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: "pq", isHDRActive: false), "HDR10")
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: "pq", isHDRActive: true), "HDR10✓")
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: "hlg", isHDRActive: false), "HLG")
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: false, transferName: "bt.709", isHDRActive: false), "SDR")
+
+        XCTAssertEqual(PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: "videotoolbox"), "硬解 VT")
+        XCTAssertEqual(PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: "software"), "软解")
+
+        XCTAssertEqual(ThermalLevel(state: .nominal).rawValue, "正常")
+        XCTAssertEqual(ThermalLevel(state: .fair).rawValue, "温热")
+        XCTAssertEqual(ThermalLevel(state: .serious).rawValue, "过热")
+        XCTAssertEqual(ThermalLevel(state: .critical).rawValue, "严重过热")
+
+        let metrics = PlaybackHUDMetrics(
+            engineBadge: "MPV",
+            interpolationBadge: "原帧率",
+            codec: "hevc",
+            width: 1920,
+            height: 1080,
+            sourceFPS: 23.976,
+            outputFPS: 24.0,
+            displayFPS: 120,
+            bitDepth: "10-bit",
+            hdrTag: "HDR10",
+            isHDRActive: false,
+            decoderBadge: "硬解 VT",
+            droppedFrames: 0,
+            activeShaderCount: 2,
+            thermalLevel: .nominal
+        )
+        XCTAssertEqual(metrics.videoStreamSummary, "HEVC · 1920×1080 · 10-bit HDR10")
+        XCTAssertEqual(metrics.fpsSummary, "23.98 → 24.0 fps · 120Hz")
+        XCTAssertEqual(metrics.pipelineSummary, "硬解 VT · 原帧率 · 2着色器")
+    }
 }

@@ -222,11 +222,26 @@ def test_swift_sources_non_empty_and_balanced():
     assert "import PhotosUI" in player_view
     assert "PhotosPicker" in player_view
     assert "runRealDeviceSelfCheck()" in player_view
+    assert "compactStatsHUD" in player_view
+    assert "showStatsHUD" in player_view
+
+    telemetry_path = ROOT / "Sources" / "Models" / "PlaybackTelemetry.swift"
+    assert telemetry_path.is_file(), f"Missing {telemetry_path}"
+    telemetry_src = telemetry_path.read_text(encoding="utf-8")
+    assert "PlaybackHUDMetrics" in telemetry_src
+    assert "ThermalLevel" in telemetry_src
 
 
-def test_lessons_learned_documented():
+def test_lessons_learned_and_research_documented():
     lessons_path = ROOT / "docs" / "LESSONS_LEARNED.md"
     assert lessons_path.is_file(), f"Missing {lessons_path}"
     content = lessons_path.read_text(encoding="utf-8")
     headings = re.findall(r"^## \d+\.", content, flags=re.MULTILINE)
     assert len(headings) == 9, f"Expected 9 numbered sections in LESSONS_LEARNED.md, found {headings}"
+
+    research_path = ROOT / "docs" / "INTERPOLATION_ARCHITECTURE_RESEARCH.md"
+    assert research_path.is_file(), f"Missing {research_path}"
+    research_src = research_path.read_text(encoding="utf-8")
+    assert "MEMC_RIFE_STD.vpy" in research_src
+    assert "MEMC_SVP_LQ.vpy" in research_src
+    assert "VTFrameProcessor" in research_src

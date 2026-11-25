@@ -10,6 +10,8 @@ trigger: always_on
 - **不改核心 Target 标识**：除非用户明确要求全量改包名，保持 `project.yml` Target `GlassMPV`、Bundle ID 与 GitHub 仓库关联不变。
 
 ## 2. 硬性防复发门禁（源自 `docs/LESSONS_LEARNED.md`）
+0. **日期时间版本号铁律（CalVer）**：
+   - 以后所有构建与交付必须使用东八区（`Asia/Shanghai`）日期时间作为版本号：`YYYY.MM.DD` 作为 `MARKETING_VERSION` / `CFBundleShortVersionString`（以及主仓 `VERSION` / `project.yml`），`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION` / `CFBundleVersion`，IPA 产物统一命名为 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。
 1. **Swift 6 并发与 C 回调隔离铁律**：
    - 严禁在 `@MainActor` 方法内向 C 函数（如 `mpv_set_wakeup_callback`）传入内联闭包；C 回调必须定义为文件顶层非隔离函数（如 `mpvWakeupCallback(_:)`），否则会触发 `_dispatch_assert_queue_fail` 闪退。
    - 严禁在 `@Sendable` 闭包内直接捕获 `super`；跨线程写入 `CAMetalLayer` 属性须经由 `@unchecked Sendable` 包装并异步派发，严禁使用 `DispatchQueue.main.sync`。
