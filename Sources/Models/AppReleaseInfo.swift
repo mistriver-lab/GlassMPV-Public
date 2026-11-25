@@ -32,7 +32,9 @@ enum AppReleaseInfo {
                 "全面切换东八区日期时间版本号体系（CalVer：YYYY.MM.DD / YYYYMMDDHHMM）",
                 "修复 MPV 120Hz 时域平滑插帧（interpolation-threshold=-1 + tscale=linear）与 ANE 光流核会话参数/像素格式池/首帧时钟竞态，新增 ANE 诊断日志采集",
                 "新增 4K 片源自动禁用超分门控（SuperResolutionPolicy）：≥3840×2160 时自动屏蔽 GLSL 与 ANE 2× 超分",
-                "新增默认横屏起播与手动旋转切换（OrientationController）、一键返回主界面及一键导出 .txt 完整诊断日志"
+                "新增默认横屏起播与手动旋转切换（OrientationController）、一键返回主界面及一键导出 .txt 完整诊断日志",
+                "消除播放页顶部 Liquid Glass 按钮粘黏并精简顶栏（移除重复的打开文件/相册/串流按钮，引擎切换改为单胶囊分段控件）",
+                "修复 ANE 光流核黑屏与失效（补齐 controlTimebase、消除切引擎 startAt/seek 竞态、规范像素格式与色彩附件传播、增加追帧保护与真实帧率回显），并升级 MPV 120Hz 时域平滑为 tscale=mitchell + interpolation-preserve=yes"
             ]
         ),
         ReleaseNoteEntry(

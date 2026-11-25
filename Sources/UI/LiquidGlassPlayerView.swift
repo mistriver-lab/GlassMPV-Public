@@ -81,9 +81,6 @@ final class PlayerCoordinator: ObservableObject {
                 thermalLevel: thermal
             )
         } else {
-            let outFPS = opticalFlowController.actualOutputFPS > 0
-                ? opticalFlowController.actualOutputFPS
-                : opticalFlowController.interpolatedFPS
             let interpBadge = opticalFlowController.enableSpatial2xUpscale ? "光流2x+超分2x" : interpolationMode.shortBadge
             return PlaybackHUDMetrics(
                 engineBadge: "ANE",
@@ -92,7 +89,7 @@ final class PlayerCoordinator: ObservableObject {
                 width: opticalFlowController.videoWidth,
                 height: opticalFlowController.videoHeight,
                 sourceFPS: opticalFlowController.sourceFPS,
-                outputFPS: outFPS,
+                outputFPS: opticalFlowController.actualOutputFPS,
                 displayFPS: 0,
                 bitDepth: opticalFlowController.bitDepthLabel,
                 hdrTag: opticalFlowController.hdrLabel,
@@ -342,10 +339,7 @@ final class PlayerCoordinator: ObservableObject {
         vtSpatial2x = enabled
         if engineMode == .opticalFlow, let url = currentURL {
             let t = opticalFlowController.currentTime
-            opticalFlowController.load(url: url, spatial2x: enabled)
-            if t > 0.5 {
-                opticalFlowController.seek(to: t)
-            }
+            opticalFlowController.load(url: url, spatial2x: enabled, startAt: t)
         }
     }
 
@@ -408,11 +402,8 @@ final class PlayerCoordinator: ObservableObject {
             }
         case .opticalFlow:
             mpvController.pause()
-            opticalFlowController.load(url: url, spatial2x: vtSpatial2x)
+            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, startAt: seekTo)
             opticalFlowController.setSpeed(speed)
-            if seekTo > 0.5 {
-                opticalFlowController.seek(to: seekTo)
-            }
         }
     }
 }
@@ -655,35 +646,32 @@ struct LiquidGlassPlayerView: View {
 
     private var playerHUDOverlay: some View {
         VStack {
-            // 顶部液态玻璃状态栏
-            GlassEffectContainer(spacing: 12) {
-                VStack(alignment: .trailing, spacing: 8) {
-                    HStack(spacing: 8) {
-                        toolbarActionButtons
+            // 顶部液态玻璃状态栏（移除外层 GlassEffectContainer 避免邻近按钮融合粘黏）
+            VStack(alignment: .trailing, spacing: 8) {
+                HStack(spacing: 8) {
+                    toolbarActionButtons
 
-                        Spacer(minLength: 6)
+                    Spacer(minLength: 6)
 
-                        if horizontalSizeClass != .compact {
-                            engineSwitcherPills
-                            Spacer(minLength: 6)
-                        }
-
-                        topRightMetricsBadge
-                    }
-
-                    if horizontalSizeClass == .compact {
+                    if horizontalSizeClass != .compact {
                         engineSwitcherPills
+                        Spacer(minLength: 6)
                     }
+
+                    topRightMetricsBadge
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
+
+                if horizontalSizeClass == .compact {
+                    engineSwitcherPills
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
 
             Spacer()
 
             // 底部液态玻璃播放控制坞
-            GlassEffectContainer(spacing: 12) {
-                VStack(spacing: 12) {
+            VStack(spacing: 12) {
                     HStack(spacing: 10) {
                         Text(formatTime(displayTime))
                             .font(.caption.monospacedDigit())
@@ -778,12 +766,11 @@ struct LiquidGlassPlayerView: View {
                 .glassEffect(.regular, in: .rect(cornerRadius: 26))
                 .padding(.horizontal, 16)
                 .padding(.bottom, 10)
-            }
         }
     }
 
     private var toolbarActionButtons: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 10) {
             Button {
                 coordinator.closeToHome()
             } label: {
@@ -809,43 +796,15 @@ struct LiquidGlassPlayerView: View {
             .glassEffect(.regular.interactive(), in: .circle)
 
             Button {
-                coordinator.presentLocalVideoPicker()
+                showDiagnosticSheet = true
             } label: {
-                Image(systemName: "folder")
+                Image(systemName: "stethoscope")
                     .font(.body.weight(.semibold))
                     .frame(width: 34, height: 34)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .contentShape(Circle())
-            .glassEffect(.regular.interactive(), in: .circle)
-
-            PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
-                Image(systemName: "photo.on.rectangle")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 34, height: 34)
-            }
-            .buttonStyle(.plain)
-            .glassEffect(.regular.interactive(), in: .circle)
-
-            Button {
-                showURLPrompt = true
-            } label: {
-                Image(systemName: "link")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 34, height: 34)
-            }
-            .buttonStyle(.plain)
-            .glassEffect(.regular.interactive(), in: .circle)
-
-            Button {
-                showDiagnosticSheet = true
-            } label: {
-                Image(systemName: "stethoscope")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 34, height: 34)
-            }
-            .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
 
             Button {
@@ -856,8 +815,10 @@ struct LiquidGlassPlayerView: View {
                 Image(systemName: showStatsHUD ? "info.circle.fill" : "info.circle")
                     .font(.body.weight(.semibold))
                     .frame(width: 34, height: 34)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
+            .contentShape(Circle())
             .glassEffect(
                 showStatsHUD ? .regular.tint(.cyan).interactive() : .regular.interactive(),
                 in: .circle
@@ -866,26 +827,28 @@ struct LiquidGlassPlayerView: View {
     }
 
     private var engineSwitcherPills: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             ForEach(PlayerEngineMode.allCases) { mode in
                 Button {
                     coordinator.switchEngine(to: mode)
                 } label: {
                     Text(mode.rawValue)
                         .font(.caption.weight(.semibold))
+                        .foregroundStyle(coordinator.engineMode == mode ? .black : .white)
                         .lineLimit(1)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
+                        .padding(.vertical, 7)
+                        .background(
+                            coordinator.engineMode == mode ? Color.cyan.opacity(0.85) : Color.clear,
+                            in: Capsule()
+                        )
+                        .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .glassEffect(
-                    coordinator.engineMode == mode
-                        ? .regular.tint(.cyan).interactive()
-                        : .regular.interactive(),
-                    in: .capsule
-                )
             }
         }
+        .padding(3)
+        .glassEffect(.regular, in: .capsule)
     }
 
     private var topRightMetricsBadge: some View {
@@ -1256,7 +1219,7 @@ struct EnhancementControlSheet: View {
         case .off:
             return "按片源原生帧率输出"
         case .mpvSmooth120Hz:
-            return "display-resample + tscale=oversample，与全部GLSL超分共存"
+            return "display-resample + tscale=mitchell，消除24p抖动并与GLSL超分共存"
         case .vtOpticalFlow2x:
             return "Apple VideoToolbox 神经网络真光流插帧（仅 MP4/MOV）"
         }
@@ -1355,7 +1318,7 @@ struct DiagnosticLogSheet: View {
                     )
                     LabeledContent(
                         "ANE 光流状态",
-                        value: "\(optical.capabilityDescription) (成功 \(optical.interpolatedFrameCount) / 失败 \(optical.failedInterpolationCount))"
+                        value: "\(optical.capabilityDescription) (补帧 \(optical.interpolatedFrameCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount))"
                     )
                     if let currentURL = coordinator.currentURL {
                         LabeledContent("当前片源", value: currentURL.lastPathComponent)

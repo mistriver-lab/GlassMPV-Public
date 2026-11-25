@@ -133,6 +133,39 @@ final class GlassMPVTests: XCTestCase {
     }
 
     @MainActor
+    func testOpticalFlowAttachConfiguresTimebaseAndSampleBuffer() throws {
+        let container = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        XCTAssertNil(container.displayLayer.controlTimebase)
+
+        let controller = OpticalFlowPlayerController()
+        controller.attach(to: container.displayLayer)
+        let timebase = try XCTUnwrap(container.displayLayer.controlTimebase, "attach 后应绑定 controlTimebase 以防止高起点 seek 黑屏")
+        XCTAssertGreaterThan(CMTimebaseGetRate(timebase), 0)
+
+        var pixelBufferOpt: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            64,
+            64,
+            kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &pixelBufferOpt
+        )
+        XCTAssertEqual(status, kCVReturnSuccess)
+        let pixelBuffer = try XCTUnwrap(pixelBufferOpt)
+
+        let sampleBuffer = try XCTUnwrap(controller.makeSampleBuffer(from: pixelBuffer, ptsSeconds: 120.0))
+        XCTAssertTrue(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).isValid)
+        let attachments = try XCTUnwrap(
+            CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+        )
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque()
+        let valPtr = try XCTUnwrap(CFDictionaryGetValue(dict, key))
+        XCTAssertTrue(CFBooleanGetValue(unsafeBitCast(valPtr, to: CFBoolean.self)))
+    }
+
+    @MainActor
     func testMPVUIControllerPlaybackWithWindowHost() async throws {
         let sampleURL = try await TestVideoGenerator.generateSampleMP4(
             durationSeconds: 3.0,

@@ -197,14 +197,18 @@ final class MPVPlayerController: ObservableObject {
             player.setProperty("video-sync", to: "display-resample")
             player.setProperty("interpolation", to: "yes")
             player.setProperty("interpolation-threshold", to: "-1")
-            player.setProperty("tscale", to: "linear")
+            player.setProperty("interpolation-preserve", to: "yes")
+            player.setProperty("tscale", to: "mitchell")
             player.setProperty("display-fps-override", to: "\(targetDisplayFPS)")
-            appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑 (display-resample + interpolation-threshold=-1 + tscale=linear + display-fps-override=\(targetDisplayFPS))")
+            displaySyncFPS = Double(targetDisplayFPS)
+            appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑 (display-resample + interpolation-threshold=-1 + interpolation-preserve=yes + tscale=mitchell + display-fps-override=\(targetDisplayFPS))")
         case .off, .vtOpticalFlow2x:
             player.setProperty("interpolation", to: "no")
+            player.setProperty("interpolation-preserve", to: "no")
             player.setProperty("interpolation-threshold", to: "0.01")
             player.setProperty("video-sync", to: "audio")
             player.setProperty("display-fps-override", to: "0")
+            displaySyncFPS = 0
             appendLog("[interp] 关闭时域插值 (video-sync=audio)")
         }
     }
@@ -249,7 +253,7 @@ final class MPVPlayerController: ObservableObject {
 
         if let dispFPS = diag.estimatedDisplayFramesPerSecond ?? diag.nominalDisplayFramesPerSecond, dispFPS > 0 {
             displaySyncFPS = dispFPS
-        } else if currentInterpolation == .mpvSmooth120Hz && displaySyncFPS <= 0 {
+        } else if currentInterpolation == .mpvSmooth120Hz {
             let screenMaxFPS = UIApplication.shared.connectedScenes
                 .compactMap { $0 as? UIWindowScene }
                 .first?.screen.maximumFramesPerSecond ?? 120

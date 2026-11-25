@@ -47,6 +47,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var enableSpatial2xUpscale: Bool = false
     @Published @MainActor var interpolatedFrameCount: Int = 0
     @Published @MainActor var failedInterpolationCount: Int = 0
+    @Published @MainActor var presentedFrameCount: Int = 0
     @Published @MainActor var lastInterpolationError: String?
     @Published @MainActor var diagnosticLogs: [String] = []
 
@@ -69,10 +70,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     private let bufferLock = NSLock()
     private let tokenLock = NSLock()
+    private let audioClockLock = NSLock()
     private var frameQueue: [(pts: Double, buffer: CVPixelBuffer)] = []
     private var maxQueuedFrames = 16
 
     private weak var displayLayer: AVSampleBufferDisplayLayer?
+    private var displayTimebase: CMTimebase?
     private var audioPlayer: AVPlayer?
     private var timeObserver: Any?
     private var displayLink: CADisplayLink?
@@ -80,6 +83,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var currentURL: URL?
     private var sessionToken = UUID()
     private var playbackSpeed: Float = 1.0
+    private var latestAudioTimeSeconds: Double = 0
     @MainActor private var isPipelineReadyToPlay: Bool = false
     private var presentedTimestamps: [CFTimeInterval] = []
     private var lastFPSPublishTimestamp: CFTimeInterval = 0
@@ -87,18 +91,32 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor
     func attach(to layer: AVSampleBufferDisplayLayer) {
         self.displayLayer = layer
+        var timebase: CMTimebase?
+        let status = CMTimebaseCreateWithSourceClock(
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &timebase
+        )
+        if status == noErr, let timebase {
+            CMTimebaseSetTime(timebase, time: .zero)
+            CMTimebaseSetRate(timebase, rate: 1.0)
+            layer.controlTimebase = timebase
+            self.displayTimebase = timebase
+        }
     }
 
     @MainActor
-    func load(url: URL, spatial2x: Bool) {
+    func load(url: URL, spatial2x: Bool, startAt: Double = 0) {
         stopInternal()
         currentURL = url
         enableSpatial2xUpscale = spatial2x
         errorMessage = nil
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
+        presentedFrameCount = 0
         lastInterpolationError = nil
-        appendLog("[ane] 请求加载光流核: \(url.lastPathComponent) (请求空间2×=\(spatial2x))")
+        updateLatestAudioTime(max(0, startAt))
+        appendLog("[ane] 请求加载光流核: \(url.lastPathComponent) (请求空间2×=\(spatial2x), startAt=\(String(format: "%.2f", startAt))s)")
 
 #if targetEnvironment(simulator)
         isHardwareSupported = false
@@ -143,9 +161,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             do {
                 let asset = AVURLAsset(url: url)
                 let assetDuration = try await asset.load(.duration)
+                guard self.isTokenValid(token) else { return }
                 self.duration = assetDuration.seconds.isFinite ? assetDuration.seconds : 0
 
                 let tracks = try await asset.loadTracks(withMediaType: .video)
+                guard self.isTokenValid(token) else { return }
                 guard let videoTrack = tracks.first else {
                     self.isPaused = true
                     self.appendLog("[ane] 未发现视频轨道（仅支持 MP4/MOV 容器）")
@@ -161,6 +181,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let nominalRate = try await videoTrack.load(.nominalFrameRate)
                 let naturalSize = try await videoTrack.load(.naturalSize)
                 let formatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
+                guard self.isTokenValid(token) else { return }
                 let trackMetrics = Self.extractTrackMetrics(from: formatDescriptions.first, naturalSize: naturalSize)
                 let is4K = SuperResolutionPolicy.isAlready4K(width: trackMetrics.width, height: trackMetrics.height)
                 let effectiveSpatial2x = spatial2x && !is4K
@@ -179,11 +200,26 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.isHDRActive = false
                 self.enableSpatial2xUpscale = effectiveSpatial2x
 
+                let clampedStart = self.duration > 0 ? max(0, min(startAt, self.duration)) : max(0, startAt)
+                if clampedStart > 0.1 {
+                    let targetCM = CMTime(seconds: clampedStart, preferredTimescale: 600)
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        player.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+                            continuation.resume()
+                        }
+                    }
+                    guard self.isTokenValid(token) else { return }
+                    self.currentTime = clampedStart
+                    self.updateLatestAudioTime(clampedStart)
+                } else {
+                    self.updateLatestAudioTime(0)
+                }
+
                 self.startPipeline(
                     url: url,
                     width: Int(abs(naturalSize.width)),
                     height: Int(abs(naturalSize.height)),
-                    startSeconds: 0,
+                    startSeconds: clampedStart,
                     spatial2x: effectiveSpatial2x,
                     token: token
                 )
@@ -229,6 +265,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         guard let url = currentURL, let audioPlayer else { return }
         let clamped = max(0, min(seconds, duration))
         let targetCM = CMTime(seconds: clamped, preferredTimescale: 600)
+        audioPlayer.rate = 0
+        isPipelineReadyToPlay = false
+        currentTime = clamped
+        updateLatestAudioTime(clamped)
         audioPlayer.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
         clearBufferedFrames()
 
@@ -236,11 +276,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let spatial2x = self.enableSpatial2xUpscale
 
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, self.isTokenValid(token) else { return }
             let asset = AVURLAsset(url: url)
             guard let tracks = try? await asset.loadTracks(withMediaType: .video),
                   let videoTrack = tracks.first else { return }
             let naturalSize = (try? await videoTrack.load(.naturalSize)) ?? .zero
+            guard self.isTokenValid(token) else { return }
             self.startPipeline(
                 url: url,
                 width: Int(abs(naturalSize.width)),
@@ -278,6 +319,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         presentedTimestamps.removeAll()
         lastFPSPublishTimestamp = 0
         actualOutputFPS = 0
+        currentTime = 0
+        duration = 0
+        updateLatestAudioTime(0)
         videoWidth = 0
         videoHeight = 0
         videoCodec = ""
@@ -287,6 +331,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         droppedFrames = 0
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
+        presentedFrameCount = 0
         lastInterpolationError = nil
         isPipelineReadyToPlay = false
         isPaused = true
@@ -418,7 +463,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 return
             }
             reader.add(trackOutput)
-            reader.startReading()
+            guard reader.startReading() else {
+                let errDesc = reader.error?.localizedDescription ?? "AVAssetReader 启动失败"
+                logAsync("[ane][error] AVAssetReader startReading 失败: \(errDesc)")
+                Task { @MainActor [weak self] in
+                    self?.errorMessage = "光流读取视频失败：\(errDesc)"
+                }
+                return
+            }
 
             var destPool = try makeDestinationPool(
                 configuration: configuration,
@@ -443,6 +495,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             var localConsecutiveFailures = 0
             var didCheckActualDimensions = false
             var didStartAudioClock = false
+            var didLogCatchUp = false
 
             while reader.status == .reading {
                 if !isTokenValid(token) {
@@ -500,7 +553,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     }
                 }
 
-                if let prevBuf = previousBuffer,
+                let behindAudioClock = didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.12)
+                if behindAudioClock && !didLogCatchUp {
+                    didLogCatchUp = true
+                    logAsync("[ane][perf] 光流处理落后音频时钟，临时跳过部分帧插帧以保持音画同步")
+                }
+
+                if !behindAudioClock,
+                   let prevBuf = previousBuffer,
                    previousPTS.isValid,
                    currentPTS > previousPTS {
                     if let prevFrame = VTFrameProcessorFrame(buffer: prevBuf, presentationTimeStamp: previousPTS),
@@ -520,6 +580,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                ) {
                                 do {
                                     _ = try await processor.process(parameters: params)
+                                    CVBufferPropagateAttachments(currentBuffer, destBuf)
                                     enqueueDecodedFrame(pts: midSeconds, buffer: destBuf)
                                     localSuccessCount += 1
                                     localConsecutiveFailures = 0
@@ -565,7 +626,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                 let outputBuffer = scaleIfNeeded(currentBuffer, spatial2x: activeSpatial2x, transferSession: transferSession, pool: destPool)
                 enqueueDecodedFrame(pts: currentPTS.seconds, buffer: outputBuffer)
-                if !didStartAudioClock {
+                if !didStartAudioClock && queuedCount() >= 2 {
                     didStartAudioClock = true
                     Task { @MainActor [weak self] in
                         guard let self, self.isTokenValid(token), let audioPlayer = self.audioPlayer else { return }
@@ -577,6 +638,25 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
                 previousBuffer = currentBuffer
                 previousPTS = currentPTS
+            }
+
+            if reader.status == .failed && isTokenValid(token) {
+                let errDesc = reader.error?.localizedDescription ?? "读取中断"
+                logAsync("[ane][error] AVAssetReader 读取异常终止: \(errDesc)")
+                if !didStartAudioClock {
+                    Task { @MainActor [weak self] in
+                        self?.errorMessage = "光流解码异常：\(errDesc)"
+                    }
+                }
+            } else if !didStartAudioClock && isTokenValid(token) && queuedCount() > 0 {
+                didStartAudioClock = true
+                Task { @MainActor [weak self] in
+                    guard let self, self.isTokenValid(token), let audioPlayer = self.audioPlayer else { return }
+                    self.isPipelineReadyToPlay = true
+                    if !self.isPaused && audioPlayer.rate == 0 {
+                        audioPlayer.rate = self.playbackSpeed
+                    }
+                }
             }
         } catch {
             let desc = error.localizedDescription
@@ -599,6 +679,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         let now = audioPlayer.currentTime().seconds
         guard now.isFinite else { return }
+        updateLatestAudioTime(now)
 
         var droppedInTick = 0
         var frameToPresent: CVPixelBuffer?
@@ -618,10 +699,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if let buffer = frameToPresent,
            let sampleBuffer = makeSampleBuffer(from: buffer, ptsSeconds: now) {
             if layer.sampleBufferRenderer.status == .failed {
+                let reason = layer.sampleBufferRenderer.error?.localizedDescription ?? "unknown"
+                appendLog("[ane][renderer] 渲染器异常，执行 flush: \(reason)")
                 layer.sampleBufferRenderer.flush()
+                if let tb = displayTimebase {
+                    CMTimebaseSetTime(tb, time: .zero)
+                    CMTimebaseSetRate(tb, rate: 1.0)
+                }
             }
             if layer.sampleBufferRenderer.isReadyForMoreMediaData {
                 layer.sampleBufferRenderer.enqueue(sampleBuffer)
+                presentedFrameCount += 1
                 let nowMedia = CACurrentMediaTime()
                 presentedTimestamps.append(nowMedia)
                 presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
@@ -664,6 +752,19 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.lock()
         frameQueue.append((pts: pts, buffer: buffer))
         bufferLock.unlock()
+    }
+
+    private func updateLatestAudioTime(_ seconds: Double) {
+        audioClockLock.lock()
+        latestAudioTimeSeconds = seconds
+        audioClockLock.unlock()
+    }
+
+    private func readLatestAudioTime() -> Double {
+        audioClockLock.lock()
+        let val = latestAudioTimeSeconds
+        audioClockLock.unlock()
+        return val
     }
 
 #if !targetEnvironment(simulator)
@@ -712,11 +813,23 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     private func resolveSourcePixelFormat(from configuration: VTLowLatencyFrameInterpolationConfiguration) -> OSType {
         let raw = configuration.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String]
+        let preferredFormats: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_32BGRA
+        ]
         if let num = raw as? NSNumber {
             return num.uint32Value
         }
-        if let arr = raw as? [NSNumber], let first = arr.first {
-            return first.uint32Value
+        if let arr = raw as? [NSNumber] {
+            let supported = arr.map(\.uint32Value)
+            for candidate in preferredFormats where supported.contains(candidate) {
+                return candidate
+            }
+            if let first = arr.first {
+                return first.uint32Value
+            }
         }
         return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     }
@@ -779,7 +892,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             return sourceBuffer
         }
         let status = VTPixelTransferSessionTransferImage(transferSession, from: sourceBuffer, to: destBuffer)
-        return status == noErr ? destBuffer : sourceBuffer
+        if status == noErr {
+            CVBufferPropagateAttachments(sourceBuffer, destBuffer)
+            return destBuffer
+        }
+        return sourceBuffer
     }
 #endif
 
@@ -792,9 +909,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         )
         guard descStatus == noErr, let formatDesc else { return nil }
 
+        let resolvedPTS: CMTime
+        if let displayTimebase {
+            resolvedPTS = CMTimebaseGetTime(displayTimebase)
+        } else {
+            resolvedPTS = CMTime(seconds: ptsSeconds, preferredTimescale: 600)
+        }
+
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 120),
-            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 600),
+            presentationTimeStamp: resolvedPTS,
             decodeTimeStamp: .invalid
         )
         var sampleBuffer: CMSampleBuffer?

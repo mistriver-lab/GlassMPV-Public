@@ -14,6 +14,8 @@
 - **修复 MPV 120Hz 时域平滑与 ANE 光流真补帧不生效**：`MPVPlayerController` 启用 `interpolation-threshold=-1` 与 `tscale=linear`（解除整数倍刷新率如 24fps@120Hz 不插帧限制）；`OpticalFlowPlayerController` 修复 `destinationPixelBufferAttributes` 数组像素格式、自动降级 `spatialScaleFactor=2` 失败回退、按首帧实测分辨率重建会话、延迟音频时钟启动至首帧入队并补全完整诊断日志采集。
 - **新增 4K 片源自动禁用超分门控 (`SuperResolutionPolicy`)**：片源长边 ≥ 3840 或短边 ≥ 2160 时自动禁用 MPV GLSL 超分与 ANE 2× 空间超分，UI 控制台与 HUD 同步提示门控原因。
 - **新增默认横屏、返回主界面与 `.txt` 诊断日志导出 (`OrientationController` + `DiagnosticLogExporter`)**：进入播放页默认横屏并支持手动旋转切换；支持一键返回主界面并恢复竖屏；诊断中心支持导出包含自检报告、MPV 日志与 ANE 光流日志的 `.txt` 文件并调起系统分享表单。
+- **消除播放页顶部 Liquid Glass 粘黏并精简顶栏 (`LiquidGlassPlayerView`)**：移除导致邻近胶囊融合的 `GlassEffectContainer`，将双核切换改为一体化单胶囊分段控件；移除顶栏中与首页重复的打开文件/相册/串流按钮，保留返回、旋转、诊断与信息显隐 4 颗简洁按钮（10pt 间距）。
+- **根治 ANE 光流核黑屏失效并升级 MPV 时域平滑 (`VTOpticalFlowEngine` + `MPVPlayerCore`)**：为 `AVSampleBufferDisplayLayer` 绑定 `controlTimebase` 并对齐送显 PTS，修复切换引擎时 `load()` 与 `seek()` 竞态、规范源像素格式选择、检查 `AVAssetReader.startReading()`、传播 `CVBufferPropagateAttachments` 色彩附件并加入追帧跳过插帧保护；HUD 如实显示实测帧率；MPV 核升级 `tscale=mitchell` + `interpolation-preserve=yes`。
 
 ## [v1.1.0] - 2026-11-24
 
@@ -94,3 +96,9 @@
   3. **策略切换 6 连击重置 Bug**：`applyMutualExclusion(for:)` 修改多个 `@Published` 属性未抑制 `notifyRuntimeConfigChanged`，且 `SiderEnhancementView` 二次赋值子开关，导致每次切策略同一毫秒触发 5–6 次 `makeFrameCallbackConfiguration` 与 `EnhancementTelemetryCollector.reset`。
   4. **多帧 API 已核验**：`RifeStream.push(_ frame: CVPixelBuffer, timesteps: [Float]) throws -> [CVPixelBuffer]` 可直接支持多相位（首帧返回 `[]` 需走 anchor 段，空 `timesteps` 做 cache-rebase）。
   5. **当前代码状态**：`CinePlayer-repo` 工作区干净无未提交修改（HEAD `397db87`），已完成全量方案定稿。
+
+- [x] **修复 MPV 120Hz 时域平滑与 ANE 光流真补帧不生效**：`MPVPlayerCore.swift` 配置 `interpolation-threshold=-1` + `tscale=linear`（解除整数倍刷新率屏蔽插帧）；`VTOpticalFlowEngine.swift` 修复像素格式池数组键异常、`spatialScaleFactor=2` 失败回退、按实测解码尺寸重建会话、首帧入队后再启动音频时钟，并补全 ANE 诊断日志采集。
+
+- [x] **新增 4K 片源自动禁用超分门控 (`SuperResolutionPolicy`)**：`width/height` 达 `3840×2160` 及以上时自动屏蔽 MPV GLSL 超分与 ANE 2× 空间超分，UI 控制台、HUD 与自检报告同步透出原因。
+
+- [x] **新增默认横屏起播、手动旋转、返回主界面与 `.txt` 诊断日志导出 (`OrientationController` + `DiagnosticLogExporter` + `LiquidGlassPlayerView`)**：打开视频默认进横屏并支持工具栏旋转切换；支持一键返回主界面与错误横幅返回；诊断中心支持分享/导出完整 `.txt` 日志文件。
