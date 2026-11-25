@@ -250,7 +250,7 @@ final class GlassMPVTests: XCTestCase {
     func testNativeDocumentPickerConfigurationAndPhotoPermission() throws {
         let picker = NativeDocumentPickerPresenter.makePicker()
         XCTAssertFalse(picker.allowsMultipleSelection)
-        XCTAssertTrue(picker.shouldShowFileExtensions)
+        XCTAssertEqual(picker.modalPresentationStyle, .formSheet)
         XCTAssertTrue(NativeDocumentPickerPresenter.supportedContentTypes.contains(.movie))
         XCTAssertTrue(NativeDocumentPickerPresenter.supportedContentTypes.contains(.item))
 
