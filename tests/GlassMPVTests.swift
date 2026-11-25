@@ -313,12 +313,15 @@ final class GlassMPVTests: XCTestCase {
             fpsSummary: "24.0 → 120.0 fps",
             decoderSummary: "HEVC / 硬解 VT",
             is4KGated: false,
+            telemetrySummary: ["MPV Target Sync: 120 Hz", "ANE Clock: 合成单调时钟"],
             selfCheck: "self-check-ok",
             mpvLogs: ["[mpv] ready"],
             opticalLogs: ["[ane] idle"]
         )
         XCTAssertTrue(report.contains("GlassMPV v2026.11.25"))
         XCTAssertTrue(report.contains("4K Super-Res Gated: NO"))
+        XCTAssertTrue(report.contains("--- Interpolation Telemetry ---"))
+        XCTAssertTrue(report.contains("ANE Clock: 合成单调时钟"))
         XCTAssertTrue(report.contains("--- Self Check ---"))
         XCTAssertTrue(report.contains("self-check-ok"))
         XCTAssertTrue(report.contains("--- MPV Logs (1) ---"))
@@ -358,5 +361,106 @@ final class GlassMPVTests: XCTestCase {
         controller.returnToHomeOrientation()
         XCTAssertEqual(controller.supportedMask, .allButUpsideDown)
         XCTAssertFalse(controller.isLandscapeLocked)
+    }
+
+    func testOpticalFlowSyntheticClockTransitions() {
+        var clock = OpticalFlowSyntheticClock()
+        clock.reset(to: 1.5, now: 100.0)
+        XCTAssertFalse(clock.isRunning)
+        XCTAssertEqual(clock.currentTime(now: 105.0), 1.5, accuracy: 1e-6)
+
+        clock.start(rate: 1.0, now: 105.0)
+        XCTAssertTrue(clock.isRunning)
+        XCTAssertEqual(clock.currentTime(now: 107.0), 3.5, accuracy: 1e-6)
+
+        clock.setRate(2.0, now: 107.0)
+        XCTAssertTrue(clock.isRunning)
+        XCTAssertEqual(clock.currentTime(now: 108.5), 6.5, accuracy: 1e-6)
+
+        clock.pause(now: 108.5)
+        XCTAssertFalse(clock.isRunning)
+        XCTAssertEqual(clock.currentTime(now: 120.0), 6.5, accuracy: 1e-6)
+
+        clock.seek(to: 2.0, now: 120.0)
+        XCTAssertFalse(clock.isRunning)
+        XCTAssertEqual(clock.currentTime(now: 125.0), 2.0, accuracy: 1e-6)
+
+        clock.start(rate: 1.5, now: 125.0)
+        XCTAssertEqual(clock.currentTime(now: 127.0), 5.0, accuracy: 1e-6)
+    }
+
+    @MainActor
+    func testOpticalFlowPendingFirstFrameDeliveredOnAttach() throws {
+        var pixelBufferOpt: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            64,
+            64,
+            kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &pixelBufferOpt
+        )
+        XCTAssertEqual(status, kCVReturnSuccess)
+        let pixelBuffer = try XCTUnwrap(pixelBufferOpt)
+
+        let controller = OpticalFlowPlayerController()
+        controller.isLoadingPipeline = true
+        controller.cachePendingFirstFrame(pixelBuffer, ptsSeconds: 0.25)
+
+        let container = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        controller.attach(to: container)
+
+        XCTAssertNotNil(container.displayLayer.controlTimebase)
+        XCTAssertEqual(controller.presentedFrameCount, 1)
+        XCTAssertFalse(controller.isLoadingPipeline)
+    }
+
+    @MainActor
+    func testSampleBufferDisplayContainerRotationLayout() {
+        let container = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        XCTAssertTrue(container.displayLayer.superlayer === container.layer)
+        XCTAssertEqual(container.displayLayer.bounds.size.width, 400, accuracy: 0.5)
+        XCTAssertEqual(container.displayLayer.bounds.size.height, 200, accuracy: 0.5)
+
+        let quarterTurn = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)
+        XCTAssertTrue(SampleBufferDisplayContainerView.isQuarterTurnTransform(quarterTurn))
+        container.applyVideoTransform(quarterTurn)
+
+        XCTAssertEqual(container.displayLayer.bounds.size.width, 200, accuracy: 0.5)
+        XCTAssertEqual(container.displayLayer.bounds.size.height, 400, accuracy: 0.5)
+        XCTAssertEqual(container.displayLayer.position.x, 200, accuracy: 0.5)
+        XCTAssertEqual(container.displayLayer.position.y, 100, accuracy: 0.5)
+        let applied = container.displayLayer.affineTransform()
+        XCTAssertEqual(applied.tx, 0, accuracy: 1e-4)
+        XCTAssertEqual(applied.ty, 0, accuracy: 1e-4)
+        XCTAssertEqual(applied.b, 1, accuracy: 1e-4)
+
+        XCTAssertTrue(OpticalFlowPlayerController.isValidInterpolationDelta(1.0 / 24.0))
+        XCTAssertFalse(OpticalFlowPlayerController.isValidInterpolationDelta(0.001))
+        XCTAssertFalse(OpticalFlowPlayerController.isValidInterpolationDelta(1.5))
+    }
+
+    @MainActor
+    func testMPVProMotionKeeperAndHonestDisplaySyncFPS() {
+        let keeper = ProMotionDisplayLinkKeeper()
+        defer { keeper.stop() }
+        for i in 0..<6 {
+            _ = keeper.recordSample(timestamp: 10.0 + Double(i) / 120.0)
+        }
+        XCTAssertEqual(keeper.measuredRefreshHz, 120.0, accuracy: 0.5)
+
+        let controller = MPVPlayerController()
+        defer { controller.shutdown() }
+
+        controller.applyInterpolation(.mpvSmooth120Hz)
+        XCTAssertGreaterThanOrEqual(controller.targetDisplaySyncFPS, 60)
+        XCTAssertEqual(controller.displaySyncFPS, 0, "未从 libmpv 采集到真实显示刷新率前不应伪造 displaySyncFPS")
+        XCTAssertFalse(controller.isProMotionKeeperActive, "暂停状态不应启动 ProMotion 保活链路")
+
+        controller.refreshDiagnosticsSnapshot()
+        XCTAssertEqual(controller.displaySyncFPS, 0)
+
+        controller.applyInterpolation(.off)
+        XCTAssertEqual(controller.targetDisplaySyncFPS, 0)
     }
 }

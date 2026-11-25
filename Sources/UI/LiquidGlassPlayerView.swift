@@ -63,6 +63,9 @@ final class PlayerCoordinator: ObservableObject {
     var hudMetrics: PlaybackHUDMetrics {
         let thermal = ThermalLevel(state: thermalState)
         if engineMode == .mpv {
+            let honestDisplayFPS = mpvController.displaySyncFPS > 0
+                ? mpvController.displaySyncFPS
+                : mpvController.measuredProMotionFPS
             return PlaybackHUDMetrics(
                 engineBadge: "MPV",
                 interpolationBadge: interpolationMode.shortBadge,
@@ -71,7 +74,7 @@ final class PlayerCoordinator: ObservableObject {
                 height: mpvController.videoHeight,
                 sourceFPS: mpvController.sourceFPS,
                 outputFPS: mpvController.outputFPS,
-                displayFPS: mpvController.displaySyncFPS,
+                displayFPS: honestDisplayFPS,
                 bitDepth: mpvController.bitDepthLabel,
                 hdrTag: mpvController.hdrLabel,
                 isHDRActive: mpvController.isHDRActive,
@@ -254,11 +257,18 @@ final class PlayerCoordinator: ObservableObject {
             }
         }()
 
+        let mpvDisplayText = mpvController.displaySyncFPS > 0
+            ? String(format: "%.1fHz", mpvController.displaySyncFPS)
+            : "未上报"
+        let proMotionText = mpvController.isProMotionKeeperActive
+            ? "保活中(\(String(format: "%.1f", mpvController.measuredProMotionFPS))Hz)"
+            : "未保活"
+
         let mpvStatus = mpvController.isInitialized
-            ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | display=\(String(format: "%.0f", mpvController.displaySyncFPS))Hz | passes=\(mpvController.freshRenderPassCount) | err=\(mpvController.lastErrorMessage ?? "none")"
+            ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | targetSync=\(String(format: "%.0f", mpvController.targetDisplaySyncFPS))Hz | mpvDisplay=\(mpvDisplayText) | proMotion=\(proMotionText) | pass(fresh/redraw)=\(mpvController.freshRenderPassCount)/\(mpvController.redrawRenderPassCount) | mistimed=\(mpvController.mistimedFrames) | delayed=\(mpvController.delayedFrames) | err=\(mpvController.lastErrorMessage ?? "none")"
             : "未初始化"
 
-        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 成功补帧=\(opticalFlowController.interpolatedFrameCount) | 失败=\(opticalFlowController.failedInterpolationCount) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
+        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
 
         let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许超分"
         let lines = [
@@ -461,6 +471,12 @@ struct LiquidGlassPlayerView: View {
                    mpv.videoWidth == 0,
                    !mpv.playbackState.isEmpty {
                     loadingStatusPill(mpv.playbackState)
+                } else if coordinator.engineMode == .opticalFlow,
+                          optical.errorMessage == nil,
+                          (optical.isLoadingPipeline || optical.presentedFrameCount == 0) {
+                    loadingStatusPill(
+                        optical.pipelineStatusText.isEmpty ? "正在预热 ANE 光流缓冲..." : optical.pipelineStatusText
+                    )
                 }
 
                 if showStatsHUD {
@@ -1300,25 +1316,46 @@ struct DiagnosticLogSheet: View {
                 }
 
                 Section("内核与播放状态") {
+                    let activeW = coordinator.activeVideoWidth
+                    let activeH = coordinator.activeVideoHeight
+                    let activeSrcFPS = coordinator.engineMode == .mpv ? mpv.sourceFPS : optical.sourceFPS
+                    let activeOutFPS = coordinator.engineMode == .mpv ? mpv.outputFPS : optical.actualOutputFPS
+                    let activeCodec = coordinator.engineMode == .mpv ? mpv.videoCodec : optical.videoCodec
+                    let activeBitDepth = coordinator.engineMode == .mpv ? mpv.bitDepthLabel : optical.bitDepthLabel
+                    let activeHDR = coordinator.engineMode == .mpv ? mpv.hdrLabel : optical.hdrLabel
+                    let activeState = coordinator.engineMode == .mpv ? mpv.playbackState : (optical.isPaused ? "已暂停" : "播放中")
+
                     LabeledContent("当前引擎", value: coordinator.engineMode.rawValue)
                     LabeledContent("初始化状态", value: mpv.isInitialized ? "已就绪" : "未初始化")
-                    LabeledContent("运行阶段", value: mpv.playbackState)
-                    LabeledContent("视频分辨率", value: mpv.videoWidth > 0 ? "\(mpv.videoWidth)×\(mpv.videoHeight)" : "暂无")
-                    LabeledContent("色深 / HDR", value: "\(mpv.bitDepthLabel) · \(mpv.hdrLabel)")
-                    LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", mpv.sourceFPS)) / \(String(format: "%.1f", mpv.outputFPS)) fps")
+                    LabeledContent("运行阶段", value: activeState)
+                    LabeledContent("视频分辨率", value: activeW > 0 ? "\(activeW)×\(activeH)" : "暂无")
+                    LabeledContent("色深 / HDR", value: "\(activeBitDepth) · \(activeHDR)")
+                    LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", activeSrcFPS)) / \(String(format: "%.1f", activeOutFPS)) fps")
                     LabeledContent("设备温度状态", value: ThermalLevel(state: coordinator.thermalState).rawValue)
                     LabeledContent("启用着色器数", value: "\(mpv.activeShaderCount)")
                     LabeledContent(
                         "解码器 / 硬解",
-                        value: "\(mpv.videoCodec.isEmpty ? "-" : mpv.videoCodec) / \(mpv.hardwareDecoder.isEmpty ? "-" : mpv.hardwareDecoder)"
+                        value: "\(activeCodec.isEmpty ? "-" : activeCodec) / \(coordinator.engineMode == .mpv ? (mpv.hardwareDecoder.isEmpty ? "-" : mpv.hardwareDecoder) : "VT+ANE (\(optical.clockSourceLabel))")"
                     )
                     LabeledContent(
-                        "显示同步 / 渲染 Pass",
-                        value: "\(String(format: "%.0f", mpv.displaySyncFPS)) Hz / \(mpv.freshRenderPassCount)"
+                        "MPV 目标 / 实报同步",
+                        value: "\(mpv.targetDisplaySyncFPS > 0 ? String(format: "%.0f Hz", mpv.targetDisplaySyncFPS) : "关闭") / \(mpv.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpv.displaySyncFPS) : "未上报")"
+                    )
+                    LabeledContent(
+                        "ProMotion 保活 / 实测",
+                        value: "\(mpv.isProMotionKeeperActive ? "开启" : "关闭") / \(mpv.measuredProMotionFPS > 0 ? String(format: "%.1f Hz", mpv.measuredProMotionFPS) : "--")"
+                    )
+                    LabeledContent(
+                        "渲染 Pass (新帧 / 重绘)",
+                        value: "\(mpv.freshRenderPassCount) / \(mpv.redrawRenderPassCount)"
+                    )
+                    LabeledContent(
+                        "时序失步 / 延迟帧",
+                        value: "\(mpv.mistimedFrames) / \(mpv.delayedFrames)"
                     )
                     LabeledContent(
                         "ANE 光流状态",
-                        value: "\(optical.capabilityDescription) (补帧 \(optical.interpolatedFrameCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount))"
+                        value: "\(optical.capabilityDescription) (时钟 \(optical.clockSourceLabel) · 补帧 \(optical.interpolatedFrameCount) / 追赶跳过 \(optical.skippedInterpolationCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount) / 耗时 \(String(format: "%.1f", optical.averageInterpolationMs))ms)"
                     )
                     if let currentURL = coordinator.currentURL {
                         LabeledContent("当前片源", value: currentURL.lastPathComponent)
@@ -1437,6 +1474,14 @@ struct DiagnosticLogSheet: View {
         let stateText = coordinator.engineMode == .mpv
             ? mpv.playbackState
             : (optical.isPaused ? "已暂停" : "播放中")
+        let telemetrySummary = [
+            "MPV Target Sync: \(mpv.targetDisplaySyncFPS > 0 ? String(format: "%.0f Hz", mpv.targetDisplaySyncFPS) : "OFF")",
+            "MPV Reported Display Sync: \(mpv.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpv.displaySyncFPS) : "unreported")",
+            "ProMotion Keeper: \(mpv.isProMotionKeeperActive ? "active" : "inactive") (\(mpv.measuredProMotionFPS > 0 ? String(format: "%.1f Hz", mpv.measuredProMotionFPS) : "--"))",
+            "MPV Passes (fresh/redraw): \(mpv.freshRenderPassCount) / \(mpv.redrawRenderPassCount) | mistimed=\(mpv.mistimedFrames) | delayed=\(mpv.delayedFrames)",
+            "ANE Clock: \(optical.clockSourceLabel) | spatial2x=\(optical.enableSpatial2xUpscale ? "ON" : "OFF")",
+            "ANE Counters: interpolated=\(optical.interpolatedFrameCount) | skipped=\(optical.skippedInterpolationCount) | failed=\(optical.failedInterpolationCount) | presented=\(optical.presentedFrameCount) | avgMs=\(String(format: "%.1f", optical.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", optical.actualOutputFPS))"
+        ]
         return DiagnosticLogExporter.buildReport(
             version: AppReleaseInfo.displayVersion,
             engineName: coordinator.engineMode.rawValue,
@@ -1445,6 +1490,7 @@ struct DiagnosticLogSheet: View {
             fpsSummary: metrics.fpsSummary,
             decoderSummary: "\(metrics.codec) / \(metrics.decoderBadge)",
             is4KGated: coordinator.isSuperResolutionDisabledBy4K,
+            telemetrySummary: telemetrySummary,
             selfCheck: coordinator.selfCheckReport,
             mpvLogs: mpv.diagnosticLogs,
             opticalLogs: optical.diagnosticLogs

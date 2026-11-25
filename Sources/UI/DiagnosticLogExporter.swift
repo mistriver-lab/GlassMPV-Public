@@ -11,6 +11,7 @@ enum DiagnosticLogExporter: Sendable {
         fpsSummary: String,
         decoderSummary: String,
         is4KGated: Bool,
+        telemetrySummary: [String] = [],
         selfCheck: String,
         mpvLogs: [String],
         opticalLogs: [String]
@@ -23,13 +24,20 @@ enum DiagnosticLogExporter: Sendable {
             "Resolution: \(resolution)",
             "FPS: \(fpsSummary)",
             "Decoder: \(decoderSummary)",
-            "4K Super-Res Gated: \(is4KGated ? "YES" : "NO")",
+            "4K Super-Res Gated: \(is4KGated ? "YES" : "NO")"
+        ]
+        if !telemetrySummary.isEmpty {
+            sections.append("")
+            sections.append("--- Interpolation Telemetry ---")
+            sections.append(contentsOf: telemetrySummary)
+        }
+        sections.append(contentsOf: [
             "",
             "--- Self Check ---",
             selfCheck.isEmpty ? "(none)" : selfCheck,
             "",
             "--- MPV Logs (\(mpvLogs.count)) ---"
-        ]
+        ])
         if mpvLogs.isEmpty {
             sections.append("(no mpv logs)")
         } else {

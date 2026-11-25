@@ -215,6 +215,12 @@ def test_swift_sources_non_empty_and_balanced():
     assert 'joined(separator: ":")' in mpv_core
     assert 'joined(separator: ";")' not in mpv_core
     assert "DispatchQueue.main.sync" not in mpv_core
+    assert "ProMotionDisplayLinkKeeper" in mpv_core
+    assert "targetDisplaySyncFPS" in mpv_core
+    assert "measuredProMotionFPS" in mpv_core
+    assert "redrawRenderPassCount" in mpv_core
+    assert "mistimedFrames" in mpv_core
+    assert "delayedFrames" in mpv_core
 
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "kCMSampleAttachmentKey_DisplayImmediately" in vt_engine
@@ -223,6 +229,13 @@ def test_swift_sources_non_empty_and_balanced():
     assert "diagnosticLogs" in vt_engine
     assert "SuperResolutionPolicy" in vt_engine
     assert "#if targetEnvironment(simulator)" in vt_engine
+    assert "OpticalFlowSyntheticClock" in vt_engine
+    assert "requiresFlushToResumeDecoding" in vt_engine
+    assert "preferredTransform" in vt_engine
+    assert "pendingFirstFrame" in vt_engine
+    assert "averageInterpolationMs" in vt_engine
+    assert "layer.addSublayer(displayLayer)" in vt_engine
+    assert "override class var layerClass" not in vt_engine
 
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "import PhotosUI" in player_view

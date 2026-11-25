@@ -2,8 +2,112 @@ import AVFoundation
 import Combine
 import Foundation
 import MPVUI
+import QuartzCore
 import SwiftUI
 import UIKit
+
+/// 播放阶段 ProMotion 120Hz 刷新率保活与实际刷新率采样器
+@MainActor
+final class ProMotionDisplayLinkKeeper {
+    private final class DisplayLinkBox: @unchecked Sendable {
+        let link: CADisplayLink
+        init(_ link: CADisplayLink) { self.link = link }
+    }
+
+    private final class DisplayLinkHolder: @unchecked Sendable {
+        var link: CADisplayLink?
+        deinit {
+            if let link {
+                let box = DisplayLinkBox(link)
+                if Thread.isMainThread {
+                    box.link.invalidate()
+                } else {
+                    DispatchQueue.main.async {
+                        box.link.invalidate()
+                    }
+                }
+            }
+        }
+    }
+
+    private final class DisplayLinkProxy: NSObject {
+        weak var owner: ProMotionDisplayLinkKeeper?
+
+        @MainActor
+        @objc func handleTick(_ link: CADisplayLink) {
+            owner?.handleDisplayLinkTick(link)
+        }
+    }
+
+    private(set) var isActive: Bool = false
+    private(set) var measuredRefreshHz: Double = 0
+    var onMeasuredRefreshUpdate: ((Double) -> Void)?
+
+    private let linkHolder = DisplayLinkHolder()
+    private var proxy: DisplayLinkProxy?
+    private var lastSampleTimestamp: CFTimeInterval?
+    private var recentDeltas: [CFTimeInterval] = []
+    private var lastPublishTimestamp: CFTimeInterval = 0
+
+    func start(preferredMaxFPS: Int = 120) {
+        let clampedMax = Float(max(60, preferredMaxFPS))
+        let minRate: Float = clampedMax >= 120 ? 80 : 60
+        let range = CAFrameRateRange(minimum: minRate, maximum: clampedMax, preferred: clampedMax)
+
+        if let existing = linkHolder.link {
+            existing.preferredFrameRateRange = range
+            isActive = true
+            return
+        }
+
+        let proxy = DisplayLinkProxy()
+        proxy.owner = self
+        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.handleTick(_:)))
+        link.preferredFrameRateRange = range
+        link.add(to: .main, forMode: .common)
+        self.proxy = proxy
+        self.linkHolder.link = link
+        self.isActive = true
+    }
+
+    func stop() {
+        linkHolder.link?.invalidate()
+        linkHolder.link = nil
+        proxy = nil
+        lastSampleTimestamp = nil
+        recentDeltas.removeAll()
+        lastPublishTimestamp = 0
+        isActive = false
+        measuredRefreshHz = 0
+    }
+
+    @discardableResult
+    func recordSample(timestamp: CFTimeInterval) -> Double? {
+        defer { lastSampleTimestamp = timestamp }
+        guard let previous = lastSampleTimestamp else { return nil }
+        let delta = timestamp - previous
+        guard delta > 0.002 && delta < 0.25 else { return nil }
+
+        recentDeltas.append(delta)
+        if recentDeltas.count > 30 {
+            recentDeltas.removeFirst(recentDeltas.count - 30)
+        }
+        guard recentDeltas.count >= 4 else { return nil }
+        let avgDelta = recentDeltas.reduce(0, +) / Double(recentDeltas.count)
+        guard avgDelta > 0 else { return nil }
+        let hz = 1.0 / avgDelta
+        measuredRefreshHz = hz
+        return hz
+    }
+
+    private func handleDisplayLinkTick(_ link: CADisplayLink) {
+        let now = link.timestamp
+        if let hz = recordSample(timestamp: now), now - lastPublishTimestamp >= 0.25 {
+            lastPublishTimestamp = now
+            onMeasuredRefreshUpdate?(hz)
+        }
+    }
+}
 
 private final class MPVTaskBag: @unchecked Sendable {
     private let lock = NSLock()
@@ -47,6 +151,9 @@ final class MPVPlayerController: ObservableObject {
     @Published var sourceFPS: Double = 0
     @Published var outputFPS: Double = 0
     @Published var displaySyncFPS: Double = 0
+    @Published var targetDisplaySyncFPS: Double = 0
+    @Published var measuredProMotionFPS: Double = 0
+    @Published var isProMotionKeeperActive: Bool = false
     @Published var videoWidth: Int = 0
     @Published var videoHeight: Int = 0
     @Published var videoCodec: String = ""
@@ -56,7 +163,10 @@ final class MPVPlayerController: ObservableObject {
     @Published var hdrLabel: String = "SDR"
     @Published var isHDRActive: Bool = false
     @Published var droppedFrames: Int64 = 0
+    @Published var mistimedFrames: Int64 = 0
+    @Published var delayedFrames: Int64 = 0
     @Published var freshRenderPassCount: Int = 0
+    @Published var redrawRenderPassCount: Int = 0
     @Published var activeShaderCount: Int = 0
     @Published var isSuperResolutionGatedBy4K: Bool = false
     @Published var statusMessage: String = ""
@@ -74,6 +184,7 @@ final class MPVPlayerController: ObservableObject {
     }()
 
     private let taskBag = MPVTaskBag()
+    private let proMotionKeeper = ProMotionDisplayLinkKeeper()
     private var currentPreset: ShaderPreset = .off
     private var currentExtras: Set<String> = []
     private var currentInterpolation: InterpolationMode = .off
@@ -86,6 +197,10 @@ final class MPVPlayerController: ObservableObject {
         self.player.setDiagnosticsEnabled(true)
         self.player.logHandler = { [weak self] logMsg in
             self?.appendLog("[\(logMsg.level.rawValue)][\(logMsg.prefix)] \(logMsg.message)")
+        }
+
+        self.proMotionKeeper.onMeasuredRefreshUpdate = { [weak self] hz in
+            self?.measuredProMotionFPS = hz
         }
 
         self.isInitialized = true
@@ -108,6 +223,8 @@ final class MPVPlayerController: ObservableObject {
         sourceFPS = 0
         outputFPS = 0
         displaySyncFPS = 0
+        targetDisplaySyncFPS = 0
+        measuredProMotionFPS = 0
         videoWidth = 0
         videoHeight = 0
         videoCodec = ""
@@ -117,7 +234,10 @@ final class MPVPlayerController: ObservableObject {
         hdrLabel = "SDR"
         isHDRActive = false
         droppedFrames = 0
+        mistimedFrames = 0
+        delayedFrames = 0
         freshRenderPassCount = 0
+        redrawRenderPassCount = 0
         isSuperResolutionGatedBy4K = false
         last4KGateLoggedSize = nil
         lastAppliedReadyGeneration = nil
@@ -137,6 +257,8 @@ final class MPVPlayerController: ObservableObject {
 
     func pause() {
         player.pause()
+        isPaused = true
+        syncProMotionKeeper()
     }
 
     func seek(to seconds: Double) {
@@ -200,7 +322,8 @@ final class MPVPlayerController: ObservableObject {
             player.setProperty("interpolation-preserve", to: "yes")
             player.setProperty("tscale", to: "mitchell")
             player.setProperty("display-fps-override", to: "\(targetDisplayFPS)")
-            displaySyncFPS = Double(targetDisplayFPS)
+            targetDisplaySyncFPS = Double(targetDisplayFPS)
+            syncProMotionKeeper()
             appendLog("[interp] 开启 \(targetDisplayFPS)Hz 时域平滑 (display-resample + interpolation-threshold=-1 + interpolation-preserve=yes + tscale=mitchell + display-fps-override=\(targetDisplayFPS))")
         case .off, .vtOpticalFlow2x:
             player.setProperty("interpolation", to: "no")
@@ -208,7 +331,9 @@ final class MPVPlayerController: ObservableObject {
             player.setProperty("interpolation-threshold", to: "0.01")
             player.setProperty("video-sync", to: "audio")
             player.setProperty("display-fps-override", to: "0")
+            targetDisplaySyncFPS = 0
             displaySyncFPS = 0
+            syncProMotionKeeper()
             appendLog("[interp] 关闭时域插值 (video-sync=audio)")
         }
     }
@@ -253,14 +378,14 @@ final class MPVPlayerController: ObservableObject {
 
         if let dispFPS = diag.estimatedDisplayFramesPerSecond ?? diag.nominalDisplayFramesPerSecond, dispFPS > 0 {
             displaySyncFPS = dispFPS
-        } else if currentInterpolation == .mpvSmooth120Hz {
-            let screenMaxFPS = UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .first?.screen.maximumFramesPerSecond ?? 120
-            displaySyncFPS = Double(max(screenMaxFPS, 60))
+        } else {
+            displaySyncFPS = 0
         }
         freshRenderPassCount = diag.freshRenderPasses?.count ?? 0
+        redrawRenderPassCount = diag.redrawRenderPasses?.count ?? 0
         droppedFrames = (diag.decoderDroppedFrames ?? 0) + (diag.outputDroppedFrames ?? 0)
+        mistimedFrames = diag.mistimedFrames ?? 0
+        delayedFrames = diag.delayedFrames ?? 0
 
         if let codec = diag.decoder.codec ?? info.videoCodec, !codec.isEmpty {
             videoCodec = codec
@@ -291,11 +416,14 @@ final class MPVPlayerController: ObservableObject {
     func stopPlayback() {
         player.stop()
         isPaused = true
+        syncProMotionKeeper()
         currentTime = 0
         duration = 0
         sourceFPS = 0
         outputFPS = 0
         displaySyncFPS = 0
+        targetDisplaySyncFPS = 0
+        measuredProMotionFPS = 0
         videoWidth = 0
         videoHeight = 0
         videoCodec = ""
@@ -305,7 +433,10 @@ final class MPVPlayerController: ObservableObject {
         hdrLabel = "SDR"
         isHDRActive = false
         droppedFrames = 0
+        mistimedFrames = 0
+        delayedFrames = 0
         freshRenderPassCount = 0
+        redrawRenderPassCount = 0
         activeShaderCount = 0
         isSuperResolutionGatedBy4K = false
         last4KGateLoggedSize = nil
@@ -318,9 +449,23 @@ final class MPVPlayerController: ObservableObject {
 
     func shutdown() {
         player.stop()
+        isPaused = true
         isInitialized = false
+        syncProMotionKeeper()
         playbackState = "已停止"
         appendLog("[lifecycle] 播放器已停止")
+    }
+
+    private func syncProMotionKeeper() {
+        let shouldRun = isInitialized && currentInterpolation == .mpvSmooth120Hz && !isPaused
+        if shouldRun {
+            let maxFPS = targetDisplaySyncFPS > 0 ? Int(targetDisplaySyncFPS) : 120
+            proMotionKeeper.start(preferredMaxFPS: maxFPS)
+        } else {
+            proMotionKeeper.stop()
+            measuredProMotionFPS = 0
+        }
+        isProMotionKeeperActive = proMotionKeeper.isActive
     }
 
     // MARK: - Private Stream Observation
@@ -362,12 +507,15 @@ final class MPVPlayerController: ObservableObject {
             }
             applyMediaInfo(snapshot.mediaInformation)
             applyState(snapshot.state, generation: event.generation)
+            syncProMotionKeeper()
 
         case .stateChanged(let state):
             applyState(state, generation: event.generation)
+            syncProMotionKeeper()
 
         case .pauseChanged(let paused):
             isPaused = paused
+            syncProMotionKeeper()
 
         case .readinessChanged(let ready):
             if ready {
@@ -402,9 +550,11 @@ final class MPVPlayerController: ObservableObject {
             playbackState = "已加载，开始解码..."
             reapplyActivePipelineIfNeeded(for: generation)
         case .playing:
+            isPaused = false
             playbackState = "播放中"
             reapplyActivePipelineIfNeeded(for: generation)
         case .paused:
+            isPaused = true
             playbackState = "已暂停"
         case .buffering:
             playbackState = "缓冲中..."
