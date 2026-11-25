@@ -4,6 +4,7 @@ import CoreVideo
 import Foundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import XCTest
 @testable import GlassMPV
 
@@ -243,5 +244,18 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(metrics.videoStreamSummary, "HEVC · 1920×1080 · 10-bit HDR10")
         XCTAssertEqual(metrics.fpsSummary, "23.98 → 24.0 fps · 120Hz")
         XCTAssertEqual(metrics.pipelineSummary, "硬解 VT · 原帧率 · 2着色器")
+    }
+
+    @MainActor
+    func testNativeDocumentPickerConfigurationAndPhotoPermission() throws {
+        let picker = NativeDocumentPickerPresenter.makePicker()
+        XCTAssertFalse(picker.allowsMultipleSelection)
+        XCTAssertTrue(picker.shouldShowFileExtensions)
+        XCTAssertTrue(NativeDocumentPickerPresenter.supportedContentTypes.contains(.movie))
+        XCTAssertTrue(NativeDocumentPickerPresenter.supportedContentTypes.contains(.item))
+
+        let photoUsage = Bundle.main.object(forInfoDictionaryKey: "NSPhotoLibraryUsageDescription") as? String
+        XCTAssertNotNil(photoUsage)
+        XCTAssertFalse((photoUsage ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 }

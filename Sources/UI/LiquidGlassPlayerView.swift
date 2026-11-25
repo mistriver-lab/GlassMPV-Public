@@ -93,6 +93,22 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
+    func presentLocalVideoPicker() {
+        mpvController.clearError()
+        mpvController.appendLog("[file] 正在拉起系统原生文件选择器 (UIDocumentPickerViewController, asCopy=true)...")
+        NativeDocumentPickerPresenter.shared.present(
+            onPick: { [weak self] url in
+                self?.open(url: url, isSecurityScoped: false)
+            },
+            onCancel: { [weak self] in
+                self?.mpvController.appendLog("[file] 用户取消了本地文件选择")
+            },
+            onError: { [weak self] message in
+                self?.mpvController.recordExternalError("无法打开本地文件选择器：\(message)")
+            }
+        )
+    }
+
     func open(url: URL, isSecurityScoped: Bool = false) {
         mpvController.clearError()
 
@@ -364,7 +380,6 @@ struct LiquidGlassPlayerView: View {
 
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = true
-    @State private var showFileImporter: Bool = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
@@ -444,20 +459,6 @@ struct LiquidGlassPlayerView: View {
                 opticalFlowErrorBanner(error)
             }
         }
-        .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                if let first = urls.first {
-                    coordinator.open(url: first, isSecurityScoped: true)
-                }
-            case .failure(let error):
-                coordinator.mpvController.recordExternalError("文件选择器返回错误：\(error.localizedDescription)")
-            }
-        }
         .onChange(of: selectedPhotoItem) { _, newItem in
             guard let newItem else { return }
             selectedPhotoItem = nil
@@ -513,14 +514,16 @@ struct LiquidGlassPlayerView: View {
 
                 HStack(spacing: 12) {
                     Button {
-                        showFileImporter = true
+                        coordinator.presentLocalVideoPicker()
                     } label: {
                         Label("打开本地视频", systemImage: "folder.badge.plus")
                             .font(.headline)
                             .padding(.horizontal, 18)
                             .padding(.vertical, 13)
+                            .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                    .contentShape(Capsule())
                     .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
 
                     PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
@@ -738,13 +741,15 @@ struct LiquidGlassPlayerView: View {
     private var toolbarActionButtons: some View {
         HStack(spacing: 8) {
             Button {
-                showFileImporter = true
+                coordinator.presentLocalVideoPicker()
             } label: {
                 Image(systemName: "folder")
                     .font(.body.weight(.semibold))
                     .frame(width: 38, height: 38)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
+            .contentShape(Circle())
             .glassEffect(.regular.interactive(), in: .circle)
 
             PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {

@@ -5,6 +5,7 @@
 ## [v2026.11.25] - 2026-11-25
 
 ### 变更与修复 (Changed & Fixed)
+- **修复 iOS 26 本地视频选择器点击无反应 (`NativeDocumentPickerPresenter` + `LocalMediaImporter` + `Info.plist`)**：移除在 Liquid Glass 与多层弹窗下偶发失效的 SwiftUI `.fileImporter`，改用原生 `UIDocumentPickerViewController(asCopy: true)` 并扩展 `.contentShape` 点击热区；补齐 `NSPhotoLibraryUsageDescription` 相册权限描述，同时收敛 `LocalMediaImporter` 缓存命中路径确保 Inbox 临时副本必经文件名净化拷贝至沙盒目录。
 - **新增 MPV 风格常驻关键信息 HUD (`PlaybackTelemetry` + `LiquidGlassPlayerView`)**：在未开启补帧（原帧率）状态下亦可实时显示视频编码、分辨率、原帧率/实时输出帧率（补齐 `estimatedDecodedFramesPerSecond` 与 `AVSampleBufferDisplayLayer` 实测帧率采样）、色深/HDR（10-bit / HDR10 / HLG）、硬解/软解状态、丢帧计数与设备实时温度（`ProcessInfo.ThermalState`），精简布局且不受主控制栏自动隐藏影响，支持顶部 `info.circle` 按钮或右上角参数徽章一键显隐。
 - **沉淀桌面端插帧深度剖析与 iOS 端稳定架构调研 (`docs/INTERPOLATION_ARCHITECTURE_RESEARCH.md`)**：完整拆解 `mpvnet-20231122.zip`（`mpv.conf` / `profiles.conf` / `k7sfunc.py` + `MVTools`/`SVPFlow`/`RIFE` 四套 VapourSynth `.vpy` 管线），横向对比 `MPVUI`、`VideoToolbox VTFrameProcessor`、`CoreML RIFE` 与 `MetalFX`，确立「MPV 时域平滑全格式主轨 + VideoToolbox ANE 硬件光流真补帧轨 + `k7sfunc` 护栏移植」的 iOS 端稳定落地架构。
 - **全面切换日期时间版本号体系 (CalVer)**：工作流与构建规则统一采用东八区 `YYYY.MM.DD` 作为 `MARKETING_VERSION`、`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION`，IPA 产物命名为 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。

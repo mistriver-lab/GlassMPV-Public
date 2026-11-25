@@ -95,6 +95,8 @@ def test_info_plist_valid_and_120hz_enabled():
     assert plist["UIFileSharingEnabled"] is True
     assert plist["LSSupportsOpeningDocumentsInPlace"] is True
     assert plist["CFBundleDisplayName"] == "GlassMPV"
+    photo_desc = plist.get("NSPhotoLibraryUsageDescription")
+    assert isinstance(photo_desc, str) and photo_desc.strip(), "Missing NSPhotoLibraryUsageDescription"
 
 
 def _strip_comments_and_strings(source: str) -> str:
@@ -221,9 +223,17 @@ def test_swift_sources_non_empty_and_balanced():
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "import PhotosUI" in player_view
     assert "PhotosPicker" in player_view
+    assert ".fileImporter(" not in player_view
+    assert "presentLocalVideoPicker()" in player_view
     assert "runRealDeviceSelfCheck()" in player_view
     assert "compactStatsHUD" in player_view
     assert "showStatsHUD" in player_view
+
+    doc_picker = ROOT / "Sources" / "UI" / "NativeDocumentPickerPresenter.swift"
+    assert doc_picker.is_file(), f"Missing {doc_picker}"
+    doc_picker_src = doc_picker.read_text(encoding="utf-8")
+    assert "UIDocumentPickerViewController" in doc_picker_src
+    assert "asCopy: true" in doc_picker_src
 
     telemetry_path = ROOT / "Sources" / "Models" / "PlaybackTelemetry.swift"
     assert telemetry_path.is_file(), f"Missing {telemetry_path}"

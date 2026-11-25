@@ -38,9 +38,9 @@ enum LocalMediaImporter: Sendable {
         }
 
         return try await Task.detached(priority: .userInitiated) {
-            let tempRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+            let importsRoot = importsDirectory.standardizedFileURL.path
             let sourcePath = sourceURL.standardizedFileURL.path
-            if sourcePath.hasPrefix(tempRoot), FileManager.default.isReadableFile(atPath: sourcePath) {
+            if sourcePath.hasPrefix(importsRoot), FileManager.default.isReadableFile(atPath: sourcePath) {
                 return sourceURL
             }
 
