@@ -236,6 +236,14 @@ def test_swift_sources_non_empty_and_balanced():
     assert "averageInterpolationMs" in vt_engine
     assert "layer.addSublayer(displayLayer)" in vt_engine
     assert "override class var layerClass" not in vt_engine
+    assert "nonisolated static func isQuarterTurnTransform" in vt_engine
+    assert "nonisolated static func normalizedRotationTransform" in vt_engine
+    assert "private func markReaderEOF()" in vt_engine
+    task_start = vt_engine.index("private func runOpticalFlowTask(")
+    task_end = vt_engine.index("#endif", task_start)
+    optical_flow_task_body = vt_engine[task_start:task_end]
+    assert ".lock()" not in optical_flow_task_body
+    assert ".unlock()" not in optical_flow_task_body
 
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "import PhotosUI" in player_view

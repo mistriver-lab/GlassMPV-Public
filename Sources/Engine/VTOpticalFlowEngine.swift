@@ -25,11 +25,11 @@ final class SampleBufferDisplayContainerView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    static func isQuarterTurnTransform(_ transform: CGAffineTransform) -> Bool {
+    nonisolated static func isQuarterTurnTransform(_ transform: CGAffineTransform) -> Bool {
         abs(transform.b) > abs(transform.a)
     }
 
-    static func normalizedRotationTransform(from transform: CGAffineTransform) -> CGAffineTransform {
+    nonisolated static func normalizedRotationTransform(from transform: CGAffineTransform) -> CGAffineTransform {
         let isDegenerate = abs(transform.a) < 1e-6
             && abs(transform.b) < 1e-6
             && abs(transform.c) < 1e-6
@@ -918,9 +918,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     }
                 }
             } else if isTokenValid(token) {
-                bufferLock.lock()
-                isReaderEOF = true
-                bufferLock.unlock()
+                markReaderEOF()
 
                 if !didStartAudioClock && queuedCount() > 0 {
                     didStartAudioClock = true
@@ -1077,6 +1075,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if pts > lastEnqueuedPTS {
             lastEnqueuedPTS = pts
         }
+        bufferLock.unlock()
+    }
+
+    private func markReaderEOF() {
+        bufferLock.lock()
+        isReaderEOF = true
         bufferLock.unlock()
     }
 
