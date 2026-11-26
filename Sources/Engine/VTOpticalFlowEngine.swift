@@ -532,13 +532,13 @@ enum HEVCFormatNormalizer {
 }
 
 /// VideoToolbox 光流后端类型
-enum OpticalFlowBackendKind: String, Equatable, Sendable {
+enum OpticalFlowBackendKind: String, Hashable, Sendable {
     case lowLatency = "LowLatency"
     case frameRateConversion = "FRC"
 }
 
 /// 单个分辨率 + 后端组合候选
-struct OpticalFlowCandidate: Equatable, Sendable {
+struct OpticalFlowCandidate: Hashable, Sendable {
     let backend: OpticalFlowBackendKind
     let width: Int
     let height: Int

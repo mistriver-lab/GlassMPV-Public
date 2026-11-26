@@ -259,6 +259,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "videoDecoderSpecification:" not in vt_engine
     assert "OpticalFlowBackendKind" in vt_engine
     assert "OpticalFlowCandidate" in vt_engine
+    assert "struct OpticalFlowCandidate: Hashable" in vt_engine
     assert "OpticalFlowResolutionPlanner" in vt_engine
     assert "ActiveOpticalFlowConfiguration" in vt_engine
     assert "VTFrameRateConversionConfiguration" in vt_engine
