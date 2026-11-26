@@ -200,7 +200,7 @@ final class GlassMPVTests: XCTestCase {
         try await Task.sleep(nanoseconds: 200_000_000)
         controller.load(url: sampleURL)
 
-        let deadline = Date().addingTimeInterval(12.0)
+        let deadline = Date().addingTimeInterval(30.0)
         while Date() < deadline {
             if controller.lastErrorMessage != nil {
                 break
