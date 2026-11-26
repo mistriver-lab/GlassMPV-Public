@@ -27,6 +27,7 @@ final class PlayerCoordinator: ObservableObject {
     @Published var selectedPreset: ShaderPreset = .off // 保守默认原画直出，确保首次 100% 起播后再按需开启超分
     @Published var selectedExtras: Set<String> = []
     @Published var interpolationMode: InterpolationMode = .off
+    @Published var opticalFlowTargetFPS: OpticalFlowTargetFPS = .x2
     @Published var vtSpatial2x: Bool = false
     @Published var speed: Double = 1.0
     @Published var currentURL: URL?
@@ -94,7 +95,10 @@ final class PlayerCoordinator: ObservableObject {
                 thermalLevel: thermal
             )
         } else {
-            let interpBadge = opticalFlowController.enableSpatial2xUpscale ? "光流2x+超分2x" : interpolationMode.shortBadge
+            let targetBadge = opticalFlowController.targetSummaryBadge
+            let interpBadge = opticalFlowController.enableSpatial2xUpscale
+                ? "光流\(targetBadge)+超分2×"
+                : "光流\(targetBadge)"
             let aneDecoderBadge = opticalFlowController.activeBackendLabel != "--"
                 ? "VT+\(opticalFlowController.activeBackendLabel)"
                 : "硬解 VT+ANE"
@@ -230,7 +234,8 @@ final class PlayerCoordinator: ObservableObject {
                 presentedCount: opticalFlowController.presentedFrameCount,
                 actualOutputFPS: opticalFlowController.actualOutputFPS,
                 sourceFPS: opticalFlowController.sourceFPS,
-                errorMessage: opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError
+                errorMessage: opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError,
+                targetLabel: opticalFlowController.targetSummaryBadge
             )
         }
     }
@@ -283,6 +288,7 @@ final class PlayerCoordinator: ObservableObject {
             aneFailed: opticalFlowController.failedInterpolationCount,
             anePresented: opticalFlowController.presentedFrameCount,
             aneAvgMs: opticalFlowController.averageInterpolationMs,
+            aneTargetFPS: engineMode == .opticalFlow ? opticalFlowController.targetSummaryBadge : "",
             verdictLabel: verdict.shortLabel,
             thermalLevel: ThermalLevel(state: thermalState)
         )
@@ -377,7 +383,7 @@ final class PlayerCoordinator: ObservableObject {
             ? "就绪 | state=\(mpvController.playbackState) | \(mpvController.videoWidth)x\(mpvController.videoHeight) | codec=\(mpvController.videoCodec.isEmpty ? "-" : mpvController.videoCodec) | hwdec=\(mpvController.hardwareDecoder.isEmpty ? "-" : mpvController.hardwareDecoder) | fps=\(String(format: "%.1f", mpvController.sourceFPS))/\(String(format: "%.1f", mpvController.outputFPS)) | targetSync=\(String(format: "%.0f", mpvController.targetDisplaySyncFPS))Hz | mpvDisplay=\(mpvDisplayText) | proMotion=\(proMotionText) | pass(fresh/redraw)=\(mpvController.freshRenderPassCount)/\(mpvController.redrawRenderPassCount) | mistimed=\(mpvController.mistimedFrames) | delayed=\(mpvController.delayedFrames) | probe=\(probeText) | err=\(mpvController.lastErrorMessage ?? "none")"
             : "未初始化"
 
-        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
+        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 目标=\(opticalFlowController.targetSummaryBadge) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
 
         let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许超分"
         let lines = [
@@ -456,7 +462,25 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
+    func setOpticalFlowTargetFPS(_ target: OpticalFlowTargetFPS) {
+        opticalFlowTargetFPS = target
+        if !target.allowsSpatial2x && vtSpatial2x {
+            vtSpatial2x = false
+            opticalFlowController.appendLog("[ane] 切换至多相目标 \(target.shortBadge)，已自动关闭 ANE 2× 空间超分")
+        }
+        if engineMode == .opticalFlow, let url = currentURL {
+            let t = opticalFlowController.currentTime
+            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: target, startAt: t)
+            opticalFlowController.setSpeed(speed)
+        }
+    }
+
     func setVTSpatial2x(_ enabled: Bool) {
+        if enabled && !opticalFlowTargetFPS.allowsSpatial2x {
+            vtSpatial2x = false
+            opticalFlowController.appendLog("[ane] 目标帧率 \(opticalFlowTargetFPS.shortBadge) 需多相补帧，仅 2× 档位支持同步开启 ANE 2× 空间超分")
+            return
+        }
         if enabled && isSuperResolutionDisabledBy4K {
             vtSpatial2x = false
             let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用 ANE 2× 超分"
@@ -466,7 +490,8 @@ final class PlayerCoordinator: ObservableObject {
         vtSpatial2x = enabled
         if engineMode == .opticalFlow, let url = currentURL {
             let t = opticalFlowController.currentTime
-            opticalFlowController.load(url: url, spatial2x: enabled, startAt: t)
+            opticalFlowController.load(url: url, spatial2x: enabled, targetFPS: opticalFlowTargetFPS, startAt: t)
+            opticalFlowController.setSpeed(speed)
         }
     }
 
@@ -529,7 +554,7 @@ final class PlayerCoordinator: ObservableObject {
             }
         case .opticalFlow:
             mpvController.releaseMediaForExternalEngine()
-            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, startAt: seekTo)
+            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: opticalFlowTargetFPS, startAt: seekTo)
             opticalFlowController.setSpeed(speed)
         }
     }
@@ -993,7 +1018,7 @@ struct LiquidGlassPlayerView: View {
             VStack(alignment: .trailing, spacing: 2) {
                 Text(activeResolutionText)
                     .font(.caption2.monospacedDigit().weight(.semibold))
-                Text("\(coordinator.interpolationMode.shortBadge) · \(activeFPSText)")
+                Text("\(coordinator.hudMetrics.interpolationBadge) · \(activeFPSText)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -1197,7 +1222,13 @@ struct LiquidGlassPlayerView: View {
 
 struct EnhancementControlSheet: View {
     @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject private var optical: OpticalFlowPlayerController
     @Environment(\.dismiss) private var dismiss
+
+    init(coordinator: PlayerCoordinator) {
+        self.coordinator = coordinator
+        self._optical = ObservedObject(wrappedValue: coordinator.opticalFlowController)
+    }
 
     var body: some View {
         NavigationStack {
@@ -1247,11 +1278,42 @@ struct EnhancementControlSheet: View {
                     }
 
                     if coordinator.engineMode == .opticalFlow {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("ANE 目标帧率")
+                                Spacer()
+                                Text("当前 \(optical.targetSummaryBadge)")
+                                    .font(.caption.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.cyan)
+                            }
+
+                            Picker("ANE 目标帧率", selection: Binding(
+                                get: { coordinator.opticalFlowTargetFPS },
+                                set: { coordinator.setOpticalFlowTargetFPS($0) }
+                            )) {
+                                ForEach(OpticalFlowTargetFPS.allCases) { tier in
+                                    Text(tier.shortBadge).tag(tier)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text("2×/96fps(24p) 优先 LowLatency；60/72/120fps(24p) 优先 FRC 多相栅格重采样；算力不足自动先降分辨率再降帧率")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+
                         Toggle("同步开启 ANE 2× 硬件超分", isOn: Binding(
                             get: { coordinator.vtSpatial2x },
                             set: { coordinator.setVTSpatial2x($0) }
                         ))
-                        .disabled(coordinator.isSuperResolutionDisabledBy4K)
+                        .disabled(coordinator.isSuperResolutionDisabledBy4K || !coordinator.opticalFlowTargetFPS.allowsSpatial2x)
+
+                        if !coordinator.opticalFlowTargetFPS.allowsSpatial2x {
+                            Text("仅 2× 单相档位支持同步开启 ANE 2× 空间超分（\(coordinator.opticalFlowTargetFPS.shortBadge) 档位需多相补帧，已自动互斥关闭）")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -1354,7 +1416,7 @@ struct EnhancementControlSheet: View {
         case .mpvSmooth120Hz:
             return "display-resample + 自适应 tscale (≤2K mitchell / 4K linear)，时间轴去抖动（非运动光流，24p→120Hz 整数倍体感接近原帧率）；真补帧请切 ANE 光流核"
         case .vtOpticalFlow2x:
-            return "Apple VideoToolbox ANE 硬件光流真补帧（支持 4K 自动降档与 LowLatency/FRC 双后端自适应自愈，仅 MP4/MOV）"
+            return "Apple VideoToolbox ANE 硬件光流真补帧（支持 2×/60/72/96/120fps 多档位、4K 自动降档与 LowLatency/FRC 双后端自适应自愈，仅 MP4/MOV）"
         }
     }
 }
@@ -1481,7 +1543,7 @@ struct DiagnosticLogSheet: View {
                     )
                     LabeledContent(
                         "ANE 光流状态",
-                        value: "\(optical.capabilityDescription) (后端 \(optical.activeBackendLabel) · 时钟 \(optical.clockSourceLabel) · 补帧 \(optical.interpolatedFrameCount) / 追赶跳过 \(optical.skippedInterpolationCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount) / 耗时 \(String(format: "%.1f", optical.averageInterpolationMs))ms)"
+                        value: "\(optical.capabilityDescription) (目标 \(optical.targetSummaryBadge) · 后端 \(optical.activeBackendLabel) · 时钟 \(optical.clockSourceLabel) · 补帧 \(optical.interpolatedFrameCount) / 追赶跳过 \(optical.skippedInterpolationCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount) / 耗时 \(String(format: "%.1f", optical.averageInterpolationMs))ms)"
                     )
                     if let currentURL = coordinator.currentURL {
                         LabeledContent("当前片源", value: currentURL.lastPathComponent)
@@ -1625,7 +1687,7 @@ struct DiagnosticLogSheet: View {
             "MPV Reported Display Sync: \(mpv.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpv.displaySyncFPS) : "unreported")",
             "ProMotion Keeper: \(mpv.isProMotionKeeperActive ? "active" : "inactive") (\(pmDisplay))",
             "MPV Passes (fresh/redraw): \(mpv.freshRenderPassCount) / \(mpv.redrawRenderPassCount) | mistimed=\(mpv.mistimedFrames) | delayed=\(mpv.delayedFrames)",
-            "ANE Backend: \(optical.activeBackendLabel) | Clock: \(optical.clockSourceLabel) | spatial2x=\(optical.enableSpatial2xUpscale ? "ON" : "OFF")",
+            "ANE Target: \(optical.targetSummaryBadge) (requested=\(optical.requestedTargetFPS.shortBadge), effective=\(optical.effectiveTargetFPS.shortBadge)) | ANE Backend: \(optical.activeBackendLabel) | Clock: \(optical.clockSourceLabel) | spatial2x=\(optical.enableSpatial2xUpscale ? "ON" : "OFF")",
             "ANE Counters: interpolated=\(optical.interpolatedFrameCount) | skipped=\(optical.skippedInterpolationCount) | failed=\(optical.failedInterpolationCount) | presented=\(optical.presentedFrameCount) | avgMs=\(String(format: "%.1f", optical.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", optical.actualOutputFPS))"
         ]
         return DiagnosticLogExporter.buildReport(

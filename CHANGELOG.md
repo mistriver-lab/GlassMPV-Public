@@ -5,6 +5,10 @@
 ## [v2026.11.26] - 2026-11-26
 
 ### 修复与增强 (Fixed & Enhanced)
+- **新增 ANE 光流核多档位目标帧率（`2× / 60 / 72 / 96 / 120fps`）、相位时间栅格重采样与算力预算守卫 (`ShaderPreset` + `VTOpticalFlowEngine` + `PlaybackTelemetry` + `LiquidGlassPlayerView`)**：
+  - 新增 `OpticalFlowTargetFPS` 五档目标帧率选择器，约束仅 `2×` 允许 `spatial2x` 空间超分，并按倍率自动调度双后端优先级（2 的幂倍率优先 `LowLatency`，非 2 的幂如 `24→60/72/120` 优先 `FRC`）。
+  - 新增跨平台 `OpticalFlowPhaseScheduler`（整倍等分 + 非整倍时间栅格重采样）与单次多缓冲 `process` 调用，配合 `OpticalFlowResolutionPlanner.recommendedQueueLimits` 动态队列上限与 `OpticalFlowBudgetGuard`（「先降分辨率、再降帧率档位」滑窗过载/追帧自愈）。
+  - 在控制台（分段选择器）、HUD、黑匣子采样、真机 5 项体检与诊断导出中全链路透出目标/实测档位（如 `120fps→96fps`）。
 - **根治 ANE 4K 光流 `-19730` (`Processor is not initialized`) 与双后端自适应自愈 (`VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
   - 新增跨平台 `OpticalFlowResolutionPlanner` 与 `OpticalFlowCandidate`，自动将 4K 片源（如 `2960×2160`、`3840×2160`）等比偶对齐降档至 `1080p` / `720p` / `540p`，并结合 `VTFrameProcessorConfiguration.minimumDimensions`/`maximumDimensions` 边界过滤。
   - 打通 `VTLowLatencyFrameInterpolationConfiguration` 与 `VTFrameRateConversionConfiguration`（`VTFrameRateConversionParameters` `.sequential`/`.random` 提交模式）双后端协商及 `ActiveOpticalFlowConfiguration` 状态机；修复 `CVPixelBufferPool` 池属性不覆盖 `IOSurfaceProperties`，并升级 `normalizeSourceBufferIfNeeded` 支持尺寸不匹配时硬件缩放对齐。
@@ -121,3 +125,5 @@
   2. **ANE 光流真补帧核**：`VTFrameProcessor` 已为 `2960×2160` 成功启动，但 `AVAssetReader` 4 个输出档位均报 `-11833 / NSOSStatusErrorDomain(-12906)`；原因是该 HEVC MP4 容器标签为 `hev1`（苹果 `AVAssetReader` 要求 `hvc1`），须通过 `outputSettings: nil` 压缩透传 + `HEVCFormatNormalizer`（`hev1→hvc1`）+ `VTDecompressionSession` + `OpticalFlowPTSReorderBuffer` 硬解兜底。
 
 - [x] **当前代码改动进度（工作区未提交 WIP，新窗可直接接续，无需从头重读文件）**：
+
+- [x] 修复 `VTOpticalFlowEngine.swift` `VTDecompressionSessionCreate` 参数标签与 `test_project_integrity.py` 断言（`b4676df`）；CI Run `45588353144` 全绿出包并交付微信「文件传输助手」。

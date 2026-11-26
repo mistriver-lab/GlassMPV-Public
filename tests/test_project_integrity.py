@@ -268,11 +268,23 @@ def test_swift_sources_non_empty_and_balanced():
     assert "activateCandidate" in vt_engine
     assert "queryDimensionBounds" in vt_engine
     assert "interpolationExhausted" in vt_engine
+    assert "OpticalFlowPhaseScheduler" in vt_engine
+    assert "OpticalFlowBudgetGuard" in vt_engine
+    assert "recommendedQueueLimits" in vt_engine
+    assert "targetSummaryBadge" in vt_engine
+    assert "downgradeResolutionIfPossible" in vt_engine
+    assert "downgradeTargetFPSIfPossible" in vt_engine
+    assert "updateQueueLimits" in vt_engine
+    assert "readMaxQueuedFrames" in vt_engine
+    assert "readPrebufferFrameTarget" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
     assert ".lock()" not in optical_flow_task_body
     assert ".unlock()" not in optical_flow_task_body
+
+    shader_preset = (ROOT / "Sources" / "Models" / "ShaderPreset.swift").read_text(encoding="utf-8")
+    assert "enum OpticalFlowTargetFPS" in shader_preset
 
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "import PhotosUI" in player_view
@@ -292,9 +304,12 @@ def test_swift_sources_non_empty_and_balanced():
     assert "startRuntimeTelemetrySampling()" in player_view
     assert "captureRuntimeTelemetrySample()" in player_view
     assert "activeBackendLabel" in player_view
+    assert "opticalFlowTargetFPS" in player_view
+    assert "setOpticalFlowTargetFPS" in player_view
 
     swift_test_src = swift_test_file.read_text(encoding="utf-8")
     assert "testOpticalFlowResolutionPlannerAndCandidateFallback" in swift_test_src
+    assert "testOpticalFlowPhaseSchedulerAndMultiTierTargets" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

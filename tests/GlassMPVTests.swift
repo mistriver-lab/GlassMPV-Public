@@ -855,4 +855,155 @@ final class GlassMPVTests: XCTestCase {
         )
         XCTAssertTrue(planEmpty.isEmpty)
     }
+
+    func testOpticalFlowPhaseSchedulerAndMultiTierTargets() throws {
+        // 1. OpticalFlowTargetFPS 档位契约
+        XCTAssertTrue(OpticalFlowTargetFPS.x2.allowsSpatial2x)
+        XCTAssertFalse(OpticalFlowTargetFPS.fps60.allowsSpatial2x)
+        XCTAssertFalse(OpticalFlowTargetFPS.fps72.allowsSpatial2x)
+        XCTAssertFalse(OpticalFlowTargetFPS.fps96.allowsSpatial2x)
+        XCTAssertFalse(OpticalFlowTargetFPS.fps120.allowsSpatial2x)
+
+        XCTAssertEqual(OpticalFlowTargetFPS.fps120.nextLowerTier, .fps96)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps96.nextLowerTier, .fps72)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps72.nextLowerTier, .fps60)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps60.nextLowerTier, .x2)
+        XCTAssertNil(OpticalFlowTargetFPS.x2.nextLowerTier)
+
+        XCTAssertEqual(OpticalFlowTargetFPS.x2.effectiveTargetFPS(sourceFPS: 23.976), 47.952, accuracy: 0.01)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps60.effectiveTargetFPS(sourceFPS: 24.0), 60.0, accuracy: 0.01)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps60.effectiveTargetFPS(sourceFPS: 60.0), 60.0, accuracy: 0.01)
+
+        // 24p -> 2x/96fps 属 2 的幂倍率；24p -> 60/72/120fps 非 2 的幂（优先 FRC）
+        XCTAssertTrue(OpticalFlowTargetFPS.x2.isPowerOfTwoMultiplier(sourceFPS: 23.976))
+        XCTAssertTrue(OpticalFlowTargetFPS.fps96.isPowerOfTwoMultiplier(sourceFPS: 23.976))
+        XCTAssertFalse(OpticalFlowTargetFPS.fps60.isPowerOfTwoMultiplier(sourceFPS: 24.0))
+        XCTAssertFalse(OpticalFlowTargetFPS.fps72.isPowerOfTwoMultiplier(sourceFPS: 24.0))
+        XCTAssertFalse(OpticalFlowTargetFPS.fps120.isPowerOfTwoMultiplier(sourceFPS: 24.0))
+        XCTAssertTrue(OpticalFlowTargetFPS.fps60.isPowerOfTwoMultiplier(sourceFPS: 30.0))
+        XCTAssertTrue(OpticalFlowTargetFPS.fps120.isPowerOfTwoMultiplier(sourceFPS: 30.0))
+
+        XCTAssertEqual(OpticalFlowTargetFPS.x2.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 1)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps60.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 3)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps72.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 2)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps96.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 3)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps120.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 4)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps60.maxInterpolatedFramesPerPair(sourceFPS: 60.0), 0)
+
+        // 2. 队列上限推荐与双后端排序（preferFRC + [×N] 标签）
+        let limits48 = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 48.0)
+        let limits120 = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 120.0)
+        XCTAssertEqual(limits48.maxQueued, 24)
+        XCTAssertEqual(limits48.prebuffer, 7)
+        XCTAssertEqual(limits120.maxQueued, 60)
+        XCTAssertEqual(limits120.prebuffer, 18)
+
+        let frcPlan = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            requestedSpatial2x: true,
+            lowLatencySupported: true,
+            frcSupported: true,
+            preferFRC: true,
+            maxInterpolatedFrames: 4
+        )
+        XCTAssertEqual(frcPlan.first?.backend, .frameRateConversion)
+        XCTAssertEqual(frcPlan.first?.maxInterpolatedFrames, 4)
+        XCTAssertFalse(frcPlan.contains(where: { $0.spatial2x }))
+        XCTAssertTrue(frcPlan.first?.displayLabel.contains("[×5]") == true)
+
+        // 3. 整倍等分相位调度（24p -> 2x / 72 / 96 / 120）
+        var sched72 = OpticalFlowPhaseScheduler(targetTier: .fps72, sourceFPS: 24.0)
+        let step72 = sched72.planStep(previousPTS: 0.0, currentPTS: 1.0 / 24.0, maxAllowedSlots: 4)
+        XCTAssertTrue(step72.shouldEmitOriginalFrame)
+        XCTAssertEqual(step72.interpolatedSlots.count, 2)
+        XCTAssertEqual(Double(step72.interpolatedSlots[0].phase), 1.0 / 3.0, accuracy: 0.005)
+        XCTAssertEqual(Double(step72.interpolatedSlots[1].phase), 2.0 / 3.0, accuracy: 0.005)
+
+        var sched120 = OpticalFlowPhaseScheduler(targetTier: .fps120, sourceFPS: 24.0)
+        let step120 = sched120.planStep(previousPTS: 0.0, currentPTS: 1.0 / 24.0, maxAllowedSlots: 4)
+        XCTAssertEqual(step120.interpolatedSlots.count, 4)
+        XCTAssertEqual(Double(step120.interpolatedSlots[0].phase), 0.2, accuracy: 0.005)
+        XCTAssertEqual(Double(step120.interpolatedSlots[3].phase), 0.8, accuracy: 0.005)
+
+        // 4. 非整倍时间栅格重采样（24p -> 60fps 模拟 1 秒 24 帧）
+        var sched60 = OpticalFlowPhaseScheduler(targetTier: .fps60, sourceFPS: 24.0)
+        var generatedPTS: [Double] = [0.0]
+        for idx in 1...24 {
+            let prev = Double(idx - 1) / 24.0
+            let curr = Double(idx) / 24.0
+            let step = sched60.planStep(previousPTS: prev, currentPTS: curr, maxAllowedSlots: 3)
+            var lastPhase: Float = 0
+            for slot in step.interpolatedSlots {
+                XCTAssertGreaterThan(slot.phase, 0)
+                XCTAssertLessThan(slot.phase, 1)
+                XCTAssertGreaterThan(slot.phase, lastPhase)
+                lastPhase = slot.phase
+                generatedPTS.append(slot.pts)
+            }
+            if step.shouldEmitOriginalFrame {
+                generatedPTS.append(curr)
+            }
+        }
+        XCTAssertTrue((58...62).contains(generatedPTS.count), "24p->60fps 1秒总输出帧应约60帧，实际=\(generatedPTS.count)")
+        for i in 1..<generatedPTS.count {
+            XCTAssertGreaterThan(generatedPTS[i], generatedPTS[i - 1], "重采样 PTS 必须严格单调递增")
+        }
+
+        // 5. 算力预算守卫：连续超预算先降分辨率，冷却期保持，冷却后且无法再降分辨率时降目标帧率
+        var guardState = OpticalFlowBudgetGuard(
+            windowSize: 2,
+            overloadRatioThreshold: 0.85,
+            consecutiveOverloadWindowsRequired: 2,
+            maxConsecutiveCatchUpSkips: 2,
+            cooldownPairs: 2
+        )
+        XCTAssertEqual(guardState.recordPair(processMs: 38, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .keep)
+        XCTAssertEqual(guardState.recordPair(processMs: 38, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .keep)
+        XCTAssertEqual(guardState.recordPair(processMs: 39, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .keep)
+        XCTAssertEqual(guardState.recordPair(processMs: 39, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .downgradeResolution)
+        // 冷却期 2 次忽略
+        XCTAssertEqual(guardState.recordPair(processMs: 50, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
+        XCTAssertEqual(guardState.recordPair(processMs: 50, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
+        // 冷却结束后连续 2 次追帧跳过，且无更低分辨率 -> 降目标帧率
+        XCTAssertEqual(guardState.recordPair(processMs: 0, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
+        XCTAssertEqual(guardState.recordPair(processMs: 0, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .downgradeTargetFPS)
+
+        // 6. 遥测判定与黑匣子格式含目标帧率标签
+        let verdict = InterpolationVerdict.evaluateANE(
+            interpolatedCount: 120,
+            failedCount: 0,
+            presentedCount: 180,
+            actualOutputFPS: 118.5,
+            sourceFPS: 24.0,
+            errorMessage: nil,
+            targetLabel: "120fps→96fps"
+        )
+        XCTAssertTrue(verdict.detailText.contains("目标 120fps→96fps"))
+
+        let sample = RuntimeTelemetrySample(
+            engine: "ANE 光流核",
+            playbackState: "播放中",
+            mediaTime: 3.5,
+            width: 1480,
+            height: 1080,
+            sourceFPS: 24.0,
+            outputFPS: 95.8,
+            displayFPS: 0,
+            proMotionFPS: 0,
+            droppedFrames: 0,
+            mistimedFrames: 0,
+            delayedFrames: 0,
+            mpvProbe: nil,
+            aneInterpolated: 150,
+            aneSkipped: 1,
+            aneFailed: 0,
+            anePresented: 200,
+            aneAvgMs: 14.2,
+            aneTargetFPS: "96fps",
+            verdictLabel: "ANE光流生效",
+            thermalLevel: .nominal
+        )
+        XCTAssertTrue(sample.formatLogLine().contains("target=96fps"))
+    }
 }

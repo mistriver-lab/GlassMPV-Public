@@ -26,9 +26,11 @@ enum AppReleaseInfo {
             version: "v2026.11.26",
             date: "2026-11-26",
             highlights: [
+                "新增 ANE 光流核多档位目标帧率（2× / 60 / 72 / 96 / 120fps）：支持 2 的幂倍率优先 LowLatency 与非 2 的幂（如 24→60/72/120）优先 FRC 双后端协同",
+                "新增 OpticalFlowPhaseScheduler（整倍等分 + 非整倍时间栅格重采样）与单次多缓冲 process 调用，配合动态预缓冲与「先降分辨率后降帧率」算力预算守卫（OpticalFlowBudgetGuard）",
                 "根治 ANE 4K 光流 -19730 失败：新增 OpticalFlowResolutionPlanner 自动将 4K 降档至 1080p/720p/540p 等比偶对齐档位并结合系统维度边界过滤",
                 "打通 LowLatency 与 VTFrameRateConversion (FRC) 双后端协商，保留池原生 IOSurfaceProperties 并支持运行期首帧异常自动降档切后端自愈与日志防刷屏",
-                "在 HUD、真机 5 项体检与诊断导出中实时透出当前激活的 ANE 光流后端标签（activeBackendLabel）"
+                "在控制台、HUD、真机 5 项体检与诊断导出中实时透出目标/实测档位分段控制及激活的 ANE 光流后端标签（activeBackendLabel）"
             ]
         ),
         ReleaseNoteEntry(

@@ -390,12 +390,19 @@ enum InterpolationVerdict: Equatable, Sendable {
         presentedCount: Int,
         actualOutputFPS: Double,
         sourceFPS: Double,
-        errorMessage: String?
+        errorMessage: String?,
+        targetLabel: String? = nil
     ) -> InterpolationVerdict {
         if interpolatedCount > 0 {
             let outText = actualOutputFPS > 0 ? String(format: "%.1f", actualOutputFPS) : "--"
             let srcText = sourceFPS > 0 ? String(format: "%.1f", sourceFPS) : "--"
-            return .aneActive(detail: "已生成 \(interpolatedCount) 帧光流中间帧（送显 \(presentedCount) 帧, \(srcText)→\(outText)fps）")
+            let targetSuffix: String
+            if let targetLabel, !targetLabel.isEmpty {
+                targetSuffix = ", 目标 \(targetLabel)"
+            } else {
+                targetSuffix = ""
+            }
+            return .aneActive(detail: "已生成 \(interpolatedCount) 帧光流中间帧（送显 \(presentedCount) 帧, \(srcText)→\(outText)fps\(targetSuffix)）")
         }
         if let errorMessage {
             let trimmed = errorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -432,6 +439,7 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
     let aneFailed: Int
     let anePresented: Int
     let aneAvgMs: Double
+    let aneTargetFPS: String
     let verdictLabel: String
     let thermalLevel: ThermalLevel
 
@@ -456,6 +464,7 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         aneFailed: Int,
         anePresented: Int,
         aneAvgMs: Double,
+        aneTargetFPS: String = "",
         verdictLabel: String,
         thermalLevel: ThermalLevel
     ) {
@@ -479,6 +488,7 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         self.aneFailed = aneFailed
         self.anePresented = anePresented
         self.aneAvgMs = aneAvgMs
+        self.aneTargetFPS = aneTargetFPS
         self.verdictLabel = verdictLabel
         self.thermalLevel = thermalLevel
     }
@@ -502,7 +512,8 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
 
         if isANE {
             let avgText = String(format: "%.1fms", aneAvgMs)
-            return "[\(resolvedTime)] [ANE] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText) drop=\(droppedFrames) ane(interp=\(aneInterpolated),skip=\(aneSkipped),fail=\(aneFailed),pres=\(anePresented),avg=\(avgText)) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
+            let targetSeg = aneTargetFPS.isEmpty ? "" : " target=\(aneTargetFPS)"
+            return "[\(resolvedTime)] [ANE] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText)\(targetSeg) drop=\(droppedFrames) ane(interp=\(aneInterpolated),skip=\(aneSkipped),fail=\(aneFailed),pres=\(anePresented),avg=\(avgText)) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
         } else {
             let probeText: String
             if let mpvProbe {
