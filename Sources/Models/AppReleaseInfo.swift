@@ -23,6 +23,15 @@ enum AppReleaseInfo {
 
     static let changelog: [ReleaseNoteEntry] = [
         ReleaseNoteEntry(
+            version: "v2026.11.26",
+            date: "2026-11-26",
+            highlights: [
+                "根治 ANE 4K 光流 -19730 失败：新增 OpticalFlowResolutionPlanner 自动将 4K 降档至 1080p/720p/540p 等比偶对齐档位并结合系统维度边界过滤",
+                "打通 LowLatency 与 VTFrameRateConversion (FRC) 双后端协商，保留池原生 IOSurfaceProperties 并支持运行期首帧异常自动降档切后端自愈与日志防刷屏",
+                "在 HUD、真机 5 项体检与诊断导出中实时透出当前激活的 ANE 光流后端标签（activeBackendLabel）"
+            ]
+        ),
+        ReleaseNoteEntry(
             version: "v2026.11.25",
             date: "2026-11-25",
             highlights: [

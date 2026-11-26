@@ -531,6 +531,167 @@ enum HEVCFormatNormalizer {
     }
 }
 
+/// VideoToolbox 光流后端类型
+enum OpticalFlowBackendKind: String, Equatable, Sendable {
+    case lowLatency = "LowLatency"
+    case frameRateConversion = "FRC"
+}
+
+/// 单个分辨率 + 后端组合候选
+struct OpticalFlowCandidate: Equatable, Sendable {
+    let backend: OpticalFlowBackendKind
+    let width: Int
+    let height: Int
+    let spatial2x: Bool
+
+    var displayLabel: String {
+        if spatial2x {
+            return "\(backend.rawValue) \(width)×\(height)+2×"
+        }
+        return "\(backend.rawValue) \(width)×\(height)"
+    }
+}
+
+/// 跨平台分辨率自适应与双后端候选规划器（自动将 4K 降档至 1080p/720p/540p 等比偶对齐档位）
+enum OpticalFlowResolutionPlanner: Sendable {
+    struct DimensionBounds: Equatable, Sendable {
+        let minWidth: Int
+        let minHeight: Int
+        let maxWidth: Int
+        let maxHeight: Int
+    }
+
+    static func alignEven(_ value: Int, minimum: Int = 64) -> Int {
+        let clamped = max(minimum, value)
+        return clamped - (clamped % 2)
+    }
+
+    static func fitProportionally(
+        width: Int,
+        height: Int,
+        maxLongSide: Int,
+        maxShortSide: Int
+    ) -> (width: Int, height: Int) {
+        let safeW = max(2, width)
+        let safeH = max(2, height)
+        let capW = safeW >= safeH ? maxLongSide : maxShortSide
+        let capH = safeW >= safeH ? maxShortSide : maxLongSide
+        let scale = min(1.0, min(Double(capW) / Double(safeW), Double(capH) / Double(safeH)))
+        let scaledW = alignEven(Int(floor(Double(safeW) * scale)))
+        let scaledH = alignEven(Int(floor(Double(safeH) * scale)))
+        return (scaledW, scaledH)
+    }
+
+    static func clampToBounds(
+        width: Int,
+        height: Int,
+        bounds: DimensionBounds?
+    ) -> (width: Int, height: Int)? {
+        var w = alignEven(width)
+        var h = alignEven(height)
+        guard let bounds else {
+            return (w, h)
+        }
+        if bounds.maxWidth > 0 && bounds.maxHeight > 0 {
+            if w > bounds.maxWidth || h > bounds.maxHeight {
+                let scale = min(Double(bounds.maxWidth) / Double(w), Double(bounds.maxHeight) / Double(h))
+                w = alignEven(Int(floor(Double(w) * scale)))
+                h = alignEven(Int(floor(Double(h) * scale)))
+            }
+        }
+        if bounds.minWidth > 0 && w < bounds.minWidth {
+            return nil
+        }
+        if bounds.minHeight > 0 && h < bounds.minHeight {
+            return nil
+        }
+        return (w, h)
+    }
+
+    static func buildCandidatePlan(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        requestedSpatial2x: Bool,
+        lowLatencySupported: Bool,
+        frcSupported: Bool,
+        lowLatencyBounds: DimensionBounds? = nil,
+        frcBounds: DimensionBounds? = nil
+    ) -> [OpticalFlowCandidate] {
+        guard lowLatencySupported || frcSupported else { return [] }
+        let safeW = max(2, sourceWidth)
+        let safeH = max(2, sourceHeight)
+
+        let caps: [(Int, Int)] = [
+            (1920, 1080),
+            (1280, 720),
+            (960, 540)
+        ]
+        var tiers: [(width: Int, height: Int)] = []
+        for (longCap, shortCap) in caps {
+            let fitted = fitProportionally(
+                width: safeW,
+                height: safeH,
+                maxLongSide: longCap,
+                maxShortSide: shortCap
+            )
+            if !tiers.contains(where: { $0.width == fitted.width && $0.height == fitted.height }) {
+                tiers.append(fitted)
+            }
+        }
+
+        var plan: [OpticalFlowCandidate] = []
+        func appendCandidate(_ candidate: OpticalFlowCandidate) {
+            if !plan.contains(candidate) {
+                plan.append(candidate)
+            }
+        }
+
+        let allowSpatial2x = requestedSpatial2x
+            && lowLatencySupported
+            && !SuperResolutionPolicy.isAlready4K(width: safeW, height: safeH)
+
+        if allowSpatial2x,
+           let topTier = tiers.first,
+           let bounded = clampToBounds(width: topTier.width, height: topTier.height, bounds: lowLatencyBounds) {
+            appendCandidate(
+                OpticalFlowCandidate(
+                    backend: .lowLatency,
+                    width: bounded.width,
+                    height: bounded.height,
+                    spatial2x: true
+                )
+            )
+        }
+
+        for tier in tiers {
+            if lowLatencySupported,
+               let bounded = clampToBounds(width: tier.width, height: tier.height, bounds: lowLatencyBounds) {
+                appendCandidate(
+                    OpticalFlowCandidate(
+                        backend: .lowLatency,
+                        width: bounded.width,
+                        height: bounded.height,
+                        spatial2x: false
+                    )
+                )
+            }
+            if frcSupported,
+               let bounded = clampToBounds(width: tier.width, height: tier.height, bounds: frcBounds) {
+                appendCandidate(
+                    OpticalFlowCandidate(
+                        backend: .frameRateConversion,
+                        width: bounded.width,
+                        height: bounded.height,
+                        spatial2x: false
+                    )
+                )
+            }
+        }
+
+        return plan
+    }
+}
+
 private final class VTDecodedFrameCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var frames: [(pts: CMTime, buffer: CVPixelBuffer)] = []
@@ -638,6 +799,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var skippedInterpolationCount: Int = 0
     @Published @MainActor var averageInterpolationMs: Double = 0
     @Published @MainActor var clockSourceLabel: String = "AVPlayer音频"
+    @Published @MainActor var activeBackendLabel: String = "--"
     @Published @MainActor var videoTransform: CGAffineTransform = .identity
 
     @MainActor var isLoopingEnabled: Bool = true
@@ -654,8 +816,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 #if targetEnvironment(simulator)
         return "Simulator (硬件光流仅真机可用)"
 #else
-        let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
-        return supported ? "真机支持 ANE 光流" : "当前设备不支持 VTLowLatencyFrameInterpolation"
+        let lowLatencySupported = VTLowLatencyFrameInterpolationConfiguration.isSupported
+        let frcSupported = VTFrameRateConversionConfiguration.isSupported
+        switch (lowLatencySupported, frcSupported) {
+        case (true, true):
+            return "真机支持 ANE 光流 (LowLatency+FRC)"
+        case (true, false):
+            return "真机支持 ANE 光流 (LowLatency)"
+        case (false, true):
+            return "真机支持 ANE 光流 (FRC)"
+        case (false, false):
+            return "当前设备不支持 ANE 光流"
+        }
 #endif
     }
 
@@ -748,6 +920,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         presentedFrameCount = 0
         skippedInterpolationCount = 0
         averageInterpolationMs = 0
+        activeBackendLabel = "--"
         lastInterpolationError = nil
         isLoadingPipeline = true
         pipelineStatusText = "正在初始化 ANE 光流核..."
@@ -763,12 +936,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         return
 #else
         let supported = VTLowLatencyFrameInterpolationConfiguration.isSupported
+            || VTFrameRateConversionConfiguration.isSupported
         isHardwareSupported = supported
         guard supported else {
             isLoadingPipeline = false
             pipelineStatusText = ""
-            appendLog("[ane] 当前设备不支持 VTLowLatencyFrameInterpolation")
-            errorMessage = "当前设备不支持 VTLowLatencyFrameInterpolation，请切换回「MPV 超分核」。"
+            appendLog("[ane] 当前设备不支持 VTLowLatencyFrameInterpolation 或 VTFrameRateConversion")
+            errorMessage = "当前设备不支持 VideoToolbox ANE 光流，请切换回「MPV 超分核」。"
             return
         }
 
@@ -1062,6 +1236,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         syntheticClock.reset(to: 0)
         usesSyntheticClock = false
         clockSourceLabel = "AVPlayer音频"
+        activeBackendLabel = "--"
         videoTransform = .identity
         displayContainer?.applyVideoTransform(.identity)
         clearBufferedFrames()
@@ -1114,8 +1289,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     func appendLog(_ line: String) {
         let stamp = Self.logTimeFormatter.string(from: Date())
         diagnosticLogs.append("[\(stamp)] \(line)")
-        if diagnosticLogs.count > 120 {
-            diagnosticLogs.removeFirst(diagnosticLogs.count - 120)
+        if diagnosticLogs.count > 200 {
+            diagnosticLogs.removeFirst(diagnosticLogs.count - 200)
         }
     }
 
@@ -1166,13 +1341,64 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let buffer: CVPixelBuffer
     }
 
+    private enum ActiveOpticalFlowConfiguration {
+        case lowLatency(VTLowLatencyFrameInterpolationConfiguration)
+        case frameRateConversion(VTFrameRateConversionConfiguration)
+
+        var sourcePixelBufferAttributes: [String: Any] {
+            switch self {
+            case .lowLatency(let cfg):
+                return cfg.sourcePixelBufferAttributes
+            case .frameRateConversion(let cfg):
+                return cfg.sourcePixelBufferAttributes
+            }
+        }
+
+        var destinationPixelBufferAttributes: [String: Any] {
+            switch self {
+            case .lowLatency(let cfg):
+                return cfg.destinationPixelBufferAttributes
+            case .frameRateConversion(let cfg):
+                return cfg.destinationPixelBufferAttributes
+            }
+        }
+
+        func startSession(on processor: VTFrameProcessor) throws {
+            switch self {
+            case .lowLatency(let cfg):
+                try processor.startSession(configuration: cfg)
+            case .frameRateConversion(let cfg):
+                try processor.startSession(configuration: cfg)
+            }
+        }
+    }
+
+    private struct ActivatedOpticalFlowSession: @unchecked Sendable {
+        let candidateIndex: Int
+        let candidate: OpticalFlowCandidate
+        let configuration: ActiveOpticalFlowConfiguration
+        let processor: VTFrameProcessor
+        let pixelFormat: OSType
+        let sourceNormPool: CVPixelBufferPool?
+        let sourceTransferSession: VTPixelTransferSession?
+        let destPool: CVPixelBufferPool
+        let transferSession: VTPixelTransferSession?
+    }
+
     private final class OpticalFlowPipelineState: @unchecked Sendable {
-        var configuration: VTLowLatencyFrameInterpolationConfiguration
+        var configuration: ActiveOpticalFlowConfiguration
         var processor: VTFrameProcessor
+        var candidates: [OpticalFlowCandidate]
+        var candidateIndex: Int
+        var activeCandidate: OpticalFlowCandidate
         var activeWidth: Int
         var activeHeight: Int
         var activeSpatial2x: Bool
-        let pixelFormat: OSType
+        var pixelFormat: OSType
+        let prefer10Bit: Bool
+        let requestedSpatial2x: Bool
+        var sourceWidth: Int
+        var sourceHeight: Int
         var forceNormalizeSource: Bool
         var sourceNormPool: CVPixelBufferPool?
         var sourceTransferSession: VTPixelTransferSession?
@@ -1187,14 +1413,24 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         var didStartAudioClock: Bool = false
         var didLogCatchUp: Bool = false
         var didCachePendingFirstFrame: Bool = false
+        var frcNeedsRandomSubmission: Bool = true
+        var interpolationExhausted: Bool = false
+        var didRetryWithNormalizationOnCurrentCandidate: Bool = false
 
         init(
-            configuration: VTLowLatencyFrameInterpolationConfiguration,
+            configuration: ActiveOpticalFlowConfiguration,
             processor: VTFrameProcessor,
+            candidates: [OpticalFlowCandidate],
+            candidateIndex: Int,
+            activeCandidate: OpticalFlowCandidate,
             activeWidth: Int,
             activeHeight: Int,
             activeSpatial2x: Bool,
             pixelFormat: OSType,
+            prefer10Bit: Bool,
+            requestedSpatial2x: Bool,
+            sourceWidth: Int,
+            sourceHeight: Int,
             forceNormalizeSource: Bool,
             sourceNormPool: CVPixelBufferPool?,
             sourceTransferSession: VTPixelTransferSession?,
@@ -1203,10 +1439,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         ) {
             self.configuration = configuration
             self.processor = processor
+            self.candidates = candidates
+            self.candidateIndex = candidateIndex
+            self.activeCandidate = activeCandidate
             self.activeWidth = activeWidth
             self.activeHeight = activeHeight
             self.activeSpatial2x = activeSpatial2x
             self.pixelFormat = pixelFormat
+            self.prefer10Bit = prefer10Bit
+            self.requestedSpatial2x = requestedSpatial2x
+            self.sourceWidth = sourceWidth
+            self.sourceHeight = sourceHeight
             self.forceNormalizeSource = forceNormalizeSource
             self.sourceNormPool = sourceNormPool
             self.sourceTransferSession = sourceTransferSession
@@ -1250,36 +1493,36 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             let trackFormatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
             let fallbackTrackDesc = trackFormatDescriptions.first
 
-            let initialWidth = width
-            let initialHeight = height
             let initialSpatial2x = spatial2x && !SuperResolutionPolicy.isAlready4K(width: width, height: height)
-
-            guard let initialSetup = createProcessorConfiguration(
-                width: initialWidth,
-                height: initialHeight,
+            let candidates = buildCandidatePlanForDevice(
+                sourceWidth: width,
+                sourceHeight: height,
                 requestedSpatial2x: initialSpatial2x
+            )
+
+            guard let activated = activateCandidate(
+                in: candidates,
+                startingAt: 0,
+                prefer10Bit: prefer10Bit
             ) else {
-                logAsync("[ane] 无法初始化 VideoToolbox 光流配置（\(initialWidth)×\(initialHeight)）")
+                logAsync("[ane] 无法初始化 VideoToolbox 光流配置（源 \(width)×\(height), 候选数 \(candidates.count)）")
                 Task { @MainActor [weak self] in
+                    self?.activeBackendLabel = "不可用"
                     self?.isLoadingPipeline = false
                     self?.pipelineStatusText = ""
-                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(initialWidth)x\(initialHeight)）。"
+                    self?.errorMessage = "无法初始化 VideoToolbox 光流配置（\(width)×\(height)）。"
                 }
                 return
             }
 
-            let configuration = initialSetup.configuration
-            let effectiveSpatial2x = initialSetup.effectiveSpatial2x
-
-            let processor = VTFrameProcessor()
-            try processor.startSession(configuration: configuration)
-
-            let pixelFormat = resolveSourcePixelFormat(from: configuration, prefer10Bit: prefer10Bit)
-            let resolvedPixFmtString = Self.fourCCString(pixelFormat)
-            logAsync("[ane] 光流会话启动: \(initialWidth)×\(initialHeight), pixFmt=\(resolvedPixFmtString), spatial2x=\(effectiveSpatial2x), prefer10Bit=\(prefer10Bit)")
+            let resolvedPixFmtString = Self.fourCCString(activated.pixelFormat)
+            let initialForceNorm = (width != activated.candidate.width || height != activated.candidate.height)
+            logAsync("[ane] 光流会话启动: 源 \(width)×\(height) -> 后端 \(activated.candidate.displayLabel), pixFmt=\(resolvedPixFmtString), forceNorm=\(initialForceNorm), prefer10Bit=\(prefer10Bit)")
 
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.isTokenValid(token) else { return }
+                self.activeBackendLabel = activated.candidate.displayLabel
+                self.enableSpatial2xUpscale = activated.candidate.spatial2x
                 if self.bitDepthLabel == "--" {
                     let parsed = PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: resolvedPixFmtString)
                     if parsed != "--" {
@@ -1288,39 +1531,25 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             }
 
-            let sourceNormPool = try? makeSourceNormalizationPool(
-                configuration: configuration,
-                width: initialWidth,
-                height: initialHeight,
-                pixelFormat: pixelFormat
-            )
-            var sourceTransferSession: VTPixelTransferSession?
-            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &sourceTransferSession)
-
-            let destPool = try makeDestinationPool(
-                configuration: configuration,
-                fallbackWidth: effectiveSpatial2x ? initialWidth * 2 : initialWidth,
-                fallbackHeight: effectiveSpatial2x ? initialHeight * 2 : initialHeight,
-                fallbackFormat: pixelFormat
-            )
-
-            var transferSession: VTPixelTransferSession?
-            if effectiveSpatial2x {
-                VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferSession)
-            }
-
             let state = OpticalFlowPipelineState(
-                configuration: configuration,
-                processor: processor,
-                activeWidth: initialWidth,
-                activeHeight: initialHeight,
-                activeSpatial2x: effectiveSpatial2x,
-                pixelFormat: pixelFormat,
-                forceNormalizeSource: false,
-                sourceNormPool: sourceNormPool,
-                sourceTransferSession: sourceTransferSession,
-                destPool: destPool,
-                transferSession: transferSession
+                configuration: activated.configuration,
+                processor: activated.processor,
+                candidates: candidates,
+                candidateIndex: activated.candidateIndex,
+                activeCandidate: activated.candidate,
+                activeWidth: activated.candidate.width,
+                activeHeight: activated.candidate.height,
+                activeSpatial2x: activated.candidate.spatial2x,
+                pixelFormat: activated.pixelFormat,
+                prefer10Bit: prefer10Bit,
+                requestedSpatial2x: initialSpatial2x,
+                sourceWidth: width,
+                sourceHeight: height,
+                forceNormalizeSource: initialForceNorm,
+                sourceNormPool: activated.sourceNormPool,
+                sourceTransferSession: activated.sourceTransferSession,
+                destPool: activated.destPool,
+                transferSession: activated.transferSession
             )
             defer { state.cleanup() }
 
@@ -1331,7 +1560,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     asset: asset,
                     videoTrack: videoTrack,
                     startSeconds: startSeconds,
-                    preferredPixelFormat: pixelFormat,
+                    preferredPixelFormat: state.pixelFormat,
                     prefer10Bit: prefer10Bit
                 )
             } catch {
@@ -1345,7 +1574,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let reader = openedReader.reader
                 let trackOutput = openedReader.output
                 activeReader = reader
-                state.forceNormalizeSource = (openedReader.pixelFormat != pixelFormat)
+                state.forceNormalizeSource = state.forceNormalizeSource || (openedReader.pixelFormat != state.pixelFormat)
 
                 while reader.status == .reading {
                     if !isTokenValid(token) {
@@ -1434,7 +1663,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         guard let created = createDecompressionSessionWithFallback(
                             rawDesc: rawDesc,
                             fallbackSampleData: leadingData,
-                            preferredPixelFormat: pixelFormat,
+                            preferredPixelFormat: state.pixelFormat,
                             prefer10Bit: prefer10Bit
                         ) else {
                             passthroughReader.cancelReading()
@@ -1689,37 +1918,194 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
 #if !targetEnvironment(simulator)
-    private func createProcessorConfiguration(
-        width: Int,
-        height: Int,
+    private static func queryDimensionBounds(
+        for configType: any VTFrameProcessorConfiguration.Type
+    ) -> OpticalFlowResolutionPlanner.DimensionBounds? {
+        let minDims = configType.minimumDimensions
+        let maxDims = configType.maximumDimensions
+        guard minDims != nil || maxDims != nil else { return nil }
+        return OpticalFlowResolutionPlanner.DimensionBounds(
+            minWidth: Int(minDims?.width ?? 0),
+            minHeight: Int(minDims?.height ?? 0),
+            maxWidth: Int(maxDims?.width ?? 0),
+            maxHeight: Int(maxDims?.height ?? 0)
+        )
+    }
+
+    private static func formatDimensionBounds(_ bounds: OpticalFlowResolutionPlanner.DimensionBounds?) -> String {
+        guard let bounds else { return "none" }
+        return "\(bounds.minWidth)x\(bounds.minHeight)..\(bounds.maxWidth)x\(bounds.maxHeight)"
+    }
+
+    private func buildCandidatePlanForDevice(
+        sourceWidth: Int,
+        sourceHeight: Int,
         requestedSpatial2x: Bool
-    ) -> (configuration: VTLowLatencyFrameInterpolationConfiguration, effectiveSpatial2x: Bool)? {
-        if requestedSpatial2x {
-            if let scaledConfig = VTLowLatencyFrameInterpolationConfiguration(
-                frameWidth: width,
-                frameHeight: height,
-                spatialScaleFactor: 2
-            ) {
-                return (scaledConfig, true)
+    ) -> [OpticalFlowCandidate] {
+        let lowLatencySupported = VTLowLatencyFrameInterpolationConfiguration.isSupported
+        let frcSupported = VTFrameRateConversionConfiguration.isSupported
+        let llBounds = Self.queryDimensionBounds(for: VTLowLatencyFrameInterpolationConfiguration.self)
+        let frcBounds = Self.queryDimensionBounds(for: VTFrameRateConversionConfiguration.self)
+        let plan = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            requestedSpatial2x: requestedSpatial2x,
+            lowLatencySupported: lowLatencySupported,
+            frcSupported: frcSupported,
+            lowLatencyBounds: llBounds,
+            frcBounds: frcBounds
+        )
+        let labels = plan.map(\.displayLabel).joined(separator: ", ")
+        logAsync("[ane] 双后端探测: LowLatency=\(lowLatencySupported)(bounds=\(Self.formatDimensionBounds(llBounds))), FRC=\(frcSupported)(bounds=\(Self.formatDimensionBounds(frcBounds))), 候选=[\(labels)]")
+        return plan
+    }
+
+    private func instantiateConfiguration(for candidate: OpticalFlowCandidate) -> ActiveOpticalFlowConfiguration? {
+        switch candidate.backend {
+        case .lowLatency:
+            if candidate.spatial2x {
+                guard let cfg = VTLowLatencyFrameInterpolationConfiguration(
+                    frameWidth: candidate.width,
+                    frameHeight: candidate.height,
+                    spatialScaleFactor: 2
+                ) else {
+                    return nil
+                }
+                return .lowLatency(cfg)
             }
-            logAsync("[ane] spatialScaleFactor=2 初始化失败（\(width)×\(height)），自动降级为仅 2× 光流补帧")
-            Task { @MainActor [weak self] in
-                self?.enableSpatial2xUpscale = false
+            guard let cfg = VTLowLatencyFrameInterpolationConfiguration(
+                frameWidth: candidate.width,
+                frameHeight: candidate.height,
+                numberOfInterpolatedFrames: 1
+            ) else {
+                return nil
             }
+            return .lowLatency(cfg)
+        case .frameRateConversion:
+            guard let cfg = VTFrameRateConversionConfiguration(
+                frameWidth: candidate.width,
+                frameHeight: candidate.height,
+                usePrecomputedFlow: false,
+                qualityPrioritization: .normal,
+                revision: VTFrameRateConversionConfiguration.defaultRevision
+            ) else {
+                return nil
+            }
+            return .frameRateConversion(cfg)
         }
-        if let frcConfig = VTLowLatencyFrameInterpolationConfiguration(
-            frameWidth: width,
-            frameHeight: height,
-            numberOfInterpolatedFrames: 1
-        ) {
-            return (frcConfig, false)
+    }
+
+    private func activateCandidate(
+        in candidates: [OpticalFlowCandidate],
+        startingAt startIndex: Int,
+        prefer10Bit: Bool
+    ) -> ActivatedOpticalFlowSession? {
+        guard startIndex < candidates.count else { return nil }
+        for index in startIndex..<candidates.count {
+            let candidate = candidates[index]
+            guard let config = instantiateConfiguration(for: candidate) else {
+                logAsync("[ane][warn] 候选 \(candidate.displayLabel) 配置构造返回 nil，跳过")
+                continue
+            }
+
+            let processor = VTFrameProcessor()
+            do {
+                try config.startSession(on: processor)
+            } catch {
+                processor.endSession()
+                logAsync("[ane][warn] 候选 \(candidate.displayLabel) startSession 失败: \(Self.formatDetailedError(error))")
+                continue
+            }
+
+            let pixelFormat = resolveSourcePixelFormat(from: config, prefer10Bit: prefer10Bit)
+            let sourceNormPool = try? makeSourceNormalizationPool(
+                configuration: config,
+                width: candidate.width,
+                height: candidate.height,
+                pixelFormat: pixelFormat
+            )
+            var sourceTransferSession: VTPixelTransferSession?
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &sourceTransferSession)
+
+            let destPool: CVPixelBufferPool
+            do {
+                destPool = try makeDestinationPool(
+                    configuration: config,
+                    fallbackWidth: candidate.spatial2x ? candidate.width * 2 : candidate.width,
+                    fallbackHeight: candidate.spatial2x ? candidate.height * 2 : candidate.height,
+                    fallbackFormat: pixelFormat
+                )
+            } catch {
+                processor.endSession()
+                if let sourceTransferSession {
+                    VTPixelTransferSessionInvalidate(sourceTransferSession)
+                }
+                logAsync("[ane][warn] 候选 \(candidate.displayLabel) 目标池创建失败: \(Self.formatDetailedError(error))")
+                continue
+            }
+
+            var transferSession: VTPixelTransferSession?
+            if candidate.spatial2x {
+                VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferSession)
+            }
+
+            return ActivatedOpticalFlowSession(
+                candidateIndex: index,
+                candidate: candidate,
+                configuration: config,
+                processor: processor,
+                pixelFormat: pixelFormat,
+                sourceNormPool: sourceNormPool,
+                sourceTransferSession: sourceTransferSession,
+                destPool: destPool,
+                transferSession: transferSession
+            )
         }
         return nil
     }
 
-    private func recordInterpolationFailure(_ reason: String, consecutiveFailures: Int, totalSuccesses: Int) {
-        let shouldSurfaceError = (totalSuccesses == 0 && consecutiveFailures >= 5)
-        if consecutiveFailures == 1 || shouldSurfaceError {
+    private func applyActivatedSession(
+        _ activated: ActivatedOpticalFlowSession,
+        to state: OpticalFlowPipelineState,
+        token: UUID,
+        reason: String
+    ) {
+        state.cleanup()
+        state.configuration = activated.configuration
+        state.processor = activated.processor
+        state.candidateIndex = activated.candidateIndex
+        state.activeCandidate = activated.candidate
+        state.activeWidth = activated.candidate.width
+        state.activeHeight = activated.candidate.height
+        state.activeSpatial2x = activated.candidate.spatial2x
+        state.pixelFormat = activated.pixelFormat
+        state.sourceNormPool = activated.sourceNormPool
+        state.sourceTransferSession = activated.sourceTransferSession
+        state.destPool = activated.destPool
+        state.transferSession = activated.transferSession
+        state.previousBuffer = nil
+        state.previousPTS = .invalid
+        state.localConsecutiveFailures = 0
+        state.didRetryWithNormalizationOnCurrentCandidate = false
+        state.frcNeedsRandomSubmission = true
+        state.forceNormalizeSource = (state.sourceWidth != activated.candidate.width || state.sourceHeight != activated.candidate.height)
+
+        Task { @MainActor [weak self] in
+            guard let self, self.isTokenValid(token) else { return }
+            self.activeBackendLabel = activated.candidate.displayLabel
+            self.enableSpatial2xUpscale = activated.candidate.spatial2x
+        }
+        logAsync("[ane] 激活光流后端(\(reason)): \(activated.candidate.displayLabel), pixFmt=\(Self.fourCCString(activated.pixelFormat)), forceNorm=\(state.forceNormalizeSource)")
+    }
+
+    private func recordInterpolationFailure(
+        _ reason: String,
+        consecutiveFailures: Int,
+        totalSuccesses: Int,
+        suppressErrorBanner: Bool = false
+    ) {
+        let shouldSurfaceError = !suppressErrorBanner && (totalSuccesses == 0 && consecutiveFailures >= 5)
+        if consecutiveFailures == 1 || consecutiveFailures == 5 || (consecutiveFailures > 5 && consecutiveFailures % 50 == 0) {
             logAsync("[ane][warn] 补帧失败(#\(consecutiveFailures)): \(reason)")
         }
         Task { @MainActor [weak self] in
@@ -1735,7 +2121,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     private func resolveSourcePixelFormat(
-        from configuration: VTLowLatencyFrameInterpolationConfiguration,
+        from configuration: ActiveOpticalFlowConfiguration,
         prefer10Bit: Bool
     ) -> OSType {
         let raw = configuration.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String]
@@ -1913,44 +2299,35 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             state.didCheckActualDimensions = true
             let actualW = CVPixelBufferGetWidth(currentBuffer)
             let actualH = CVPixelBufferGetHeight(currentBuffer)
-            if actualW >= 2, actualH >= 2, (actualW != state.activeWidth || actualH != state.activeHeight) {
-                logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(state.activeWidth)×\(state.activeHeight) 不一致，重建光流会话")
-                let rebuiltSpatial2x = state.activeSpatial2x && !SuperResolutionPolicy.isAlready4K(width: actualW, height: actualH)
-                if let rebuilt = createProcessorConfiguration(
-                    width: actualW,
-                    height: actualH,
+            if actualW >= 2, actualH >= 2, (actualW != state.sourceWidth || actualH != state.sourceHeight) {
+                logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(state.sourceWidth)×\(state.sourceHeight) 不一致，重新规划光流候选")
+                state.sourceWidth = actualW
+                state.sourceHeight = actualH
+                let rebuiltSpatial2x = state.requestedSpatial2x && !SuperResolutionPolicy.isAlready4K(width: actualW, height: actualH)
+                let newPlan = buildCandidatePlanForDevice(
+                    sourceWidth: actualW,
+                    sourceHeight: actualH,
                     requestedSpatial2x: rebuiltSpatial2x
-                ) {
-                    state.processor.endSession()
-                    let nextProcessor = VTFrameProcessor()
-                    try nextProcessor.startSession(configuration: rebuilt.configuration)
-                    state.processor = nextProcessor
-                    state.configuration = rebuilt.configuration
-                    state.activeWidth = actualW
-                    state.activeHeight = actualH
-                    state.activeSpatial2x = rebuilt.effectiveSpatial2x
-                    state.sourceNormPool = try? makeSourceNormalizationPool(
-                        configuration: state.configuration,
-                        width: state.activeWidth,
-                        height: state.activeHeight,
-                        pixelFormat: state.pixelFormat
-                    )
-                    state.destPool = try makeDestinationPool(
-                        configuration: state.configuration,
-                        fallbackWidth: state.activeSpatial2x ? state.activeWidth * 2 : state.activeWidth,
-                        fallbackHeight: state.activeSpatial2x ? state.activeHeight * 2 : state.activeHeight,
-                        fallbackFormat: state.pixelFormat
-                    )
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.enableSpatial2xUpscale = rebuilt.effectiveSpatial2x
+                )
+                if let firstNew = newPlan.first, firstNew != state.activeCandidate {
+                    if let rebuilt = activateCandidate(
+                        in: newPlan,
+                        startingAt: 0,
+                        prefer10Bit: state.prefer10Bit
+                    ) {
+                        state.candidates = newPlan
+                        applyActivatedSession(rebuilt, to: state, token: token, reason: "实测尺寸重规划")
                     }
+                } else {
+                    state.forceNormalizeSource = state.forceNormalizeSource || (actualW != state.activeWidth || actualH != state.activeHeight)
                 }
             }
         }
 
         let workingBuffer = normalizeSourceBufferIfNeeded(
             currentBuffer,
+            targetWidth: state.activeWidth,
+            targetHeight: state.activeHeight,
             targetPixelFormat: state.pixelFormat,
             forceNormalize: state.forceNormalizeSource,
             transferSession: state.sourceTransferSession,
@@ -1959,6 +2336,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         let behindAudioClock = state.didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.18)
         if behindAudioClock {
+            state.frcNeedsRandomSubmission = true
             if !state.didLogCatchUp {
                 state.didLogCatchUp = true
                 logAsync("[ane][perf] 光流处理落后时钟，临时跳过部分帧插帧以保持音画同步")
@@ -1966,7 +2344,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             Task { @MainActor [weak self] in
                 self?.skippedInterpolationCount += 1
             }
-        } else if let prevBuf = state.previousBuffer,
+        } else if !state.interpolationExhausted,
+                  let prevBuf = state.previousBuffer,
                   state.previousPTS.isValid,
                   currentPTS > state.previousPTS,
                   Self.isValidInterpolationDelta(currentPTS.seconds - state.previousPTS.seconds) {
@@ -1978,16 +2357,40 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 if poolStatus == kCVReturnSuccess, let destBuf = destBufOpt {
                     let midSeconds = (state.previousPTS.seconds + currentPTS.seconds) * 0.5
                     let midPTS = CMTime(seconds: midSeconds, preferredTimescale: 600)
-                    if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS),
-                       let params = VTLowLatencyFrameInterpolationParameters(
-                           sourceFrame: currFrame,
-                           previousFrame: prevFrame,
-                           interpolationPhase: [0.5],
-                           destinationFrames: [destFrame]
-                       ) {
+                    if let destFrame = VTFrameProcessorFrame(buffer: destBuf, presentationTimeStamp: midPTS) {
                         do {
                             let processStart = CACurrentMediaTime()
-                            _ = try await state.processor.process(parameters: params)
+                            switch state.configuration {
+                            case .lowLatency:
+                                guard let params = VTLowLatencyFrameInterpolationParameters(
+                                    sourceFrame: currFrame,
+                                    previousFrame: prevFrame,
+                                    interpolationPhase: [0.5],
+                                    destinationFrames: [destFrame]
+                                ) else {
+                                    throw NSError(domain: "GlassMPV.OpticalFlow", code: -301, userInfo: [
+                                        NSLocalizedDescriptionKey: "VTLowLatencyFrameInterpolationParameters 初始化返回 nil"
+                                    ])
+                                }
+                                _ = try await state.processor.process(parameters: params)
+                            case .frameRateConversion:
+                                let submissionMode: VTFrameRateConversionParameters.SubmissionMode = state.frcNeedsRandomSubmission ? .random : .sequential
+                                guard let params = VTFrameRateConversionParameters(
+                                    sourceFrame: prevFrame,
+                                    nextFrame: currFrame,
+                                    opticalFlow: nil,
+                                    interpolationPhase: [0.5],
+                                    submissionMode: submissionMode,
+                                    destinationFrames: [destFrame]
+                                ) else {
+                                    throw NSError(domain: "GlassMPV.OpticalFlow", code: -302, userInfo: [
+                                        NSLocalizedDescriptionKey: "VTFrameRateConversionParameters 初始化返回 nil"
+                                    ])
+                                }
+                                _ = try await state.processor.process(parameters: params)
+                                state.frcNeedsRandomSubmission = false
+                            }
+
                             let elapsedMs = (CACurrentMediaTime() - processStart) * 1000.0
                             state.totalInterpolationMs += elapsedMs
                             CVBufferPropagateAttachments(workingBuffer, destBuf)
@@ -1996,7 +2399,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                             state.localConsecutiveFailures = 0
                             let avgMs = state.totalInterpolationMs / Double(state.localSuccessCount)
                             if state.localSuccessCount == 1 {
-                                logAsync("[ane] 首帧光流补帧成功（\(state.activeWidth)×\(state.activeHeight), 耗时 \(String(format: "%.1f", elapsedMs))ms）")
+                                logAsync("[ane] 首帧光流补帧成功（\(state.activeCandidate.displayLabel), 耗时 \(String(format: "%.1f", elapsedMs))ms）")
                             }
                             Task { @MainActor [weak self] in
                                 guard let self else { return }
@@ -2004,28 +2407,71 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                 self.averageInterpolationMs = avgMs
                             }
                         } catch {
-                            state.localConsecutiveFailures += 1
                             let detailed = Self.formatDetailedError(error)
-                            if !state.forceNormalizeSource && state.localSuccessCount == 0 && state.sourceNormPool != nil {
-                                state.forceNormalizeSource = true
-                                logAsync("[ane][warn] 检测到源帧属性不匹配，自动启用源帧标准化池重试: \(detailed)")
+                            if state.localSuccessCount == 0 {
+                                if !state.forceNormalizeSource && !state.didRetryWithNormalizationOnCurrentCandidate && state.sourceNormPool != nil {
+                                    state.forceNormalizeSource = true
+                                    state.didRetryWithNormalizationOnCurrentCandidate = true
+                                    state.frcNeedsRandomSubmission = true
+                                    state.localConsecutiveFailures += 1
+                                    logAsync("[ane][warn] 候选 \(state.activeCandidate.displayLabel) 首帧异常，自动启用源帧标准化池重试: \(detailed)")
+                                    recordInterpolationFailure(
+                                        "process 异常(标准化重试): \(detailed)",
+                                        consecutiveFailures: state.localConsecutiveFailures,
+                                        totalSuccesses: state.localSuccessCount,
+                                        suppressErrorBanner: true
+                                    )
+                                } else if let nextActivated = activateCandidate(
+                                    in: state.candidates,
+                                    startingAt: state.candidateIndex + 1,
+                                    prefer10Bit: state.prefer10Bit
+                                ) {
+                                    logAsync("[ane][fallback] 候选 \(state.activeCandidate.displayLabel) 运行期失败（\(detailed)），自动切换至 \(nextActivated.candidate.displayLabel)")
+                                    applyActivatedSession(nextActivated, to: state, token: token, reason: "运行期自愈")
+                                    recordInterpolationFailure(
+                                        "切换候选自愈(\(nextActivated.candidate.displayLabel)): \(detailed)",
+                                        consecutiveFailures: 1,
+                                        totalSuccesses: state.localSuccessCount,
+                                        suppressErrorBanner: true
+                                    )
+                                } else {
+                                    state.interpolationExhausted = true
+                                    state.localConsecutiveFailures += 1
+                                    logAsync("[ane][error] 全部 \(state.candidates.count) 个光流候选均失败，已熔断降级为原帧硬解直通: \(detailed)")
+                                    Task { @MainActor [weak self] in
+                                        guard let self, self.isTokenValid(token) else { return }
+                                        self.activeBackendLabel = "已降级直通"
+                                        self.failedInterpolationCount += 1
+                                        self.lastInterpolationError = detailed
+                                        self.isLoadingPipeline = false
+                                        self.pipelineStatusText = ""
+                                        if self.errorMessage == nil {
+                                            self.errorMessage = "ANE 光流全档位不可用（\(detailed)），可一键切回 MPV 超分核。"
+                                        }
+                                    }
+                                }
+                            } else {
+                                state.localConsecutiveFailures += 1
+                                state.frcNeedsRandomSubmission = true
+                                recordInterpolationFailure(
+                                    "process 异常: \(detailed)",
+                                    consecutiveFailures: state.localConsecutiveFailures,
+                                    totalSuccesses: state.localSuccessCount
+                                )
                             }
-                            recordInterpolationFailure(
-                                "process 异常: \(detailed)",
-                                consecutiveFailures: state.localConsecutiveFailures,
-                                totalSuccesses: state.localSuccessCount
-                            )
                         }
                     } else {
                         state.localConsecutiveFailures += 1
+                        state.frcNeedsRandomSubmission = true
                         recordInterpolationFailure(
-                            "VTLowLatencyFrameInterpolationParameters/destFrame 初始化返回 nil",
+                            "VTFrameProcessorFrame(destFrame) 初始化返回 nil",
                             consecutiveFailures: state.localConsecutiveFailures,
                             totalSuccesses: state.localSuccessCount
                         )
                     }
                 } else {
                     state.localConsecutiveFailures += 1
+                    state.frcNeedsRandomSubmission = true
                     recordInterpolationFailure(
                         "CVPixelBufferPoolCreatePixelBuffer 失败 (\(poolStatus))",
                         consecutiveFailures: state.localConsecutiveFailures,
@@ -2034,6 +2480,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             } else {
                 state.localConsecutiveFailures += 1
+                state.frcNeedsRandomSubmission = true
                 recordInterpolationFailure(
                     "VTFrameProcessorFrame(prev/curr) 初始化返回 nil",
                     consecutiveFailures: state.localConsecutiveFailures,
@@ -2042,9 +2489,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
         }
 
-        let finalSourceBuffer = state.forceNormalizeSource
+        let needsAlignToActiveCandidate = state.forceNormalizeSource
+            || CVPixelBufferGetWidth(workingBuffer) != state.activeWidth
+            || CVPixelBufferGetHeight(workingBuffer) != state.activeHeight
+            || CVPixelBufferGetPixelFormatType(workingBuffer) != state.pixelFormat
+        let finalSourceBuffer = needsAlignToActiveCandidate
             ? normalizeSourceBufferIfNeeded(
                 currentBuffer,
+                targetWidth: state.activeWidth,
+                targetHeight: state.activeHeight,
                 targetPixelFormat: state.pixelFormat,
                 forceNormalize: true,
                 transferSession: state.sourceTransferSession,
@@ -2076,7 +2529,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     private func makeSourceNormalizationPool(
-        configuration: VTLowLatencyFrameInterpolationConfiguration,
+        configuration: ActiveOpticalFlowConfiguration,
         width: Int,
         height: Int,
         pixelFormat: OSType
@@ -2100,8 +2553,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         } else {
             attrs[kCVPixelBufferPixelFormatTypeKey as String] = pixelFormat
         }
-        attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
-        attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+        if attrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+            attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+        }
+        if attrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+            attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+        }
 
         var pool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
@@ -2115,14 +2572,22 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     private func normalizeSourceBufferIfNeeded(
         _ buffer: CVPixelBuffer,
+        targetWidth: Int,
+        targetHeight: Int,
         targetPixelFormat: OSType,
         forceNormalize: Bool,
         transferSession: VTPixelTransferSession?,
         pool: CVPixelBufferPool?
     ) -> CVPixelBuffer {
+        let currentW = CVPixelBufferGetWidth(buffer)
+        let currentH = CVPixelBufferGetHeight(buffer)
         let currentFmt = CVPixelBufferGetPixelFormatType(buffer)
         let hasIOSurface = CVPixelBufferGetIOSurface(buffer) != nil
-        if !forceNormalize && currentFmt == targetPixelFormat && hasIOSurface {
+        if !forceNormalize
+            && currentW == targetWidth
+            && currentH == targetHeight
+            && currentFmt == targetPixelFormat
+            && hasIOSurface {
             return buffer
         }
         guard let transferSession, let pool else {
@@ -2142,7 +2607,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     private func makeDestinationPool(
-        configuration: VTLowLatencyFrameInterpolationConfiguration,
+        configuration: ActiveOpticalFlowConfiguration,
         fallbackWidth: Int,
         fallbackHeight: Int,
         fallbackFormat: OSType
@@ -2171,8 +2636,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         } else {
             attrs[kCVPixelBufferPixelFormatTypeKey as String] = fallbackFormat
         }
-        attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
-        attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+        if attrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+            attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+        }
+        if attrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+            attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+        }
 
         var pool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)

@@ -257,6 +257,16 @@ def test_swift_sources_non_empty_and_balanced():
     assert "createDecompressionSessionWithFallback" in vt_engine
     assert "decoderSpecification:" in vt_engine
     assert "videoDecoderSpecification:" not in vt_engine
+    assert "OpticalFlowBackendKind" in vt_engine
+    assert "OpticalFlowCandidate" in vt_engine
+    assert "OpticalFlowResolutionPlanner" in vt_engine
+    assert "ActiveOpticalFlowConfiguration" in vt_engine
+    assert "VTFrameRateConversionConfiguration" in vt_engine
+    assert "VTFrameRateConversionParameters" in vt_engine
+    assert "activeBackendLabel" in vt_engine
+    assert "activateCandidate" in vt_engine
+    assert "queryDimensionBounds" in vt_engine
+    assert "interpolationExhausted" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
@@ -280,6 +290,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "releaseMediaForExternalEngine()" in player_view
     assert "startRuntimeTelemetrySampling()" in player_view
     assert "captureRuntimeTelemetrySample()" in player_view
+    assert "activeBackendLabel" in player_view
+
+    swift_test_src = swift_test_file.read_text(encoding="utf-8")
+    assert "testOpticalFlowResolutionPlannerAndCandidateFallback" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

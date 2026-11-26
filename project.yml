@@ -28,7 +28,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.glassmpv.player
-        MARKETING_VERSION: "2026.11.25"
+        MARKETING_VERSION: "2026.11.26"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Sources/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"

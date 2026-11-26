@@ -747,4 +747,112 @@ final class GlassMPVTests: XCTestCase {
         let extracted = HEVCFormatNormalizer.extractHEVCParameterSets(fromLengthPrefixed: lengthPrefixed, nalLengthSize: 4)
         XCTAssertEqual(extracted, [vps, sps, pps])
     }
+
+    func testOpticalFlowResolutionPlannerAndCandidateFallback() throws {
+        XCTAssertEqual(OpticalFlowResolutionPlanner.alignEven(63), 64)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.alignEven(1481), 1480)
+
+        let fitted2960 = OpticalFlowResolutionPlanner.fitProportionally(
+            width: 2960,
+            height: 2160,
+            maxLongSide: 1920,
+            maxShortSide: 1080
+        )
+        XCTAssertEqual(fitted2960.width, 1480)
+        XCTAssertEqual(fitted2960.height, 1080)
+
+        let fitted4K = OpticalFlowResolutionPlanner.fitProportionally(
+            width: 3840,
+            height: 2160,
+            maxLongSide: 1920,
+            maxShortSide: 1080
+        )
+        XCTAssertEqual(fitted4K.width, 1920)
+        XCTAssertEqual(fitted4K.height, 1080)
+
+        let fittedPortrait = OpticalFlowResolutionPlanner.fitProportionally(
+            width: 2160,
+            height: 3840,
+            maxLongSide: 1920,
+            maxShortSide: 1080
+        )
+        XCTAssertEqual(fittedPortrait.width, 1080)
+        XCTAssertEqual(fittedPortrait.height, 1920)
+
+        let fitted1080 = OpticalFlowResolutionPlanner.fitProportionally(
+            width: 1920,
+            height: 1080,
+            maxLongSide: 1920,
+            maxShortSide: 1080
+        )
+        XCTAssertEqual(fitted1080.width, 1920)
+        XCTAssertEqual(fitted1080.height, 1080)
+
+        let bounds = OpticalFlowResolutionPlanner.DimensionBounds(
+            minWidth: 512,
+            minHeight: 512,
+            maxWidth: 1920,
+            maxHeight: 1080
+        )
+        let clampedLarge = try XCTUnwrap(OpticalFlowResolutionPlanner.clampToBounds(width: 2960, height: 2160, bounds: bounds))
+        XCTAssertEqual(clampedLarge.width, 1480)
+        XCTAssertEqual(clampedLarge.height, 1080)
+        XCTAssertNil(OpticalFlowResolutionPlanner.clampToBounds(width: 480, height: 360, bounds: bounds))
+
+        let plan4K = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 2960,
+            sourceHeight: 2160,
+            requestedSpatial2x: true,
+            lowLatencySupported: true,
+            frcSupported: true
+        )
+        XCTAssertFalse(plan4K.contains(where: { $0.spatial2x }), "4K 片源应禁止 spatial2x")
+        XCTAssertEqual(plan4K.first, OpticalFlowCandidate(backend: .lowLatency, width: 1480, height: 1080, spatial2x: false))
+        XCTAssertEqual(plan4K.dropFirst().first, OpticalFlowCandidate(backend: .frameRateConversion, width: 1480, height: 1080, spatial2x: false))
+        XCTAssertTrue(plan4K.contains(OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false)))
+        XCTAssertTrue(plan4K.contains(OpticalFlowCandidate(backend: .frameRateConversion, width: 740, height: 540, spatial2x: false)))
+        XCTAssertEqual(Set(plan4K).count, plan4K.count)
+
+        let plan1080Spatial = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            requestedSpatial2x: true,
+            lowLatencySupported: true,
+            frcSupported: true
+        )
+        XCTAssertEqual(plan1080Spatial.first, OpticalFlowCandidate(backend: .lowLatency, width: 1920, height: 1080, spatial2x: true))
+        XCTAssertTrue(plan1080Spatial.contains(OpticalFlowCandidate(backend: .lowLatency, width: 1920, height: 1080, spatial2x: false)))
+
+        let planFRCOnly = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            requestedSpatial2x: true,
+            lowLatencySupported: false,
+            frcSupported: true
+        )
+        XCTAssertTrue(planFRCOnly.allSatisfy { $0.backend == .frameRateConversion && !$0.spatial2x })
+        XCTAssertEqual(planFRCOnly.count, 3)
+
+        let planBounded = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            requestedSpatial2x: false,
+            lowLatencySupported: true,
+            frcSupported: true,
+            lowLatencyBounds: OpticalFlowResolutionPlanner.DimensionBounds(minWidth: 0, minHeight: 0, maxWidth: 1280, maxHeight: 720),
+            frcBounds: OpticalFlowResolutionPlanner.DimensionBounds(minWidth: 0, minHeight: 0, maxWidth: 1920, maxHeight: 1080)
+        )
+        XCTAssertFalse(planBounded.contains(OpticalFlowCandidate(backend: .lowLatency, width: 1920, height: 1080, spatial2x: false)))
+        XCTAssertTrue(planBounded.contains(OpticalFlowCandidate(backend: .lowLatency, width: 1280, height: 720, spatial2x: false)))
+        XCTAssertTrue(planBounded.contains(OpticalFlowCandidate(backend: .frameRateConversion, width: 1920, height: 1080, spatial2x: false)))
+
+        let planEmpty = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            requestedSpatial2x: true,
+            lowLatencySupported: false,
+            frcSupported: false
+        )
+        XCTAssertTrue(planEmpty.isEmpty)
+    }
 }

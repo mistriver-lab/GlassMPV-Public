@@ -2,6 +2,14 @@
 
 本项目遵循日期时间版本规范（东八区 `YYYY.MM.DD` + `YYYYMMDDHHMM`）。
 
+## [v2026.11.26] - 2026-11-26
+
+### 修复与增强 (Fixed & Enhanced)
+- **根治 ANE 4K 光流 `-19730` (`Processor is not initialized`) 与双后端自适应自愈 (`VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 新增跨平台 `OpticalFlowResolutionPlanner` 与 `OpticalFlowCandidate`，自动将 4K 片源（如 `2960×2160`、`3840×2160`）等比偶对齐降档至 `1080p` / `720p` / `540p`，并结合 `VTFrameProcessorConfiguration.minimumDimensions`/`maximumDimensions` 边界过滤。
+  - 打通 `VTLowLatencyFrameInterpolationConfiguration` 与 `VTFrameRateConversionConfiguration`（`VTFrameRateConversionParameters` `.sequential`/`.random` 提交模式）双后端协商及 `ActiveOpticalFlowConfiguration` 状态机；修复 `CVPixelBufferPool` 池属性不覆盖 `IOSurfaceProperties`，并升级 `normalizeSourceBufferIfNeeded` 支持尺寸不匹配时硬件缩放对齐。
+  - 新增首帧 `-19730` 运行期自动自愈链路（先启用源帧标准化池重试，再逐级降档并切换 FRC 后端，全部耗尽后熔断直通且防刷屏节流日志），并在 HUD、真机 5 项体检与诊断中心实时透出 `activeBackendLabel`。
+
 ## [v2026.11.25] - 2026-11-25
 
 ### 变更与修复 (Changed & Fixed)
