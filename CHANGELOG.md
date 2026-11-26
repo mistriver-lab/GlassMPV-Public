@@ -110,7 +110,7 @@
 
 - [x] 核验 CoreText 弹窗拦截与 4K RIFE 优化发布：`CTFontDownloadSuppressor.m` 已在 Release 二进制静态定义 `_CTFontDescriptorMatchFontDescriptorsWithProgressHandler`，5 轮模拟器冒烟无崩溃，`dist/GlassMPV-v1.2.0-b24-unsigned.ipa` 校验通过。
 
-- [x] **本轮已实证排查结论（来源：`C:\Users\21920\Documents\xwechat_files\wxid_8mhh4tfklkan22_9a3a\msg\file\2026-11\GlassMPV-Diagnostics 2.txt` + `CinePlayer-repo` 源码与 IPA 二进制核验）**：
+- [x] **本轮已实证排查结论（来源：`GlassMPV-Diagnostics 2.txt`（实机导出日志） + `CinePlayer-repo` 源码与 IPA 二进制核验）**：
   1. **1080p 杜比视界全部增强 `inFrames=0` 不生效**：片源 `hevc 1920x1080 @ 30.00fps 10bit Dolby Vision`（`iPhone16,2` / iOS `27.0.1` / `thermal=serious`）。`CinePlayerSDK` 架构对杜比视界默认走 AVFoundation `AVPlayer` 原生直通（见 `README-zh.md:36`），`FrameCallbackCenter` 跳过 `isDovi` 回调，故 `metalFX`/`systemML-fi`/`opticalFlow` 即使 `warmupReady` 也全程 `inFrames=0`。已核验 `CinePlayerConfig.dynamicRange`（`DynamicRange?` 含 `.sdr`）可写、`controller.currentPlaybackTime` 可取，可通过「转 SDR 兼容增强」按当前进度 `controller.replace(config:)` 重载为 SDR 解锁全链路增强。
   2. **功能被置灰禁用**：`PlayerEnhancementModel.swift:786` `rifeSectionVisible = !isHDR && ...` 禁用 HDR/DV 的 RIFE；`:842` `width * height < 1920 * 1080` 严格小于导致 1080p 直接禁用 Anime4K（需改为 `<=`）。
   3. **策略切换 6 连击重置 Bug**：`applyMutualExclusion(for:)` 修改多个 `@Published` 属性未抑制 `notifyRuntimeConfigChanged`，且 `SiderEnhancementView` 二次赋值子开关，导致每次切策略同一毫秒触发 5–6 次 `makeFrameCallbackConfiguration` 与 `EnhancementTelemetryCollector.reset`。
@@ -125,10 +125,12 @@
 
 - [x] **已验证交付（`fe9fdf4` / CI Run `45558978591`）**：修复 `VTOpticalFlowEngine.swift` Swift 6 `noasync` 锁与 `nonisolated` 并发编译，CI 全绿（`10m17s`，`GlassMPVTests` 15/15 PASS），产出并校验 `dist/GlassMPV-2026.11.25-202611251421-unsigned.ipa`。
 
-- [x] **最新实机日志（[GlassMPV-Log-20261125-153115.txt](file:///C:/Users/21920/Documents/xwechat_files/wxid_8mhh4tfklkan22_9a3a/msg/file/2026-11/GlassMPV-Log-20261125-153115.txt)）双根因定位结论**：
+- [x] **最新实机日志（`GlassMPV-Log-20261125-153115.txt`）双根因定位结论**：
   1. **MPV 120Hz 模式**：实机探针 `sync_active=yes video_sync=display-resample interp=yes tscale=linear vsync_ratio=5.00 disp_fps=120.0Hz est_disp=119.5Hz` 已实际运行，但 `libmpv` 的 `tscale` 属于无运动矢量时域帧混合（去 3:2 抖动），24fps 在 120Hz（精确 5 倍整数倍）下无运动补偿光流果冻感且 HUD `estimated-vf-fps` 恒报 `24.0`，旧标签“MPV补帧生效”造成误解。
   2. **ANE 光流真补帧核**：`VTFrameProcessor` 已为 `2960×2160` 成功启动，但 `AVAssetReader` 4 个输出档位均报 `-11833 / NSOSStatusErrorDomain(-12906)`；原因是该 HEVC MP4 容器标签为 `hev1`（苹果 `AVAssetReader` 要求 `hvc1`），须通过 `outputSettings: nil` 压缩透传 + `HEVCFormatNormalizer`（`hev1→hvc1`）+ `VTDecompressionSession` + `OpticalFlowPTSReorderBuffer` 硬解兜底。
 
 - [x] **当前代码改动进度（工作区未提交 WIP，新窗可直接接续，无需从头重读文件）**：
 
 - [x] 修复 `VTOpticalFlowEngine.swift` `VTDecompressionSessionCreate` 参数标签与 `test_project_integrity.py` 断言（`b4676df`）；CI Run `45588353144` 全绿出包并交付微信「文件传输助手」。
+
+- [x] 修复 `OpticalFlowCandidate` / `OpticalFlowBackendKind` `Hashable`（`42a9739`）与 `testMPVUIControllerPlaybackWithWindowHost` 慢跑器轮询窗口放宽至 30s（`1014b2b`），CI Run `45737880768` 全绿出包并交付微信「文件传输助手」。

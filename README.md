@@ -23,9 +23,9 @@
 
 ### 第一步：上传代码到 GitHub
 1. 在 GitHub 创建一个新仓库（例如 `GlassMPV`，公开或私有均可）。
-2. 将本文件夹 `C:\Users\21920\Desktop\GlassMPV` 的全部内容推送到该仓库的 `main` 分支：
+2. 将本文件夹 `<项目根目录>` 的全部内容推送到该仓库的 `main` 分支：
    ```powershell
-   cd C:\Users\21920\Desktop\GlassMPV
+   cd <项目根目录>
    git init
    git add .
    git commit -m "init GlassMPV iOS project"

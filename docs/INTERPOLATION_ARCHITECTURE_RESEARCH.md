@@ -1,7 +1,7 @@
 # 插帧方案深度调研与 iOS 端稳定架构选型报告
 
 > 调研来源：
-> 1. 桌面端实证样本：`C:\Users\21920\Downloads\mpvnet-20231122.zip`（`96,051,643` bytes，183 个文件，含 `portable_config`、`k7sfunc.py` 与 `vapoursynth64` 插件集）
+> 1. 桌面端实证样本：`mpvnet-20231122.zip`（`96,051,643` bytes，183 个文件，含 `portable_config`、`k7sfunc.py` 与 `vapoursynth64` 插件集）
 > 2. GitHub 开源生态与 Apple 官方 SDK：`LePips/MPVUI`（0.11.0）、`mpvkit/MPVKit`、`Practical-RIFE` / CoreML 方案、Apple `VideoToolbox`（iOS 26 `VTFrameProcessor`）与 `MetalFX`（iOS 26 `MTLFXFrameInterpolator`）
 
 ---

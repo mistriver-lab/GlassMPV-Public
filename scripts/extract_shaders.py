@@ -3,7 +3,7 @@
 from pathlib import Path
 import zipfile
 
-ZIP_PATH = Path(r"C:\Users\21920\Downloads\mpvnet-20231122.zip")
+ZIP_PATH = Path.home() / "Downloads" / "mpvnet-20231122.zip"
 OUT_DIR = Path(__file__).resolve().parent.parent / "Resources" / "Shaders"
 SHADER_PREFIX = "mpvnet/portable_config/shaders/"
 
