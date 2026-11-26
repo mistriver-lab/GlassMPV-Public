@@ -1,4 +1,50 @@
+import Darwin
 import Foundation
+
+/// 运行期硬件型号、系统版本与内存占用采样器（Swift 6 并发安全）
+enum DeviceDiagnosticsSampler: Sendable {
+    static func currentMemoryFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                task_info(task_self_trap(), task_flavor_t(TASK_VM_INFO), intPtr, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / (1024.0 * 1024.0)
+    }
+
+    static func deviceHardwareModel() -> String {
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        let count = MemoryLayout.size(ofValue: sysinfo.machine)
+        return withUnsafeBytes(of: &sysinfo.machine) { rawBuffer in
+            let bytes = rawBuffer.prefix(count).prefix { $0 != 0 }
+            let model = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            return model.isEmpty ? "Unknown" : model
+        }
+    }
+
+    static func deviceSummaryLine(maxScreenFPS: Int? = nil) -> String {
+        let model = deviceHardwareModel()
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let cores = ProcessInfo.processInfo.processorCount
+        let totalRAMGB = Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0 * 1024.0)
+        let memMB = currentMemoryFootprintMB()
+        var parts = [
+            model,
+            osVersion,
+            "\(cores) Cores",
+            String(format: "RAM=%.1fGB", totalRAMGB),
+            String(format: "AppMem=%.1fMB", memMB)
+        ]
+        if let maxScreenFPS, maxScreenFPS > 0 {
+            parts.append("ScreenMax=\(maxScreenFPS)Hz")
+        }
+        return parts.joined(separator: " | ")
+    }
+}
 
 /// 设备热状态分级（映射 ProcessInfo.ThermalState）
 enum ThermalLevel: String, Equatable, Sendable {
@@ -195,8 +241,21 @@ enum SuperResolutionPolicy: Sendable {
 
     static func disabledReason(width: Int, height: Int) -> String? {
         guard isAlready4K(width: width, height: height) else { return nil }
-        return "片源已达 4K（\(width)×\(height)），自动禁用超分以节省算力与功耗"
+        return "片源已达 4K（\(width)×\(height)），自动禁用放大类超分（保留 KrigBilateral / Adaptive Sharpen 可用）"
     }
+}
+
+/// 停播返回主界面前缓存的会话诊断摘要，防止导出报告关键指标归零
+struct SessionDiagnosticSummary: Equatable, Sendable {
+    let capturedAt: Date
+    let engineName: String
+    let playbackState: String
+    let resolution: String
+    let fpsSummary: String
+    let decoderSummary: String
+    let is4KGated: Bool
+    let telemetrySummary: [String]
+    let mediaFilename: String
 }
 
 /// libmpv 实时属性探针快照（由 expand-properties print-text 采得）
@@ -440,6 +499,10 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
     let anePresented: Int
     let aneAvgMs: Double
     let aneTargetFPS: String
+    let aneBackend: String
+    let aneQueueDepth: Int
+    let avDeltaMs: Double?
+    let memoryFootprintMB: Double
     let verdictLabel: String
     let thermalLevel: ThermalLevel
 
@@ -465,6 +528,10 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         anePresented: Int,
         aneAvgMs: Double,
         aneTargetFPS: String = "",
+        aneBackend: String = "",
+        aneQueueDepth: Int = 0,
+        avDeltaMs: Double? = nil,
+        memoryFootprintMB: Double = 0,
         verdictLabel: String,
         thermalLevel: ThermalLevel
     ) {
@@ -489,6 +556,10 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         self.anePresented = anePresented
         self.aneAvgMs = aneAvgMs
         self.aneTargetFPS = aneTargetFPS
+        self.aneBackend = aneBackend
+        self.aneQueueDepth = aneQueueDepth
+        self.avDeltaMs = avDeltaMs
+        self.memoryFootprintMB = memoryFootprintMB
         self.verdictLabel = verdictLabel
         self.thermalLevel = thermalLevel
     }
@@ -498,8 +569,9 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         if let timeString {
             resolvedTime = timeString
         } else {
-            let comps = Calendar.current.dateComponents([.hour, .minute, .second], from: timestamp)
-            resolvedTime = String(format: "%02d:%02d:%02d", comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0)
+            let comps = Calendar.current.dateComponents([.hour, .minute, .second, .nanosecond], from: timestamp)
+            let ms = max(0, min(999, (comps.nanosecond ?? 0) / 1_000_000))
+            resolvedTime = String(format: "%02d:%02d:%02d.%03d", comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0, ms)
         }
 
         let resText = (width > 0 && height > 0) ? "\(width)x\(height)" : "--"
@@ -508,12 +580,16 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
         let dispText = displayFPS > 0 ? String(format: "%.1fHz", displayFPS) : "--"
         let pmText = proMotionFPS > 0 ? String(format: "%.1fHz", proMotionFPS) : "--"
         let timeText = String(format: "%.1fs", mediaTime)
+        let memSeg = memoryFootprintMB > 0 ? String(format: " mem=%.1fMB", memoryFootprintMB) : ""
         let isANE = engine.localizedCaseInsensitiveContains("ANE") || engine.localizedCaseInsensitiveContains("光流")
 
         if isANE {
             let avgText = String(format: "%.1fms", aneAvgMs)
             let targetSeg = aneTargetFPS.isEmpty ? "" : " target=\(aneTargetFPS)"
-            return "[\(resolvedTime)] [ANE] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText)\(targetSeg) drop=\(droppedFrames) ane(interp=\(aneInterpolated),skip=\(aneSkipped),fail=\(aneFailed),pres=\(anePresented),avg=\(avgText)) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
+            let backendSeg = aneBackend.isEmpty ? "" : " backend=\(aneBackend)"
+            let queueSeg = " q=\(aneQueueDepth)"
+            let avDeltaSeg = avDeltaMs.map { String(format: " avDelta=%+.1fms", $0) } ?? ""
+            return "[\(resolvedTime)] [ANE] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText)\(targetSeg)\(backendSeg)\(queueSeg)\(avDeltaSeg) drop=\(droppedFrames) ane(interp=\(aneInterpolated),skip=\(aneSkipped),fail=\(aneFailed),pres=\(anePresented),avg=\(avgText)) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)\(memSeg)"
         } else {
             let probeText: String
             if let mpvProbe {
@@ -525,7 +601,7 @@ struct RuntimeTelemetrySample: Identifiable, Equatable, Sendable {
             } else {
                 probeText = "probe(none)"
             }
-            return "[\(resolvedTime)] [MPV] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText) disp=\(dispText) pm=\(pmText) drop=\(droppedFrames) mis=\(mistimedFrames) del=\(delayedFrames) \(probeText) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)"
+            return "[\(resolvedTime)] [MPV] \(playbackState) t=\(timeText) \(resText) fps=\(srcText)->\(outText) disp=\(dispText) pm=\(pmText) drop=\(droppedFrames) mis=\(mistimedFrames) del=\(delayedFrames) \(probeText) verdict=\(verdictLabel) therm=\(thermalLevel.rawValue)\(memSeg)"
         }
     }
 }

@@ -26,6 +26,10 @@ enum AppReleaseInfo {
             version: "v2026.11.26",
             date: "2026-11-26",
             highlights: [
+                "修复 ANE 发热与降档风暴：按 Apple 2^x-1 指数规则传入 VTLowLatencyFrameInterpolationConfiguration，优先选择原生 4:2:0/32-bit 像素格式替代 51MB RGhA，VTDecompressionSession 强制原生硬解并消除双次 VTPixelTransferSession 拷贝",
+                "新增片源 AVAssetReader 透传缓存（跳过重复 -12906 探测）、暂停挂起 CADisplayLink 与按目标帧率动态设置 preferredFrameRateRange、保留降档冷却期 + 时钟追平护栏及 ThermalState .serious/.critical 主动限档",
+                "精细化 4K 超分门控与开关状态保存：4K 下自动复位预设并放行 KrigBilateral / Adaptive Sharpen，修复 MPV ↔ ANE 切换覆盖 .off 及暂停态误起播",
+                "升级诊断日志全链路：保留退回主界面前的 lastSessionSummary 防归零，新增 [ui-switch] 审计流、设备型号/内存/队列深度/音画差 Timeline 指标与 HH:mm:ss.SSS 毫秒级 500 条环形缓冲",
                 "新增 ANE 光流核多档位目标帧率（2× / 60 / 72 / 96 / 120fps）：支持 2 的幂倍率优先 LowLatency 与非 2 的幂（如 24→60/72/120）优先 FRC 双后端协同",
                 "新增 OpticalFlowPhaseScheduler（整倍等分 + 非整倍时间栅格重采样）与单次多缓冲 process 调用，配合动态预缓冲与「先降分辨率后降帧率」算力预算守卫（OpticalFlowBudgetGuard）",
                 "根治 ANE 4K 光流 -19730 失败：新增 OpticalFlowResolutionPlanner 自动将 4K 降档至 1080p/720p/540p 等比偶对齐档位并结合系统维度边界过滤",

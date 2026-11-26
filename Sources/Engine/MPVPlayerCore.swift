@@ -181,9 +181,11 @@ final class MPVPlayerController: ObservableObject {
 
     private static let logTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
+        formatter.dateFormat = "HH:mm:ss.SSS"
         return formatter
     }()
+
+    var on4KSuperResolutionGated: (() -> Void)?
 
     private let taskBag = MPVTaskBag()
     private let proMotionKeeper = ProMotionDisplayLinkKeeper()
@@ -217,9 +219,9 @@ final class MPVPlayerController: ObservableObject {
         startObservingPlayer()
     }
 
-    func load(url: URL) {
+    func load(url: URL, autoPlay: Bool = true) {
         let target = url.isFileURL ? url.path(percentEncoded: false) : url.absoluteString
-        appendLog("[load] 请求播放: \(target)")
+        appendLog("[load] 请求播放: \(target) (autoPlay=\(autoPlay))")
 
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
@@ -255,13 +257,15 @@ final class MPVPlayerController: ObservableObject {
         last4KGateLoggedSize = nil
         lastAppliedReadyGeneration = nil
         isInitialized = true
-        playbackState = "正在加载媒体..."
+        isPaused = !autoPlay
+        playbackState = autoPlay ? "正在加载媒体..." : "正在加载媒体(暂停)..."
 
-        player.load(url, playAutomatically: true)
+        player.load(url, playAutomatically: autoPlay)
         if abs(currentSpeed - 1.0) > 0.001 {
             player.setPlaybackRate(currentSpeed)
         }
         applyInterpolation(currentInterpolation)
+        syncProMotionKeeper()
     }
 
     func togglePlayPause() {
@@ -293,12 +297,28 @@ final class MPVPlayerController: ObservableObject {
 
         if SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight) {
             isSuperResolutionGatedBy4K = true
-            activeShaderCount = 0
-            player.executeCommand("change-list", arguments: ["glsl-shaders", "clr", ""])
+            let filtered = SingleShaderOption.filteredFor4K(preset: preset, extras: extras)
+            let hadBlockedUpscaler = preset.id != ShaderPreset.off.id || filtered.extras.count != extras.count
+            if hadBlockedUpscaler {
+                currentPreset = filtered.preset
+                currentExtras = filtered.extras
+                on4KSuperResolutionGated?()
+            }
+
+            let paths = SingleShaderOption.resolvedShaderPaths(preset: filtered.preset, extras: filtered.extras)
+            activeShaderCount = paths.count
+            if paths.isEmpty {
+                player.executeCommand("change-list", arguments: ["glsl-shaders", "clr", ""])
+            } else {
+                let joined = paths.joined(separator: ":")
+                player.executeCommand("change-list", arguments: ["glsl-shaders", "set", joined])
+                appendLog("[shader] 4K片源仅保留 \(paths.count) 个非放大着色器")
+            }
+
             let currentSize = (videoWidth, videoHeight)
-            if last4KGateLoggedSize.map({ $0 != currentSize }) ?? true {
+            if last4KGateLoggedSize.map({ $0 != currentSize }) ?? true || hadBlockedUpscaler {
                 last4KGateLoggedSize = currentSize
-                let reason = SuperResolutionPolicy.disabledReason(width: videoWidth, height: videoHeight) ?? "片源已达 4K，自动禁用超分"
+                let reason = SuperResolutionPolicy.disabledReason(width: videoWidth, height: videoHeight) ?? "片源已达 4K，自动禁用放大类超分"
                 appendLog("[shader] \(reason)")
             }
             return
@@ -401,8 +421,8 @@ final class MPVPlayerController: ObservableObject {
     func appendLog(_ line: String) {
         let stamp = Self.logTimeFormatter.string(from: Date())
         diagnosticLogs.append("[\(stamp)] \(line)")
-        if diagnosticLogs.count > 120 {
-            diagnosticLogs.removeFirst(diagnosticLogs.count - 120)
+        if diagnosticLogs.count > 500 {
+            diagnosticLogs.removeFirst(diagnosticLogs.count - 500)
         }
     }
 
@@ -669,7 +689,11 @@ final class MPVPlayerController: ObservableObject {
             videoWidth = dims.width
             videoHeight = dims.height
             let is4K = SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight)
-            if is4K != isSuperResolutionGatedBy4K || (is4K && activeShaderCount > 0) {
+            let hasBlockedUpscalersUnder4K = is4K && (
+                currentPreset.id != ShaderPreset.off.id
+                    || currentExtras.contains(where: { SingleShaderOption.isUpscalerOption(id: $0) })
+            )
+            if is4K != isSuperResolutionGatedBy4K || hasBlockedUpscalersUnder4K {
                 applyShaders(preset: currentPreset, extras: currentExtras)
             }
             if currentInterpolation == .mpvSmooth120Hz {

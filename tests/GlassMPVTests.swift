@@ -1006,4 +1006,169 @@ final class GlassMPVTests: XCTestCase {
         )
         XCTAssertTrue(sample.formatLogLine().contains("target=96fps"))
     }
+
+    func testOpticalFlowExponentPixelFormatAndThermalPolicy() {
+        // 1. VTLowLatency 2^x - 1 指数映射
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 1), 1)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 2), 2)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 3), 2)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 4), 3)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 7), 3)
+
+        // 2. 像素格式优先级与原生硬解列表（绝不把 RGhA/RGfA 放进硬解解码输出）
+        let mixed10Supported: [OSType] = [
+            kCVPixelFormatType_64RGBAHalf,
+            kCVPixelFormatType_128RGBAFloat,
+            kCVPixelFormatType_32BGRA,
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ]
+        let chosen10 = OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: mixed10Supported, prefer10Bit: true)
+        XCTAssertEqual(chosen10, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        let chosen8 = OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: mixed10Supported, prefer10Bit: false)
+        XCTAssertEqual(chosen8, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+
+        let heavyOnly: [OSType] = [kCVPixelFormatType_128RGBAFloat, kCVPixelFormatType_64RGBAHalf]
+        XCTAssertEqual(
+            OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: heavyOnly, prefer10Bit: false),
+            kCVPixelFormatType_64RGBAHalf
+        )
+
+        let decodeFormats = OpticalFlowResolutionPlanner.nativeDecodePixelFormats(
+            prefer10Bit: false,
+            preferredPixelFormat: kCVPixelFormatType_64RGBAHalf
+        )
+        XCTAssertFalse(decodeFormats.contains(kCVPixelFormatType_64RGBAHalf))
+        XCTAssertFalse(decodeFormats.contains(kCVPixelFormatType_128RGBAFloat))
+        XCTAssertEqual(decodeFormats.first, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+
+        // 3. 重像素格式队列上限收敛（<= 30）
+        let heavyLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 120.0, isHeavyPixelFormat: true)
+        XCTAssertLessThanOrEqual(heavyLimits.maxQueued, 30)
+        XCTAssertLessThanOrEqual(heavyLimits.prebuffer, 10)
+
+        // 4. CADisplayLink 目标帧率区间与热限档
+        let range48 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: 48.0)
+        XCTAssertEqual(range48.maximum, 60)
+        XCTAssertEqual(range48.preferred, 48)
+        let range120 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: 120.0)
+        XCTAssertEqual(range120.maximum, 120)
+        XCTAssertEqual(range120.preferred, 120)
+
+        XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .nominal))
+        XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .fair))
+        XCTAssertEqual(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .serious), .fps60)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .critical), .x2)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps120, thermalState: .serious), .fps60)
+        XCTAssertNil(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps60, thermalState: .serious))
+        XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps60, thermalState: .critical), .x2)
+    }
+
+    @MainActor
+    func test4KGatingNonUpscalerShadersAndSwitchStatePreservation() {
+        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 2960, height: 2160))
+        XCTAssertTrue(SingleShaderOption.isUpscalerOption(id: "amd_fsr"))
+        XCTAssertFalse(SingleShaderOption.isUpscalerOption(id: "krig_bilateral"))
+        XCTAssertFalse(SingleShaderOption.isUpscalerOption(id: "adaptive_sharpen"))
+
+        let filtered = SingleShaderOption.filteredFor4K(
+            preset: ShaderPreset.allPresets[1],
+            extras: ["amd_fsr", "krig_bilateral", "adaptive_sharpen"]
+        )
+        XCTAssertEqual(filtered.preset.id, ShaderPreset.off.id)
+        XCTAssertEqual(filtered.extras, ["krig_bilateral", "adaptive_sharpen"])
+
+        let coordinator = PlayerCoordinator()
+        defer { coordinator.closeToHome() }
+
+        coordinator.setInterpolation(.off)
+        coordinator.switchEngine(to: .opticalFlow)
+        XCTAssertEqual(coordinator.engineMode, .opticalFlow)
+        XCTAssertEqual(coordinator.interpolationMode, .vtOpticalFlow2x)
+
+        coordinator.switchEngine(to: .mpv)
+        XCTAssertEqual(coordinator.engineMode, .mpv)
+        XCTAssertEqual(coordinator.interpolationMode, .off, "从 ANE 切回 MPV 时不应覆盖原本的关闭补帧状态")
+
+        coordinator.setInterpolation(.mpvSmooth120Hz)
+        coordinator.switchEngine(to: .opticalFlow)
+        coordinator.switchEngine(to: .mpv)
+        XCTAssertEqual(coordinator.interpolationMode, .mpvSmooth120Hz)
+        XCTAssertTrue(coordinator.uiAuditLogs.contains(where: { $0.contains("[ui-switch]") }))
+    }
+
+    @MainActor
+    func testDiagnosticLogUpgradeSessionSummaryAndMemorySampler() {
+        let memMB = DeviceDiagnosticsSampler.currentMemoryFootprintMB()
+        XCTAssertGreaterThan(memMB, 0)
+        let deviceLine = DeviceDiagnosticsSampler.deviceSummaryLine(maxScreenFPS: 120)
+        XCTAssertTrue(deviceLine.contains("ScreenMax=120Hz"))
+        XCTAssertTrue(deviceLine.contains("AppMem="))
+
+        let sample = RuntimeTelemetrySample(
+            engine: "ANE 光流核",
+            playbackState: "播放中",
+            mediaTime: 8.5,
+            width: 1480,
+            height: 1080,
+            sourceFPS: 24.0,
+            outputFPS: 72.0,
+            displayFPS: 0,
+            proMotionFPS: 0,
+            droppedFrames: 0,
+            mistimedFrames: 0,
+            delayedFrames: 0,
+            mpvProbe: nil,
+            aneInterpolated: 60,
+            aneSkipped: 0,
+            aneFailed: 0,
+            anePresented: 90,
+            aneAvgMs: 12.4,
+            aneTargetFPS: "72fps",
+            aneBackend: "FRC 986×720 [×3]",
+            aneQueueDepth: 14,
+            avDeltaMs: 18.2,
+            memoryFootprintMB: memMB,
+            verdictLabel: "ANE光流生效",
+            thermalLevel: .nominal
+        )
+        let line = sample.formatLogLine()
+        let timeRegex = try? NSRegularExpression(pattern: #"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]"#)
+        let fullRange = NSRange(location: 0, length: line.utf16.count)
+        XCTAssertNotNil(timeRegex?.firstMatch(in: line, range: fullRange), "日志时间戳应精确至毫秒 HH:mm:ss.SSS: \(line)")
+        XCTAssertTrue(line.contains("backend=FRC 986×720 [×3]"))
+        XCTAssertTrue(line.contains("q=14"))
+        XCTAssertTrue(line.contains("avDelta=+18.2ms"))
+        XCTAssertTrue(line.contains("mem="))
+
+        let report = DiagnosticLogExporter.buildReport(
+            version: "v2026.11.26",
+            deviceInfo: deviceLine,
+            engineName: "ANE 光流核",
+            playbackState: "播放中",
+            resolution: "2960×2160",
+            fpsSummary: "24.0 → 72.0 fps",
+            decoderSummary: "HEVC / VT+FRC",
+            is4KGated: true,
+            telemetrySummary: ["Snapshot Source: last-session"],
+            runtimeTimeline: [line],
+            uiAuditLogs: ["[10:50:31.123] [ui-switch] switchEngine MPV -> ANE"],
+            selfCheck: "ok",
+            mpvLogs: [],
+            opticalLogs: []
+        )
+        XCTAssertTrue(report.contains("Device: \(deviceLine)"))
+        XCTAssertTrue(report.contains("--- UI Switch Audit (1) ---"))
+
+        let coordinator = PlayerCoordinator()
+        coordinator.currentURL = URL(fileURLWithPath: "/tmp/sample.mp4")
+        coordinator.mpvController.videoWidth = 1920
+        coordinator.mpvController.videoHeight = 1080
+        coordinator.mpvController.videoCodec = "hevc"
+        coordinator.captureRuntimeTelemetrySample()
+        coordinator.closeToHome()
+        XCTAssertNil(coordinator.currentURL)
+        XCTAssertEqual(coordinator.lastSessionSummary?.resolution, "1920×1080")
+        XCTAssertEqual(coordinator.lastSessionSummary?.mediaFilename, "sample.mp4")
+    }
 }

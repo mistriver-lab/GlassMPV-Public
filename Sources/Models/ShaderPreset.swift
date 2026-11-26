@@ -268,45 +268,61 @@ struct SingleShaderOption: Identifiable, Hashable, Sendable {
     let title: String
     let filename: String
     let summary: String
+    let isUpscaler: Bool
 
     static let allOptions: [SingleShaderOption] = [
         SingleShaderOption(
             id: "amd_fsr",
             title: "AMD FSR",
             filename: "AMD_FSR.glsl",
-            summary: "适合真人影视/写实画面的边缘自适应超分"
+            summary: "适合真人影视/写实画面的边缘自适应超分",
+            isUpscaler: true
         ),
         SingleShaderOption(
             id: "fsrcnnx_8",
             title: "FSRCNNX x2 (8-0-4-1)",
             filename: "FSRCNNX_x2_8_0_4_1.glsl",
-            summary: "轻量神经网络超分，兼顾二次元与真人"
+            summary: "轻量神经网络超分，兼顾二次元与真人",
+            isUpscaler: true
         ),
         SingleShaderOption(
             id: "krig_bilateral",
             title: "KrigBilateral",
             filename: "KrigBilateral.glsl",
-            summary: "色度上采样着色器，消除 4:2:0 彩边锯齿"
+            summary: "色度上采样着色器，消除 4:2:0 彩边锯齿（4K可用）",
+            isUpscaler: false
         ),
         SingleShaderOption(
             id: "nnedi3_64",
             title: "NNEDI3 (64/8x4)",
             filename: "nnedi3_nns64_win8x4.glsl",
-            summary: "高精度边缘插值放大（GPU 负载较高）"
+            summary: "高精度边缘插值放大（GPU 负载较高）",
+            isUpscaler: true
         ),
         SingleShaderOption(
             id: "ravu_zoom",
             title: "RAVU Zoom R2",
             filename: "ravu_zoom_r2.glsl",
-            summary: "任意比例快速锐利放大"
+            summary: "任意比例快速锐利放大",
+            isUpscaler: true
         ),
         SingleShaderOption(
             id: "adaptive_sharpen",
             title: "Adaptive Sharpen",
             filename: "adaptive_sharpen.glsl",
-            summary: "自适应锐化，避免过冲白边"
+            summary: "自适应锐化，避免过冲白边（4K可用）",
+            isUpscaler: false
         )
     ]
+
+    static func isUpscalerOption(id: String) -> Bool {
+        allOptions.first(where: { $0.id == id })?.isUpscaler ?? true
+    }
+
+    static func filteredFor4K(preset: ShaderPreset, extras: Set<String>) -> (preset: ShaderPreset, extras: Set<String>) {
+        let allowedExtras = extras.filter { !isUpscalerOption(id: $0) }
+        return (.off, allowedExtras)
+    }
 
     /// 将选中着色器文件名解析为 Bundle 内真实物理路径，按 Unix 冒号分隔拼接给 mpv
     static func resolvedShaderPaths(preset: ShaderPreset, extras: Set<String>) -> [String] {

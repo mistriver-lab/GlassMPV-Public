@@ -36,11 +36,20 @@ final class PlayerCoordinator: ObservableObject {
     @Published var selfCheckReport: String = ""
     @Published var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
     @Published var runtimeTimeline: [RuntimeTelemetrySample] = []
+    @Published var lastSessionSummary: SessionDiagnosticSummary?
+    @Published var uiAuditLogs: [String] = []
 
     let mpvController = MPVPlayerController()
     let opticalFlowController = OpticalFlowPlayerController()
     private let thermalToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
+    private var lastMPVInterpolationMode: InterpolationMode = .off
+
+    private static let auditTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
 
     init() {
         thermalToken.observer = NotificationCenter.default.addObserver(
@@ -52,6 +61,37 @@ final class PlayerCoordinator: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.thermalState = current
             }
+        }
+        mpvController.on4KSuperResolutionGated = { [weak self] in
+            self?.syncCoordinatorShadersFor4KGate()
+        }
+    }
+
+    func recordUISwitch(_ detail: String) {
+        let stamp = Self.auditTimeFormatter.string(from: Date())
+        uiAuditLogs.append("[\(stamp)] [ui-switch] \(detail)")
+        if uiAuditLogs.count > 500 {
+            uiAuditLogs.removeFirst(uiAuditLogs.count - 500)
+        }
+    }
+
+    func syncCoordinatorShadersFor4KGate() {
+        var changed: [String] = []
+        if selectedPreset.id != ShaderPreset.off.id {
+            selectedPreset = .off
+            changed.append("preset->off")
+        }
+        let filteredExtras = selectedExtras.filter { !SingleShaderOption.isUpscalerOption(id: $0) }
+        if filteredExtras.count != selectedExtras.count {
+            selectedExtras = filteredExtras
+            changed.append("upscalerExtras->removed")
+        }
+        if vtSpatial2x {
+            vtSpatial2x = false
+            changed.append("vtSpatial2x->false")
+        }
+        if !changed.isEmpty {
+            recordUISwitch("4K门控同步复位: \(changed.joined(separator: ", "))")
         }
     }
 
@@ -193,7 +233,9 @@ final class PlayerCoordinator: ObservableObject {
     func closeToHome() {
         if currentURL != nil {
             captureRuntimeTelemetrySample()
+            lastSessionSummary = buildCurrentSessionSummary()
         }
+        recordUISwitch("closeToHome engine=\(engineMode.rawValue) interp=\(interpolationMode.rawValue)")
         stopRuntimeTelemetrySampling()
         mpvController.stopPlayback()
         opticalFlowController.stop()
@@ -269,6 +311,7 @@ final class PlayerCoordinator: ObservableObject {
         let pmFPS = mpvController.measuredProMotionFPS > 0
             ? mpvController.measuredProMotionFPS
             : mpvController.lastMeasuredProMotionFPS
+        let memMB = DeviceDiagnosticsSampler.currentMemoryFootprintMB()
         let sample = RuntimeTelemetrySample(
             engine: engineMode.rawValue,
             playbackState: engineMode == .mpv ? mpvController.playbackState : (opticalFlowController.isPaused ? "已暂停" : "播放中"),
@@ -289,13 +332,55 @@ final class PlayerCoordinator: ObservableObject {
             anePresented: opticalFlowController.presentedFrameCount,
             aneAvgMs: opticalFlowController.averageInterpolationMs,
             aneTargetFPS: engineMode == .opticalFlow ? opticalFlowController.targetSummaryBadge : "",
+            aneBackend: engineMode == .opticalFlow ? opticalFlowController.activeBackendLabel : "",
+            aneQueueDepth: engineMode == .opticalFlow ? opticalFlowController.currentQueueDepthSnapshot() : 0,
+            avDeltaMs: engineMode == .opticalFlow ? opticalFlowController.latestAVDeltaMs : nil,
+            memoryFootprintMB: memMB,
             verdictLabel: verdict.shortLabel,
             thermalLevel: ThermalLevel(state: thermalState)
         )
         runtimeTimeline.append(sample)
-        if runtimeTimeline.count > 180 {
-            runtimeTimeline.removeFirst(runtimeTimeline.count - 180)
+        if runtimeTimeline.count > 500 {
+            runtimeTimeline.removeFirst(runtimeTimeline.count - 500)
         }
+        if currentURL != nil {
+            lastSessionSummary = buildCurrentSessionSummary()
+        }
+    }
+
+    func buildCurrentSessionSummary() -> SessionDiagnosticSummary {
+        let metrics = hudMetrics
+        let resolution = (metrics.width > 0 && metrics.height > 0)
+            ? "\(metrics.width)×\(metrics.height)"
+            : "暂无"
+        let stateText = engineMode == .mpv
+            ? mpvController.playbackState
+            : (opticalFlowController.isPaused ? "已暂停" : "播放中")
+        let verdict = currentInterpolationVerdict
+        let pmDisplay = mpvController.measuredProMotionFPS > 0
+            ? String(format: "%.1f Hz", mpvController.measuredProMotionFPS)
+            : (mpvController.lastMeasuredProMotionFPS > 0 ? String(format: "last %.1f Hz", mpvController.lastMeasuredProMotionFPS) : "--")
+        let telemetrySummary = [
+            "Interpolation Verdict: \(verdict.shortLabel) | \(verdict.detailText)",
+            "MPV Probe: \(mpvController.latestMPVProbe?.summaryText ?? "none")",
+            "MPV Target Sync: \(mpvController.targetDisplaySyncFPS > 0 ? String(format: "%.0f Hz", mpvController.targetDisplaySyncFPS) : "OFF")",
+            "MPV Reported Display Sync: \(mpvController.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpvController.displaySyncFPS) : "unreported")",
+            "ProMotion Keeper: \(mpvController.isProMotionKeeperActive ? "active" : "inactive") (\(pmDisplay))",
+            "MPV Passes (fresh/redraw): \(mpvController.freshRenderPassCount) / \(mpvController.redrawRenderPassCount) | mistimed=\(mpvController.mistimedFrames) | delayed=\(mpvController.delayedFrames)",
+            "ANE Target: \(opticalFlowController.targetSummaryBadge) (requested=\(opticalFlowController.requestedTargetFPS.shortBadge), effective=\(opticalFlowController.effectiveTargetFPS.shortBadge)) | ANE Backend: \(opticalFlowController.activeBackendLabel) | Clock: \(opticalFlowController.clockSourceLabel) | spatial2x=\(opticalFlowController.enableSpatial2xUpscale ? "ON" : "OFF")",
+            "ANE Counters: interpolated=\(opticalFlowController.interpolatedFrameCount) | skipped=\(opticalFlowController.skippedInterpolationCount) | failed=\(opticalFlowController.failedInterpolationCount) | presented=\(opticalFlowController.presentedFrameCount) | avgMs=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | queueDepth=\(opticalFlowController.currentQueueDepthSnapshot()) | avDelta=\(opticalFlowController.latestAVDeltaMs.map { String(format: "%+.1fms", $0) } ?? "--")"
+        ]
+        return SessionDiagnosticSummary(
+            capturedAt: Date(),
+            engineName: engineMode.rawValue,
+            playbackState: stateText,
+            resolution: resolution,
+            fpsSummary: metrics.fpsSummary,
+            decoderSummary: "\(metrics.codec) / \(metrics.decoderBadge)",
+            is4KGated: isSuperResolutionDisabledBy4K,
+            telemetrySummary: telemetrySummary,
+            mediaFilename: currentURL?.lastPathComponent ?? ""
+        )
     }
 
     func playBuiltInSampleVideo() {
@@ -399,13 +484,18 @@ final class PlayerCoordinator: ObservableObject {
         selfCheckReport = lines.joined(separator: "\n")
     }
 
-    func switchEngine(to target: PlayerEngineMode) {
+    func switchEngine(to target: PlayerEngineMode, requestedInterpolation: InterpolationMode? = nil) {
         guard target != engineMode else { return }
+        let wasPaused = activePaused
+        let previousEngine = engineMode
         let resumeTime = activeCurrentTime
         if currentURL != nil {
             captureRuntimeTelemetrySample()
         }
         if target == .opticalFlow {
+            if interpolationMode != .vtOpticalFlow2x {
+                lastMPVInterpolationMode = interpolationMode
+            }
             mpvController.releaseMediaForExternalEngine()
         } else {
             mpvController.pause()
@@ -415,27 +505,38 @@ final class PlayerCoordinator: ObservableObject {
         engineMode = target
         if target == .opticalFlow {
             interpolationMode = .vtOpticalFlow2x
-        } else if interpolationMode == .vtOpticalFlow2x {
-            interpolationMode = .mpvSmooth120Hz
+        } else {
+            let resolvedMPVMode: InterpolationMode
+            if let requestedInterpolation, requestedInterpolation != .vtOpticalFlow2x {
+                resolvedMPVMode = requestedInterpolation
+                lastMPVInterpolationMode = requestedInterpolation
+            } else {
+                resolvedMPVMode = lastMPVInterpolationMode
+            }
+            interpolationMode = resolvedMPVMode
         }
 
-        startPlaybackForCurrentEngine(seekTo: resumeTime)
+        recordUISwitch("switchEngine \(previousEngine.rawValue) -> \(target.rawValue), interp=\(interpolationMode.rawValue), wasPaused=\(wasPaused), t=\(String(format: "%.2f", resumeTime))s")
+        startPlaybackForCurrentEngine(seekTo: resumeTime, autoPlay: !wasPaused)
     }
 
     func applyPreset(_ preset: ShaderPreset) {
         if isSuperResolutionDisabledBy4K && preset.id != ShaderPreset.off.id {
-            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用超分"
+            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用放大类超分"
             mpvController.appendLog("[shader] \(reason)")
+            recordUISwitch("applyPreset(\(preset.id)) 被4K门控拦截")
             return
         }
         selectedPreset = preset
+        recordUISwitch("applyPreset(\(preset.id))")
         mpvController.applyShaders(preset: preset, extras: selectedExtras)
     }
 
     func toggleExtraShader(_ id: String) {
-        if isSuperResolutionDisabledBy4K && !selectedExtras.contains(id) {
-            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用超分"
+        if isSuperResolutionDisabledBy4K && SingleShaderOption.isUpscalerOption(id: id) && !selectedExtras.contains(id) {
+            let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用放大类超分"
             mpvController.appendLog("[shader] \(reason)")
+            recordUISwitch("toggleExtraShader(\(id)) 被4K门控拦截")
             return
         }
         if selectedExtras.contains(id) {
@@ -443,15 +544,21 @@ final class PlayerCoordinator: ObservableObject {
         } else {
             selectedExtras.insert(id)
         }
+        recordUISwitch("toggleExtraShader(\(id)) -> activeExtras=\(selectedExtras.sorted().joined(separator: ","))")
         mpvController.applyShaders(preset: selectedPreset, extras: selectedExtras)
     }
 
     func setInterpolation(_ mode: InterpolationMode) {
+        let previousMode = interpolationMode
         interpolationMode = mode
+        if mode != .vtOpticalFlow2x {
+            lastMPVInterpolationMode = mode
+        }
+        recordUISwitch("setInterpolation \(previousMode.rawValue) -> \(mode.rawValue) (engine=\(engineMode.rawValue))")
         switch mode {
         case .off, .mpvSmooth120Hz:
             if engineMode != .mpv {
-                switchEngine(to: .mpv)
+                switchEngine(to: .mpv, requestedInterpolation: mode)
             } else {
                 mpvController.applyInterpolation(mode)
             }
@@ -463,14 +570,17 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func setOpticalFlowTargetFPS(_ target: OpticalFlowTargetFPS) {
+        let previousTarget = opticalFlowTargetFPS
         opticalFlowTargetFPS = target
         if !target.allowsSpatial2x && vtSpatial2x {
             vtSpatial2x = false
             opticalFlowController.appendLog("[ane] 切换至多相目标 \(target.shortBadge)，已自动关闭 ANE 2× 空间超分")
         }
+        let wasPaused = opticalFlowController.isPaused
+        recordUISwitch("setOpticalFlowTargetFPS \(previousTarget.shortBadge) -> \(target.shortBadge) (paused=\(wasPaused))")
         if engineMode == .opticalFlow, let url = currentURL {
             let t = opticalFlowController.currentTime
-            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: target, startAt: t)
+            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: target, startAt: t, autoPlay: !wasPaused)
             opticalFlowController.setSpeed(speed)
         }
     }
@@ -479,29 +589,36 @@ final class PlayerCoordinator: ObservableObject {
         if enabled && !opticalFlowTargetFPS.allowsSpatial2x {
             vtSpatial2x = false
             opticalFlowController.appendLog("[ane] 目标帧率 \(opticalFlowTargetFPS.shortBadge) 需多相补帧，仅 2× 档位支持同步开启 ANE 2× 空间超分")
+            recordUISwitch("setVTSpatial2x(true) 被多相档位(\(opticalFlowTargetFPS.shortBadge))互斥拦截")
             return
         }
         if enabled && isSuperResolutionDisabledBy4K {
             vtSpatial2x = false
             let reason = superResolutionDisabledReason ?? "片源已达 4K，自动禁用 ANE 2× 超分"
             opticalFlowController.appendLog("[ane] \(reason)")
+            recordUISwitch("setVTSpatial2x(true) 被4K门控拦截")
             return
         }
         vtSpatial2x = enabled
+        let wasPaused = opticalFlowController.isPaused
+        recordUISwitch("setVTSpatial2x(\(enabled)) (paused=\(wasPaused))")
         if engineMode == .opticalFlow, let url = currentURL {
             let t = opticalFlowController.currentTime
-            opticalFlowController.load(url: url, spatial2x: enabled, targetFPS: opticalFlowTargetFPS, startAt: t)
+            opticalFlowController.load(url: url, spatial2x: enabled, targetFPS: opticalFlowTargetFPS, startAt: t, autoPlay: !wasPaused)
             opticalFlowController.setSpeed(speed)
         }
     }
 
     func setSpeed(_ value: Double) {
         speed = value
+        recordUISwitch("setSpeed(\(String(format: "%.2g", value))x)")
         mpvController.setSpeed(value)
         opticalFlowController.setSpeed(value)
     }
 
     func togglePlayPause() {
+        let nextState = activePaused ? "play" : "pause"
+        recordUISwitch("togglePlayPause(\(nextState), engine=\(engineMode.rawValue))")
         switch engineMode {
         case .mpv:
             mpvController.togglePlayPause()
@@ -540,21 +657,21 @@ final class PlayerCoordinator: ObservableObject {
         engineMode == .mpv ? mpvController.isPaused : opticalFlowController.isPaused
     }
 
-    private func startPlaybackForCurrentEngine(seekTo: Double = 0) {
+    private func startPlaybackForCurrentEngine(seekTo: Double = 0, autoPlay: Bool = true) {
         guard let url = currentURL else { return }
         switch engineMode {
         case .mpv:
             opticalFlowController.stop()
             mpvController.applyInterpolation(interpolationMode)
             mpvController.applyShaders(preset: selectedPreset, extras: selectedExtras)
-            mpvController.load(url: url)
+            mpvController.load(url: url, autoPlay: autoPlay)
             mpvController.setSpeed(speed)
             if seekTo > 0.5 {
                 mpvController.seek(to: seekTo)
             }
         case .opticalFlow:
             mpvController.releaseMediaForExternalEngine()
-            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: opticalFlowTargetFPS, startAt: seekTo)
+            opticalFlowController.load(url: url, spatial2x: vtSpatial2x, targetFPS: opticalFlowTargetFPS, startAt: seekTo, autoPlay: autoPlay)
             opticalFlowController.setSpeed(speed)
         }
     }
@@ -1370,7 +1487,7 @@ struct EnhancementControlSheet: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
-                            .disabled(coordinator.isSuperResolutionDisabledBy4K)
+                            .disabled(coordinator.isSuperResolutionDisabledBy4K && option.isUpscaler)
                         }
                     }
                 }
@@ -1624,6 +1741,20 @@ struct DiagnosticLogSheet: View {
                     }
                 }
 
+                Section("界面交互与开关审计（最近 \(coordinator.uiAuditLogs.count) 条）") {
+                    if coordinator.uiAuditLogs.isEmpty {
+                        Text("暂无开关切换审计记录")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(coordinator.uiAuditLogs.suffix(30).reversed().enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
                 Section("libmpv 事件与警告日志（最近 \(mpv.diagnosticLogs.count) 条）") {
                     if mpv.diagnosticLogs.isEmpty {
                         Text("暂无日志（打开视频或触发测试视频后将自动采集）")
@@ -1669,37 +1800,34 @@ struct DiagnosticLogSheet: View {
         if coordinator.selfCheckReport.isEmpty {
             coordinator.runRealDeviceSelfCheck()
         }
-        let metrics = coordinator.hudMetrics
-        let resolution = (metrics.width > 0 && metrics.height > 0)
-            ? "\(metrics.width)×\(metrics.height)"
-            : "暂无"
-        let stateText = coordinator.engineMode == .mpv
-            ? mpv.playbackState
-            : (optical.isPaused ? "已暂停" : "播放中")
-        let verdict = coordinator.currentInterpolationVerdict
-        let pmDisplay = mpv.measuredProMotionFPS > 0
-            ? String(format: "%.1f Hz", mpv.measuredProMotionFPS)
-            : (mpv.lastMeasuredProMotionFPS > 0 ? String(format: "last %.1f Hz", mpv.lastMeasuredProMotionFPS) : "--")
-        let telemetrySummary = [
-            "Interpolation Verdict: \(verdict.shortLabel) | \(verdict.detailText)",
-            "MPV Probe: \(mpv.latestMPVProbe?.summaryText ?? "none")",
-            "MPV Target Sync: \(mpv.targetDisplaySyncFPS > 0 ? String(format: "%.0f Hz", mpv.targetDisplaySyncFPS) : "OFF")",
-            "MPV Reported Display Sync: \(mpv.displaySyncFPS > 0 ? String(format: "%.1f Hz", mpv.displaySyncFPS) : "unreported")",
-            "ProMotion Keeper: \(mpv.isProMotionKeeperActive ? "active" : "inactive") (\(pmDisplay))",
-            "MPV Passes (fresh/redraw): \(mpv.freshRenderPassCount) / \(mpv.redrawRenderPassCount) | mistimed=\(mpv.mistimedFrames) | delayed=\(mpv.delayedFrames)",
-            "ANE Target: \(optical.targetSummaryBadge) (requested=\(optical.requestedTargetFPS.shortBadge), effective=\(optical.effectiveTargetFPS.shortBadge)) | ANE Backend: \(optical.activeBackendLabel) | Clock: \(optical.clockSourceLabel) | spatial2x=\(optical.enableSpatial2xUpscale ? "ON" : "OFF")",
-            "ANE Counters: interpolated=\(optical.interpolatedFrameCount) | skipped=\(optical.skippedInterpolationCount) | failed=\(optical.failedInterpolationCount) | presented=\(optical.presentedFrameCount) | avgMs=\(String(format: "%.1f", optical.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", optical.actualOutputFPS))"
-        ]
+        let maxScreenFPS = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.maximumFramesPerSecond ?? 60
+        let deviceInfo = DeviceDiagnosticsSampler.deviceSummaryLine(maxScreenFPS: maxScreenFPS)
+
+        let summary: SessionDiagnosticSummary
+        var extraTelemetry: [String] = []
+        if coordinator.currentURL != nil {
+            summary = coordinator.buildCurrentSessionSummary()
+        } else if let cached = coordinator.lastSessionSummary {
+            summary = cached
+            extraTelemetry.append("Snapshot Source: last-session (cached before closeToHome)")
+        } else {
+            summary = coordinator.buildCurrentSessionSummary()
+        }
+
         return DiagnosticLogExporter.buildReport(
             version: AppReleaseInfo.displayVersion,
-            engineName: coordinator.engineMode.rawValue,
-            playbackState: stateText,
-            resolution: resolution,
-            fpsSummary: metrics.fpsSummary,
-            decoderSummary: "\(metrics.codec) / \(metrics.decoderBadge)",
-            is4KGated: coordinator.isSuperResolutionDisabledBy4K,
-            telemetrySummary: telemetrySummary,
+            deviceInfo: deviceInfo,
+            engineName: summary.engineName,
+            playbackState: summary.playbackState,
+            resolution: summary.resolution,
+            fpsSummary: summary.fpsSummary,
+            decoderSummary: summary.decoderSummary,
+            is4KGated: summary.is4KGated,
+            telemetrySummary: summary.telemetrySummary + extraTelemetry,
             runtimeTimeline: coordinator.runtimeTimeline.map { $0.formatLogLine() },
+            uiAuditLogs: coordinator.uiAuditLogs,
             selfCheck: coordinator.selfCheckReport,
             mpvLogs: mpv.diagnosticLogs,
             opticalLogs: optical.diagnosticLogs

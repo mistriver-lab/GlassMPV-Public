@@ -5,6 +5,11 @@
 ## [v2026.11.26] - 2026-11-26
 
 ### 修复与增强 (Fixed & Enhanced)
+- **ANE 光流能效优化、降档风暴治理与 4K 开关/日志全链路升级 (`ShaderPreset` + `PlaybackTelemetry` + `DiagnosticLogExporter` + `MPVPlayerCore` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 修复 `VTLowLatencyFrameInterpolationConfiguration` 帧数参数按 Apple $2^x - 1$ 指数规则传值，避免 96fps 误开 7 级流水线；补齐 `selectOptimalPixelFormat`（`xf20`/`420f`/Lossless YUV/`32-bit` 优先，将 `RGhA`/`RGfA` 置末），强制 `VTDecompressionSession` 使用原生 `420v`/`x420` 硬解 4K，FRC 多相仅支持 `RGhA` 时直接从 720p 候选起跑并收敛队列上限（`<= 30`），消除 `processDecodedFrame` 双次 `VTPixelTransferSession` 冗余拷贝，并按片源 URL 缓存 `-12906` 透传跳过重复试探。
+  - 移除降档后的 `budgetGuard.reset()` 保留冷却计数并新增 `awaitingClockCatchUpAfterSwitch` 护栏消除降档风暴；暂停时挂起 `CADisplayLink` 并按目标帧率动态设置 `preferredFrameRateRange`；接入 `ProcessInfo.ThermalState` `.serious`/`.critical` 主动限档。
+  - 精细化 4K 门控（保留 `2960×2160` 判定，放行 `KrigBilateral`/`Adaptive Sharpen` 非放大着色器并同步复位 `coordinator` 预设），修复 MPV ↔ ANE 切换覆盖 `.off` 与暂停态调节设置擅自起播。
+  - 升级诊断系统：新增 `DeviceDiagnosticsSampler`（`task_self_trap()` 内存采样与设备型号）、`lastSessionSummary` 停播防归零、`[ui-switch]` 交互审计流、Timeline 补齐 `backend`/`q`/`avDelta`/`mem`、日志精确至 `HH:mm:ss.SSS` 并扩容环形缓冲至 500 条。
 - **新增 ANE 光流核多档位目标帧率（`2× / 60 / 72 / 96 / 120fps`）、相位时间栅格重采样与算力预算守卫 (`ShaderPreset` + `VTOpticalFlowEngine` + `PlaybackTelemetry` + `LiquidGlassPlayerView`)**：
   - 新增 `OpticalFlowTargetFPS` 五档目标帧率选择器，约束仅 `2×` 允许 `spatial2x` 空间超分，并按倍率自动调度双后端优先级（2 的幂倍率优先 `LowLatency`，非 2 的幂如 `24→60/72/120` 优先 `FRC`）。
   - 新增跨平台 `OpticalFlowPhaseScheduler`（整倍等分 + 非整倍时间栅格重采样）与单次多缓冲 `process` 调用，配合 `OpticalFlowResolutionPlanner.recommendedQueueLimits` 动态队列上限与 `OpticalFlowBudgetGuard`（「先降分辨率、再降帧率档位」滑窗过载/追帧自愈）。

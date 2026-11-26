@@ -5,6 +5,7 @@ import UIKit
 enum DiagnosticLogExporter: Sendable {
     static func buildReport(
         version: String,
+        deviceInfo: String = "",
         engineName: String,
         playbackState: String,
         resolution: String,
@@ -13,20 +14,26 @@ enum DiagnosticLogExporter: Sendable {
         is4KGated: Bool,
         telemetrySummary: [String] = [],
         runtimeTimeline: [String] = [],
+        uiAuditLogs: [String] = [],
         selfCheck: String,
         mpvLogs: [String],
         opticalLogs: [String]
     ) -> String {
         var sections: [String] = [
             "GlassMPV \(version)",
-            "Generated: \(ISO8601DateFormatter().string(from: Date()))",
+            "Generated: \(ISO8601DateFormatter().string(from: Date()))"
+        ]
+        if !deviceInfo.isEmpty {
+            sections.append("Device: \(deviceInfo)")
+        }
+        sections.append(contentsOf: [
             "Engine: \(engineName)",
             "State: \(playbackState)",
             "Resolution: \(resolution)",
             "FPS: \(fpsSummary)",
             "Decoder: \(decoderSummary)",
             "4K Super-Res Gated: \(is4KGated ? "YES" : "NO")"
-        ]
+        ])
         if !telemetrySummary.isEmpty {
             sections.append("")
             sections.append("--- Interpolation Telemetry ---")
@@ -38,6 +45,13 @@ enum DiagnosticLogExporter: Sendable {
             sections.append("(no runtime samples captured)")
         } else {
             sections.append(contentsOf: runtimeTimeline)
+        }
+        sections.append("")
+        sections.append("--- UI Switch Audit (\(uiAuditLogs.count)) ---")
+        if uiAuditLogs.isEmpty {
+            sections.append("(no ui switch events)")
+        } else {
+            sections.append(contentsOf: uiAuditLogs)
         }
         sections.append(contentsOf: [
             "",

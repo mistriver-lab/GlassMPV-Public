@@ -227,6 +227,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "lastMeasuredProMotionFPS" in mpv_core
     assert "isStoppedByUser" in mpv_core
     assert "logLevel: .info" in mpv_core
+    assert "HH:mm:ss.SSS" in mpv_core
+    assert "on4KSuperResolutionGated" in mpv_core
+    assert "filteredFor4K" in mpv_core
 
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "kCMSampleAttachmentKey_DisplayImmediately" in vt_engine
@@ -277,6 +280,13 @@ def test_swift_sources_non_empty_and_balanced():
     assert "updateQueueLimits" in vt_engine
     assert "readMaxQueuedFrames" in vt_engine
     assert "readPrebufferFrameTarget" in vt_engine
+    assert "lowLatencyExponent" in vt_engine
+    assert "selectOptimalPixelFormat" in vt_engine
+    assert "nativeDecodePixelFormats" in vt_engine
+    assert "awaitingClockCatchUpAfterSwitch" in vt_engine
+    assert "thermalMaxTargetTier" in vt_engine
+    assert "isPassthroughForced" in vt_engine
+    assert "HH:mm:ss.SSS" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
@@ -285,6 +295,8 @@ def test_swift_sources_non_empty_and_balanced():
 
     shader_preset = (ROOT / "Sources" / "Models" / "ShaderPreset.swift").read_text(encoding="utf-8")
     assert "enum OpticalFlowTargetFPS" in shader_preset
+    assert "isUpscaler" in shader_preset
+    assert "filteredFor4K" in shader_preset
 
     player_view = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "import PhotosUI" in player_view
@@ -306,10 +318,17 @@ def test_swift_sources_non_empty_and_balanced():
     assert "activeBackendLabel" in player_view
     assert "opticalFlowTargetFPS" in player_view
     assert "setOpticalFlowTargetFPS" in player_view
+    assert "lastSessionSummary" in player_view
+    assert "uiAuditLogs" in player_view
+    assert "recordUISwitch" in player_view
+    assert "DeviceDiagnosticsSampler" in player_view
 
     swift_test_src = swift_test_file.read_text(encoding="utf-8")
     assert "testOpticalFlowResolutionPlannerAndCandidateFallback" in swift_test_src
     assert "testOpticalFlowPhaseSchedulerAndMultiTierTargets" in swift_test_src
+    assert "testOpticalFlowExponentPixelFormatAndThermalPolicy" in swift_test_src
+    assert "test4KGatingNonUpscalerShadersAndSwitchStatePreservation" in swift_test_src
+    assert "testDiagnosticLogUpgradeSessionSummaryAndMemorySampler" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"
@@ -339,6 +358,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "MPVProbeSnapshot" in telemetry_src
     assert "InterpolationVerdict" in telemetry_src
     assert "RuntimeTelemetrySample" in telemetry_src
+    assert "DeviceDiagnosticsSampler" in telemetry_src
+    assert "task_self_trap()" in telemetry_src
+    assert "mach_task_self_" not in telemetry_src
+    assert "SessionDiagnosticSummary" in telemetry_src
 
 
 def test_lessons_learned_and_research_documented():
