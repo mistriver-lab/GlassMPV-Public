@@ -1866,14 +1866,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            if resolvedTier != targetFPS {
-                let resolvedTargetFPS = resolvedTier.effectiveTargetFPS(sourceFPS: safeSourceFPS)
+            let finalTier = resolvedTier
+            if finalTier != targetFPS {
+                let resolvedTargetFPS = finalTier.effectiveTargetFPS(sourceFPS: safeSourceFPS)
                 let queueLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: resolvedTargetFPS)
                 updateQueueLimits(maxQueued: queueLimits.maxQueued, prebuffer: queueLimits.prebuffer)
-                logAsync("[ane][fallback] 目标档位 \(targetFPS.shortBadge) 不可用，已自动降档至 \(resolvedTier.shortBadge)")
+                logAsync("[ane][fallback] 目标档位 \(targetFPS.shortBadge) 不可用，已自动降档至 \(finalTier.shortBadge)")
                 Task { @MainActor [weak self] in
                     guard let self, self.isTokenValid(token) else { return }
-                    self.effectiveTargetFPS = resolvedTier
+                    self.effectiveTargetFPS = finalTier
                     self.interpolatedFPS = resolvedTargetFPS
                 }
             }
