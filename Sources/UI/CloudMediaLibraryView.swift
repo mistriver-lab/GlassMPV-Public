@@ -20,8 +20,9 @@ private struct QuarkLoginWebContainer: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
+        config.defaultWebpagePreferences.preferredContentMode = .desktop
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.customUserAgent = QuarkDriveClient.defaultUserAgent
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
         webView.allowsBackForwardNavigationGestures = true
         webView.load(URLRequest(url: url))
         return webView
@@ -120,8 +121,16 @@ struct QuarkWebLoginSheet: View {
                 .joined(separator: "; ")
 
             isExtracting = false
+            let hasSessionCookie = quarkCookies.contains { cookie in
+                let name = cookie.name.lowercased()
+                return (name == "__puus" || name == "__pus") && !cookie.value.isEmpty
+            }
             if quarkCookies.isEmpty || cookieString.isEmpty {
                 statusHint = "尚未检测到夸克登录态 Cookie，请先完成账号登录后再试。"
+                return
+            }
+            if !hasSessionCookie {
+                statusHint = "未检测到核心凭证 __puus/__pus，请确认网页已进入「全部文件」列表页后再点击提取。"
                 return
             }
             onExtractedCookie(cookieString)
@@ -546,7 +555,17 @@ struct CloudSourceBrowserSheet: View {
             let fetched: [CloudMediaItem]
             switch account.kind {
             case .quark:
-                fetched = try await QuarkDriveClient.listDirectory(parentFid: key, cookie: secret)
+                let storeRef = store
+                let accRef = account
+                fetched = try await QuarkDriveClient.listDirectory(
+                    parentFid: key,
+                    cookie: secret,
+                    onCookieRefresh: { refreshed in
+                        Task { @MainActor in
+                            storeRef.addOrUpdate(account: accRef, secret: refreshed)
+                        }
+                    }
+                )
             case .emby:
                 if key.isEmpty {
                     fetched = try await EmbyClient.listLibraries(account: account, token: secret)
@@ -587,7 +606,8 @@ struct CloudSourceBrowserSheet: View {
                     headers: resolved.headers,
                     displayTitle: resolved.title,
                     sourceLabel: "\(account.kind.shortBadge) · \(resolved.qualityLabel)",
-                    alternatives: resolved.alternatives
+                    alternatives: resolved.alternatives,
+                    accountID: account.id
                 )
                 busyMessage = nil
                 dismiss()
@@ -642,10 +662,17 @@ struct CloudSourceBrowserSheet: View {
     ) async throws -> ResolvedPlaybackStream {
         switch account.kind {
         case .quark:
+            let storeRef = store
+            let accRef = account
             return try await QuarkDriveClient.resolvePlaybackStream(
                 item: item,
                 cookie: secret,
-                preferTranscode: preferAlternate
+                preferTranscode: preferAlternate,
+                onCookieRefresh: { refreshed in
+                    Task { @MainActor in
+                        storeRef.addOrUpdate(account: accRef, secret: refreshed)
+                    }
+                }
             )
         case .emby:
             guard let baseURL = EmbyClient.normalizedBaseURL(account.baseURL) else {

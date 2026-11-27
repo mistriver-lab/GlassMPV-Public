@@ -3,6 +3,8 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import Network
+import QuartzCore
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -219,7 +221,7 @@ final class GlassMPVTests: XCTestCase {
 
     func testDiagnosticLogExporterBuildAndWrite() throws {
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.27",
+            version: "v0.1.0-beta.1",
             engineName: "ANE 光流核",
             playbackState: "播放中",
             resolution: "1920×1080",
@@ -230,7 +232,7 @@ final class GlassMPVTests: XCTestCase {
             selfCheck: "self-check-ok",
             opticalLogs: ["[ane] idle"]
         )
-        XCTAssertTrue(report.contains("GlassMPV v2026.11.27"))
+        XCTAssertTrue(report.contains("GlassMPV v0.1.0-beta.1"))
         XCTAssertTrue(report.contains("4K Super-Res Gated: NO"))
         XCTAssertTrue(report.contains("--- Interpolation Telemetry ---"))
         XCTAssertTrue(report.contains("ANE Clock: 合成单调时钟"))
@@ -459,7 +461,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(aneLine.contains("verdict=ANE光流生效"))
 
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.27",
+            version: "v0.1.0-beta.1",
             engineName: "ANE 光流核",
             playbackState: "播放中",
             resolution: "1920×1080",
@@ -1063,7 +1065,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(line.contains("mem="))
 
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.27",
+            version: "v0.1.0-beta.1",
             deviceInfo: deviceLine,
             engineName: "ANE 光流核",
             playbackState: "播放中",
@@ -1605,5 +1607,192 @@ final class GlassMPVTests: XCTestCase {
 
         store.delete(accountID: quark.id)
         XCTAssertTrue(store.accounts.isEmpty)
+    }
+
+    func testLocalHTTPStreamProxyParsersCookieMergeAndHLSRewrite() throws {
+        let rawHTTP = "GET /stream/tok1/video.mp4?x=1 HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nRange: bytes=0-1023\r\n\r\n"
+        let parsed = try XCTUnwrap(LocalHTTPStreamProxy.parseHTTPRequestHead(rawHTTP))
+        XCTAssertEqual(parsed.method, "GET")
+        XCTAssertEqual(parsed.path, "/stream/tok1/video.mp4")
+        XCTAssertEqual(parsed.rangeHeader, "bytes=0-1023")
+
+        let merged = LocalHTTPStreamProxy.mergeSetCookieHeaders(
+            ["__puus=new_token_999; Path=/; HttpOnly", "__extra=val2; Secure"],
+            into: "__pus=keep1; __puus=old_token_111; uid=42"
+        )
+        XCTAssertTrue(merged.contains("__pus=keep1"))
+        XCTAssertTrue(merged.contains("__puus=new_token_999"))
+        XCTAssertFalse(merged.contains("old_token_111"))
+        XCTAssertTrue(merged.contains("__extra=val2"))
+
+        let baseURL = try XCTUnwrap(URL(string: "https://cdn.quark.cn/hls/master.m3u8"))
+        let manifest = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\nseg_000.m4s\nhttps://other.cdn.cn/seg_001.m4s\n"
+        let rewritten = LocalHTTPStreamProxy.rewriteHLSManifest(manifest, baseURL: baseURL) { child in
+            URL(string: "http://127.0.0.1:9999/sub/" + child.lastPathComponent)!
+        }
+        XCTAssertTrue(rewritten.contains("URI=\"http://127.0.0.1:9999/sub/init.mp4\""))
+        XCTAssertTrue(rewritten.contains("http://127.0.0.1:9999/sub/seg_000.m4s"))
+        XCTAssertTrue(rewritten.contains("http://127.0.0.1:9999/sub/seg_001.m4s"))
+    }
+
+    func testLocalHTTPStreamProxyLiveLoopbackRoundTrip() async throws {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let upstreamListener = try NWListener(using: params)
+        final class StubCapture: @unchecked Sendable {
+            private let lock = NSLock()
+            private let readySem = DispatchSemaphore(value: 0)
+            private var receivedHeaderText = ""
+            private var port: UInt16 = 0
+            private var refreshedCookie = ""
+
+            func markReady(port: UInt16) {
+                lock.lock()
+                self.port = port
+                lock.unlock()
+                readySem.signal()
+            }
+
+            func waitForPort() -> UInt16 {
+                _ = readySem.wait(timeout: .now() + 2.0)
+                lock.lock()
+                let p = port
+                lock.unlock()
+                return p
+            }
+
+            func recordRequest(_ text: String) {
+                lock.lock()
+                receivedHeaderText = text
+                lock.unlock()
+            }
+
+            func recordRefreshedCookie(_ cookie: String) {
+                lock.lock()
+                refreshedCookie = cookie
+                lock.unlock()
+            }
+
+            func snapshot() -> (headerText: String, cookie: String) {
+                lock.lock()
+                let res = (receivedHeaderText, refreshedCookie)
+                lock.unlock()
+                return res
+            }
+        }
+        let capture = StubCapture()
+        let stubQueue = DispatchQueue(label: "com.glassmpv.test.upstream")
+
+        upstreamListener.stateUpdateHandler = { state in
+            if case .ready = state {
+                capture.markReady(port: upstreamListener.port?.rawValue ?? 0)
+            }
+        }
+        upstreamListener.newConnectionHandler = { conn in
+            conn.start(queue: stubQueue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, _ in
+                if let data, let text = String(data: data, encoding: .utf8) {
+                    capture.recordRequest(text)
+                }
+                let body = Data("GLASSMPV_OK".utf8)
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: \(body.count)\r\nSet-Cookie: __puus=fresh_cookie_777; Path=/\r\nConnection: close\r\n\r\n"
+                var packet = Data(resp.utf8)
+                packet.append(body)
+                conn.send(content: packet, completion: .contentProcessed { _ in
+                    conn.cancel()
+                })
+            }
+        }
+        upstreamListener.start(queue: stubQueue)
+        defer {
+            upstreamListener.cancel()
+            LocalHTTPStreamProxy.shared.resetRoutes()
+        }
+
+        let stubPort = capture.waitForPort()
+        XCTAssertGreaterThan(stubPort, 0)
+
+        let upstreamURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(stubPort)/movie.mp4"))
+        let proxyURL = LocalHTTPStreamProxy.shared.registerStream(
+            url: upstreamURL,
+            headers: [
+                "Cookie": "__puus=stale_cookie_111",
+                "Referer": "https://pan.quark.cn/"
+            ],
+            isHLS: false,
+            onCookieUpdate: { updated in
+                capture.recordRefreshedCookie(updated)
+            }
+        )
+        XCTAssertEqual(proxyURL.host, "127.0.0.1")
+
+        let (data, response) = try await URLSession.shared.data(from: proxyURL)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+        XCTAssertEqual(String(data: data, encoding: .utf8), "GLASSMPV_OK")
+
+        let snap = capture.snapshot()
+        XCTAssertTrue(snap.headerText.contains("__puus=stale_cookie_111"))
+        XCTAssertTrue(snap.headerText.contains("https://pan.quark.cn/"))
+        XCTAssertTrue(snap.cookie.contains("__puus=fresh_cookie_777"))
+    }
+
+    @MainActor
+    func testMetalDirectRendererAspectMathAndZeroWaitMetrics() throws {
+        let fitScale = MetalVideoEnhancer.aspectVertexScale(
+            videoWidth: 4,
+            videoHeight: 3,
+            drawableWidth: 16,
+            drawableHeight: 9,
+            aspectFill: false
+        )
+        XCTAssertEqual(fitScale.y, 1.0, accuracy: 0.001)
+        XCTAssertEqual(fitScale.x, 0.75, accuracy: 0.001)
+
+        let fillScale = MetalVideoEnhancer.aspectVertexScale(
+            videoWidth: 4,
+            videoHeight: 3,
+            drawableWidth: 16,
+            drawableHeight: 9,
+            aspectFill: true
+        )
+        XCTAssertEqual(fillScale.x, 1.0, accuracy: 0.001)
+        XCTAssertGreaterThan(fillScale.y, 1.3)
+
+        let enhancer = MetalVideoEnhancer()
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.drawableSize = CGSize(width: 256, height: 144)
+
+        var yuvOpt: CVPixelBuffer?
+        let st = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            72,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ] as CFDictionary,
+            &yuvOpt
+        )
+        XCTAssertEqual(st, kCVReturnSuccess)
+        let yuv = try XCTUnwrap(yuvOpt)
+
+        let didRender = enhancer.renderToLayer(
+            yuv,
+            on: metalLayer,
+            preset: .old4KRestore,
+            strength: .standard,
+            aspectFill: false,
+            compareMode: .split,
+            outputFPS: 48.0,
+            thermalState: .nominal
+        )
+        if MTLCreateSystemDefaultDevice() != nil {
+            XCTAssertTrue(didRender)
+            XCTAssertTrue(enhancer.activePipelineLabel.contains("直绘"))
+        }
     }
 }

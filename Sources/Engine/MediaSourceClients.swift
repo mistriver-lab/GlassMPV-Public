@@ -149,11 +149,29 @@ enum QuarkDriveClient: Sendable {
         ]
     }
 
+    static func extractRefreshedCookie(from response: URLResponse, currentCookie: String) -> String? {
+        guard let http = response as? HTTPURLResponse,
+              let url = http.url ?? URL(string: "https://pan.quark.cn/") else {
+            return nil
+        }
+        let fields = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
+            if let k = pair.key as? String, let v = pair.value as? String {
+                acc[k] = v
+            }
+        }
+        let parsed = HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
+        guard !parsed.isEmpty else { return nil }
+        let pairs = parsed.map { "\($0.name)=\($0.value)" }
+        let merged = LocalHTTPStreamProxy.mergeSetCookieHeaders(pairs, into: currentCookie)
+        return merged == currentCookie ? nil : merged
+    }
+
     static func listDirectory(
         parentFid: String = "0",
         page: Int = 1,
         cookie: String,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        onCookieRefresh: (@Sendable (String) -> Void)? = nil
     ) async throws -> [CloudMediaItem] {
         let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedCookie.isEmpty else {
@@ -181,6 +199,9 @@ enum QuarkDriveClient: Sendable {
         }
 
         let (data, resp) = try await session.data(for: req)
+        if let refreshed = extractRefreshedCookie(from: resp, currentCookie: trimmedCookie) {
+            onCookieRefresh?(refreshed)
+        }
         try validateHTTPResponse(resp, data: data, serviceName: "夸克网盘")
         return try parseFileListJSON(data)
     }
@@ -194,7 +215,8 @@ enum QuarkDriveClient: Sendable {
         item: CloudMediaItem,
         cookie: String,
         preferTranscode: Bool = false,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        onCookieRefresh: (@Sendable (String) -> Void)? = nil
     ) async throws -> ResolvedPlaybackStream {
         let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedCookie.isEmpty else {
@@ -202,8 +224,18 @@ enum QuarkDriveClient: Sendable {
         }
         let headers = requestHeaders(cookie: trimmedCookie)
 
-        async let downloadResult: URL? = try? fetchDownloadURL(fid: item.id, headers: headers, session: session)
-        async let variantsResult: [StreamVariantOption] = (try? fetchPlayVariants(fid: item.id, headers: headers, session: session)) ?? []
+        async let downloadResult: URL? = try? fetchDownloadURL(
+            fid: item.id,
+            headers: headers,
+            session: session,
+            onCookieRefresh: onCookieRefresh
+        )
+        async let variantsResult: [StreamVariantOption] = (try? fetchPlayVariants(
+            fid: item.id,
+            headers: headers,
+            session: session,
+            onCookieRefresh: onCookieRefresh
+        )) ?? []
 
         let downloadURL = await downloadResult
         let cloudVariants = await variantsResult
@@ -426,7 +458,8 @@ enum QuarkDriveClient: Sendable {
     private static func fetchDownloadURL(
         fid: String,
         headers: [String: String],
-        session: URLSession
+        session: URLSession,
+        onCookieRefresh: (@Sendable (String) -> Void)? = nil
     ) async throws -> URL {
         guard let url = URL(string: "\(baseAPIHost)/1/clouddrive/file/download?pr=ucpro&fr=pc&uc_param_str=") else {
             throw MediaSourceClientError.invalidURL("夸克下载接口 URL 无效")
@@ -440,6 +473,10 @@ enum QuarkDriveClient: Sendable {
         req.httpBody = try JSONSerialization.data(withJSONObject: ["fids": [fid]])
 
         let (data, resp) = try await session.data(for: req)
+        if let currentCookie = headers["Cookie"],
+           let refreshed = extractRefreshedCookie(from: resp, currentCookie: currentCookie) {
+            onCookieRefresh?(refreshed)
+        }
         try validateHTTPResponse(resp, data: data, serviceName: "夸克直链")
         return try parseDownloadURLJSON(data)
     }
@@ -447,7 +484,8 @@ enum QuarkDriveClient: Sendable {
     private static func fetchPlayVariants(
         fid: String,
         headers: [String: String],
-        session: URLSession
+        session: URLSession,
+        onCookieRefresh: (@Sendable (String) -> Void)? = nil
     ) async throws -> [StreamVariantOption] {
         guard let url = URL(string: "\(baseAPIHost)/1/clouddrive/file/v2/play?pr=ucpro&fr=pc&uc_param_str=") else {
             throw MediaSourceClientError.invalidURL("夸克在线播放接口 URL 无效")
@@ -465,6 +503,10 @@ enum QuarkDriveClient: Sendable {
         ])
 
         let (data, resp) = try await session.data(for: req)
+        if let currentCookie = headers["Cookie"],
+           let refreshed = extractRefreshedCookie(from: resp, currentCookie: currentCookie) {
+            onCookieRefresh?(refreshed)
+        }
         try validateHTTPResponse(resp, data: data, serviceName: "夸克云转码")
         return parsePlayVariantsJSON(data, headers: headers)
     }
@@ -489,7 +531,7 @@ enum EmbyClient: Sendable {
     }
 
     static func authorizationHeader(deviceId: String = "GlassMPV-iOS", token: String? = nil) -> String {
-        var header = "Emby Client=\"GlassMPV\", Device=\"iPhone\", DeviceId=\"\(deviceId)\", Version=\"2026.11.27\""
+        var header = "Emby Client=\"GlassMPV\", Device=\"iPhone\", DeviceId=\"\(deviceId)\", Version=\"0.1.0-beta.1\""
         if let token, !token.isEmpty {
             header += ", Token=\"\(token)\""
         }

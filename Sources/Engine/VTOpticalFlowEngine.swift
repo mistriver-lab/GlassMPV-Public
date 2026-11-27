@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import CoreMedia
 import CoreVideo
+import Metal
 import QuartzCore
 import SwiftUI
 import UIKit
@@ -9,6 +10,7 @@ import VideoToolbox
 
 final class SampleBufferDisplayContainerView: UIView {
     let displayLayer = AVSampleBufferDisplayLayer()
+    let metalLayer = CAMetalLayer()
     let proMotionPulseLayer = CALayer()
     @MainActor private var proMotionToggle: Bool = false
     @MainActor private var updateLink: UIUpdateLink?
@@ -16,6 +18,7 @@ final class SampleBufferDisplayContainerView: UIView {
     @MainActor private var desiredProMotionRange: CAFrameRateRange = .default
     @MainActor var onProMotionTick: (@MainActor () -> Void)?
     @MainActor private(set) var videoTransform: CGAffineTransform = .identity
+    @MainActor private(set) var isMetalOverlayActive: Bool = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -25,6 +28,16 @@ final class SampleBufferDisplayContainerView: UIView {
         displayLayer.preferredDynamicRange = .high
         displayLayer.preventsDisplaySleepDuringVideoPlayback = true
         layer.addSublayer(displayLayer)
+
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+        metalLayer.maximumDrawableCount = 3
+        metalLayer.presentsWithTransaction = false
+        metalLayer.isOpaque = true
+        metalLayer.isHidden = true
+        metalLayer.zPosition = 5
+        layer.addSublayer(metalLayer)
 
         // 2×2 活跃视口内微扰层：每 VSync 仅提交一次微幅位姿+透明度变化，避免被 OLED 圆角裁切或同帧双向翻转抵消
         proMotionPulseLayer.frame = CGRect(x: 64, y: 12, width: 2, height: 2)
@@ -147,6 +160,17 @@ final class SampleBufferDisplayContainerView: UIView {
         layoutDisplayLayer()
     }
 
+    @MainActor
+    func setMetalOverlayActive(_ active: Bool) {
+        guard isMetalOverlayActive != active else { return }
+        isMetalOverlayActive = active
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.isHidden = !active
+        displayLayer.isHidden = active
+        CATransaction.commit()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         layoutDisplayLayer()
@@ -161,10 +185,25 @@ final class SampleBufferDisplayContainerView: UIView {
         let layerSize = isQuarterTurn
             ? CGSize(width: bounds.height, height: bounds.width)
             : bounds.size
+        let normTransform = Self.normalizedRotationTransform(from: videoTransform)
+
         displayLayer.setAffineTransform(.identity)
         displayLayer.bounds = CGRect(origin: .zero, size: layerSize)
         displayLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        displayLayer.setAffineTransform(Self.normalizedRotationTransform(from: videoTransform))
+        displayLayer.setAffineTransform(normTransform)
+
+        metalLayer.setAffineTransform(.identity)
+        metalLayer.bounds = CGRect(origin: .zero, size: layerSize)
+        metalLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        metalLayer.setAffineTransform(normTransform)
+        let rawScale = max(1.0, traitCollection.displayScale)
+        let longPt = max(layerSize.width, layerSize.height)
+        let effectiveScale = (longPt * rawScale > 2560.0 && longPt > 0) ? (2560.0 / longPt) : rawScale
+        metalLayer.contentsScale = max(1.0, effectiveScale)
+        metalLayer.drawableSize = CGSize(
+            width: max(2.0, (layerSize.width * metalLayer.contentsScale).rounded()),
+            height: max(2.0, (layerSize.height * metalLayer.contentsScale).rounded())
+        )
 
         let safeX = max(64.0, bounds.midX)
         let safeY = max(12.0, safeAreaInsets.top + 4.0)
@@ -1692,6 +1731,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var remoteFlowWorker: RemoteStreamOpticalFlowWorker?
     private var lastRemoteSamplePTS: Double = -1
     private var remoteStatusObserver: NSKeyValueObservation?
+    var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
+    private var activeActivityIncludesLatencyCritical: Bool = false
 
     @MainActor
     private var metalEnhancer: MetalVideoEnhancer {
@@ -1879,10 +1920,23 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         enableInterpolation: Bool,
         token: UUID
     ) {
-        let options: [String: Any]? = httpHeaders.isEmpty
-            ? nil
-            : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
-        let asset = AVURLAsset(url: url, options: options)
+        let playbackURL: URL
+        let options: [String: Any]?
+        if !httpHeaders.isEmpty {
+            let isHLS = url.pathExtension.lowercased() == "m3u8"
+            playbackURL = LocalHTTPStreamProxy.shared.registerStream(
+                url: url,
+                headers: httpHeaders,
+                isHLS: isHLS,
+                onCookieUpdate: onRemoteCookieRefresh
+            )
+            options = nil
+            appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(isHLS))")
+        } else {
+            playbackURL = url
+            options = nil
+        }
+        let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -2584,6 +2638,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         isPaused = true
         lastDisplayTickHostTime = 0
         displayContainer?.updateProMotionLink(isActive: false, range: .default)
+        displayContainer?.setMetalOverlayActive(false)
         updatePlaybackActivity(isActive: false)
         remoteStatusObserver?.invalidate()
         remoteStatusObserver = nil
@@ -2612,16 +2667,27 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func updatePlaybackActivity(isActive: Bool) {
+        let needsLatencyCritical = (effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
         if isActive {
-            if playbackActivityHolder.token == nil {
-                playbackActivityHolder.token = ProcessInfo.processInfo.beginActivity(
-                    options: [.userInitiated, .latencyCritical, .idleDisplaySleepDisabled],
-                    reason: "GlassMPV Real-Time ANE Optical Flow"
-                )
+            if playbackActivityHolder.token != nil && activeActivityIncludesLatencyCritical == needsLatencyCritical {
+                return
             }
+            if let existing = playbackActivityHolder.token {
+                ProcessInfo.processInfo.endActivity(existing)
+                playbackActivityHolder.token = nil
+            }
+            let opts: ProcessInfo.ActivityOptions = needsLatencyCritical
+                ? [.userInitiated, .latencyCritical, .idleDisplaySleepDisabled]
+                : [.userInitiated, .idleDisplaySleepDisabled]
+            playbackActivityHolder.token = ProcessInfo.processInfo.beginActivity(
+                options: opts,
+                reason: "GlassMPV Real-Time ANE Optical Flow"
+            )
+            activeActivityIncludesLatencyCritical = needsLatencyCritical
         } else if let token = playbackActivityHolder.token {
             ProcessInfo.processInfo.endActivity(token)
             playbackActivityHolder.token = nil
+            activeActivityIncludesLatencyCritical = false
         }
     }
 
@@ -3899,6 +3965,50 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             let liveOutputFPS = isInterpolationEnabled
                 ? max(actualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 48.0)
                 : max(sourceFPS, 24.0)
+
+            if !isDolbyVisionContent,
+               !isHDRContent,
+               activeCompareMode != .original,
+               let container = displayContainer,
+               enhancer.renderToLayer(
+                   buffer,
+                   on: container.metalLayer,
+                   preset: videoEnhancementPreset,
+                   strength: videoEnhancementStrength,
+                   aspectFill: isAspectFill,
+                   compareMode: activeCompareMode,
+                   outputFPS: liveOutputFPS,
+                   thermalState: ProcessInfo.processInfo.thermalState
+               ) {
+                container.setMetalOverlayActive(true)
+                if activeQualityPipelineLabel != enhancer.activePipelineLabel {
+                    activeQualityPipelineLabel = enhancer.activePipelineLabel
+                }
+                if isRefresh || presentedFrameCount % 15 == 0 {
+                    averageQualityEnhanceMs = enhancer.averageProcessMs
+                }
+                guard !isRefresh else { return }
+                presentedFrameCount += 1
+                if isLoadingPipeline {
+                    isLoadingPipeline = false
+                    pipelineStatusText = ""
+                }
+                let nowMedia = CACurrentMediaTime()
+                presentedTimestamps.append(nowMedia)
+                presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
+                if nowMedia - lastFPSPublishTimestamp >= 0.25 {
+                    lastFPSPublishTimestamp = nowMedia
+                    if presentedTimestamps.count >= 2, let first = presentedTimestamps.first {
+                        let span = nowMedia - first
+                        if span > 0.05 {
+                            actualOutputFPS = Double(presentedTimestamps.count - 1) / span
+                        }
+                    }
+                }
+                return
+            }
+
+            displayContainer?.setMetalOverlayActive(false)
             displayBuffer = enhancer.process(
                 buffer,
                 preset: videoEnhancementPreset,
@@ -3917,6 +4027,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 averageQualityEnhanceMs = enhancer.averageProcessMs
             }
         } else {
+            displayContainer?.setMetalOverlayActive(false)
             displayBuffer = buffer
             if activeQualityPipelineLabel != "关闭" {
                 activeQualityPipelineLabel = "关闭"

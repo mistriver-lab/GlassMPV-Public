@@ -10,8 +10,8 @@ trigger: always_on
 - **不改核心 Target 标识**：保持 `project.yml` Target `GlassMPV`、Bundle ID `com.glassmpv.player` 与 GitHub 仓库关联不变，确保无缝覆盖安装。
 
 ## 2. 硬性防复发门禁（源自 `docs/LESSONS_LEARNED.md`）
-0. **日期时间版本号铁律（CalVer）**：
-   - 以后所有构建与交付必须使用东八区（`Asia/Shanghai`）日期时间作为版本号：`YYYY.MM.DD` 作为 `MARKETING_VERSION` / `CFBundleShortVersionString`（以及主仓 `VERSION` / `project.yml`），`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION` / `CFBundleVersion`，IPA 产物统一命名为 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。
+0. **初始 Beta 语义版本号铁律**：
+   - 使用标准语义化 Beta 版本：`VERSION` 为 `0.1.0-beta.x`，`MARKETING_VERSION` / `CFBundleShortVersionString`（及 `project.yml`）为 `0.1.0`（纯三段数字满足 Apple 规范），`CURRENT_PROJECT_VERSION` / `CFBundleVersion` 随 CI `GITHUB_RUN_NUMBER` 递增，IPA 产物统一命名为 `GlassMPV-<VERSION>-b<BUILD>-unsigned.ipa`。
 1. **Swift 6 并发与锁隔离铁律**：
    - 严禁在 `@Sendable` 闭包内直接捕获 `super`；严禁使用 `DispatchQueue.main.sync`。
    - `VTOpticalFlowEngine.swift` 的 `runOpticalFlowTask..#endif` 区间内严禁直接调用 `.lock()` / `.unlock()`，同步操作须封装于独立的同步 helper。

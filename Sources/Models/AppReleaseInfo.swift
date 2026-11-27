@@ -9,8 +9,10 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
+    static let releaseTag = "0.1.0-beta.1"
+
     static var shortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.1.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
     static var buildNumber: String {
@@ -18,10 +20,19 @@ enum AppReleaseInfo {
     }
 
     static var displayVersion: String {
-        "v\(shortVersion) (Build \(buildNumber))"
+        "v\(releaseTag) (Build \(buildNumber))"
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.1",
+            date: "2026-11-27",
+            highlights: [
+                "版本体系切换为初始 Beta 语义版本（v0.1.0-beta.1，CFBundleShortVersionString=0.1.0，Build 号随 CI 递增）",
+                "零拷贝 FP16 Metal 直绘与温控减负：画质增强（非杜比视界/HDR）切换为 CAMetalLayer 全异步直绘，彻底移除每帧 waitUntilCompleted() 主线程阻塞与中间 YUV/UV 拷贝；48fps/60fps 解除 .latencyCritical 锁频，大幅缓解高帧率 + 去糊极速发热",
+                "夸克网盘直连架构加固：新增纯原生 Network.framework (NWListener) 127.0.0.1 本地 HTTP Range / HLS 反向代理（跨 302 重定向保留 Cookie/Referer/UA 彻底根治 403）、自动回写 Set-Cookie 中的 __puus 续期，并将夸克登录 WebView 切换为桌面模式强校验凭证"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v2026.11.27",
             date: "2026-11-27",

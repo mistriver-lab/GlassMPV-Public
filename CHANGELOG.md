@@ -1,6 +1,16 @@
 # 更新日志 (Changelog)
 
-本项目遵循日期时间版本规范（东八区 `YYYY.MM.DD` + `YYYYMMDDHHMM`）。
+本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
+
+## [v0.1.0-beta.1] - 2026-11-27
+
+### 变更与修复 (Changed & Fixed)
+- **切换初始 Beta 版本体系 (`VERSION` + `project.yml` + `build-ios.yml` + `AppReleaseInfo`)**：
+  - 停止使用日期版本号，统一切换为 `v0.1.0-beta.1`（`MARKETING_VERSION = 0.1.0`、`CURRENT_PROJECT_VERSION` 随 CI Run Number 自动递增），IPA 统一命名为 `GlassMPV-0.1.0-beta.1-b<N>-unsigned.ipa`。
+- **零拷贝异步 FP16 `CAMetalLayer` 直绘与温控重构 (`MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - 针对 `160642` 实机日志反馈的画质增强极速发热（`5.55ms` 同步等待 + `+36MB` 中间拷贝），将非 HDR/杜比视界画质增强切换为 `CAMetalLayer` 异步 Fragment Shader 直绘：移除 `waitUntilCompleted()` 与冗余 `copyChroma` / 中间 `CVPixelBufferPool`，采用 16-bit `half` 硬件双线性 5 点多尺度采样；`2× (48fps)` 与 `60fps` 不再锁死 `.latencyCritical`，显著降低功耗与机身发热。
+- **纯原生 `LocalHTTPStreamProxy` 根治夸克 403 与 `__puus` 续期 (`LocalHTTPStreamProxy` + `MediaSourceClients` + `CloudMediaLibraryView`)**：
+  - 基于 Apple `Network.framework` (`NWListener`) 构建轻量 `127.0.0.1` HTTP Range / HLS 代理，在 302 重定向与 `.m3u8` 分片期间完整透传 `Cookie / Referer / User-Agent`，并自动捕获响应头 `Set-Cookie` 回写 `__puus` 续期至 Keychain；夸克登录 WebView 切换至 `.desktop` 桌面模式并强校验 `__puus`/`__pus`。
 
 ## [v2026.11.27] - 2026-11-27
 
@@ -171,3 +181,9 @@
 - [x] 修复 `OpticalFlowCandidate` / `OpticalFlowBackendKind` `Hashable`（`42a9739`）与 `testMPVUIControllerPlaybackWithWindowHost` 慢跑器轮询窗口放宽至 30s（`1014b2b`），CI Run `45737880768` 全绿出包并交付微信「文件传输助手」。
 
 - [x] 响应 `095509` 实机日志（`3a30121` / `ed3e252`）：修复 `OpticalFlowTargetFPS` `id: Self` 切档失效、新增热切换与杜比视界/HDR EDR 支持、移除内置 3 秒测试并重塑 UI（CI Run `45927575289`，22/22 PASS）。
+
+- [x] Phase 1 实时 Metal + MetalFX 画质增强引擎上线（`ba872d4` / 公开镜像 `3f51ddf`）：支持「原画 / 老片去糊 / 动漫强化 / 低清超分」，CI Run `45957449192`（24/24 PASS）。
+
+- [x] 响应 `153158` 实机日志专项优化 + Phase 2 云端片源库上线（`a956a5c` / 公开镜像 `00fae3e`）：
+
+- [x] **实机过热/去糊/对比修复**：移除高耗时 8 邻域双边 `exp()`，改为单遍多尺度（1px+2px）邻域限幅 Luma 去糊 + 死区门控 + 防光晕 CAS；`MetalFX` 新增高刷/高温保护（`outputFPS > 65` 或过热自动切省电直锐，60fps 封顶 1080p）；`ThermalState.serious` 限档由 `60fps` 调整为 `2×(48fps)` 快速降温；新增可点击「**分屏对比（左原画｜右增强）**」与「**对比原画**」并缓存最近原始帧以支持暂停态零延迟刷新。

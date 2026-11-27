@@ -20,7 +20,46 @@ private struct MetalEnhanceUniforms {
     var padding: UInt32
 }
 
-/// 零第三方依赖的实时 Metal + MetalFX GPU 画质增强引擎（单遍多尺度亮度去糊 + 防光晕 CAS + 低清超分 + 分屏对比）
+private struct MetalDisplayVertexUniforms {
+    var scaleX: Float
+    var scaleY: Float
+}
+
+private final class MetalGPUTimingTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var averageMs: Double = 0
+    private var count: Int = 0
+
+    func record(gpuStart: CFTimeInterval, gpuEnd: CFTimeInterval, fallbackStart: CFTimeInterval) {
+        let rawMs: Double
+        if gpuEnd > gpuStart {
+            rawMs = (gpuEnd - gpuStart) * 1000.0
+        } else {
+            rawMs = max(0.05, (CACurrentMediaTime() - fallbackStart) * 1000.0)
+        }
+        let clamped = max(0.05, min(rawMs, 200.0))
+        lock.lock()
+        count += 1
+        averageMs = (count == 1) ? clamped : (averageMs * 0.85 + clamped * 0.15)
+        lock.unlock()
+    }
+
+    func snapshotAverageMs() -> Double {
+        lock.lock()
+        let v = averageMs
+        lock.unlock()
+        return v
+    }
+
+    func reset() {
+        lock.lock()
+        averageMs = 0
+        count = 0
+        lock.unlock()
+    }
+}
+
+/// 零第三方依赖的实时 FP16 Metal + MetalFX GPU 画质增强与零拷贝直绘引擎
 @MainActor
 final class MetalVideoEnhancer {
     private(set) var activePipelineLabel: String = "关闭"
@@ -30,12 +69,16 @@ final class MetalVideoEnhancer {
     private let device: MTLDevice?
     private let commandQueue: MTLCommandQueue?
     private var textureCache: CVMetalTextureCache?
+    private let gpuTimingTracker = MetalGPUTimingTracker()
 
     private var enhanceLumaPipeline: MTLComputePipelineState?
     private var copyChromaPipeline: MTLComputePipelineState?
     private var enhanceBGRAPipeline: MTLComputePipelineState?
     private var yuvToBGRAPipeline: MTLComputePipelineState?
     private var bicubicBGRAPipeline: MTLComputePipelineState?
+
+    private var displayYUVRenderPipeline: MTLRenderPipelineState?
+    private var displayBGRARenderPipeline: MTLRenderPipelineState?
 
     private var outputPool: CVPixelBufferPool?
     private var outputPoolSignature: String = ""
@@ -65,123 +108,221 @@ final class MetalVideoEnhancer {
         uint padding;
     };
 
-    inline float toUnitLuma(float raw, uint isVideoRange) {
+    struct DisplayVertexUniforms {
+        float scaleX;
+        float scaleY;
+    };
+
+    struct QuadVaryings {
+        float4 position [[position]];
+        float2 uv;
+    };
+
+    inline half toUnitLumaH(half raw, uint isVideoRange) {
         if (isVideoRange == 0u) {
-            return clamp(raw, 0.0f, 1.0f);
+            return clamp(raw, half(0.0h), half(1.0h));
         }
-        return clamp((raw - 0.0627451f) * 1.1643836f, 0.0f, 1.0f);
+        return clamp((raw - half(0.0627451h)) * half(1.1643836h), half(0.0h), half(1.0h));
     }
 
-    inline float fromUnitLuma(float unitVal, uint isVideoRange) {
-        float clamped = clamp(unitVal, 0.0f, 1.0f);
+    inline half fromUnitLumaH(half unitVal, uint isVideoRange) {
+        half clamped = clamp(unitVal, half(0.0h), half(1.0h));
         if (isVideoRange == 0u) {
             return clamped;
         }
-        return clamp(clamped * 0.8588235f + 0.0627451f, 0.004f, 0.996f);
+        return clamp(clamped * half(0.8588235h) + half(0.0627451h), half(0.004h), half(0.996h));
     }
 
-    inline float rgbLuma(float3 c) {
-        return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+    inline half rgbLumaH(half3 c) {
+        return dot(c, half3(0.2126h, 0.7152h, 0.0722h));
     }
 
-    inline float3 yuvSampleToRGB(float yRaw, float2 uvRaw, uint isVideoRange, uint isBT601) {
-        float y = isVideoRange != 0u ? (yRaw - 0.0627451f) * 1.1643836f : yRaw;
-        float cb = uvRaw.x - 0.5019608f;
-        float cr = uvRaw.y - 0.5019608f;
+    inline half3 yuvSampleToRGBH(half yUnit, half2 uvRaw, uint isVideoRange, uint isBT601) {
+        half cb = uvRaw.x - half(0.5019608h);
+        half cr = uvRaw.y - half(0.5019608h);
         if (isVideoRange != 0u) {
-            cb *= 1.1383929f;
-            cr *= 1.1383929f;
+            cb *= half(1.1383929h);
+            cr *= half(1.1383929h);
         }
-        float3 rgb;
+        half3 rgb;
         if (isBT601 != 0u) {
-            rgb.r = y + 1.402f * cr;
-            rgb.g = y - 0.344136f * cb - 0.714136f * cr;
-            rgb.b = y + 1.772f * cb;
+            rgb.r = yUnit + half(1.402h) * cr;
+            rgb.g = yUnit - half(0.344136h) * cb - half(0.714136h) * cr;
+            rgb.b = yUnit + half(1.772h) * cb;
         } else {
-            rgb.r = y + 1.5748f * cr;
-            rgb.g = y - 0.187324f * cb - 0.468124f * cr;
-            rgb.b = y + 1.8556f * cb;
+            rgb.r = yUnit + half(1.5748h) * cr;
+            rgb.g = yUnit - half(0.187324h) * cb - half(0.468124h) * cr;
+            rgb.b = yUnit + half(1.8556h) * cb;
         }
-        return clamp(rgb, 0.0f, 1.0f);
+        return clamp(rgb, half(0.0h), half(1.0h));
     }
 
-    inline float sampleUnitLuma(texture2d<float, access::read> tex, int x, int y, int maxX, int maxY, uint isVideoRange) {
-        uint2 pos = uint2(clamp(x, 0, maxX), clamp(y, 0, maxY));
-        return toUnitLuma(tex.read(pos).r, isVideoRange);
-    }
-
-    inline float sampleRGBLuma(texture2d<float, access::read> tex, int x, int y, int maxX, int maxY) {
-        uint2 pos = uint2(clamp(x, 0, maxX), clamp(y, 0, maxY));
-        return rgbLuma(tex.read(pos).rgb);
-    }
-
-    inline float computeEnhancedLuma(
-        float c,
-        float n,
-        float s,
-        float w,
-        float e,
-        float nw,
-        float ne,
-        float sw,
-        float se,
-        float n2,
-        float s2,
-        float w2,
-        float e2,
+    // FP16 5-tap + 4-diagonal bilinear multi-scale luma restoration (halo-clamped, zero exp)
+    inline half computeEnhancedLumaFastH(
+        half c,
+        half n,
+        half s,
+        half w,
+        half e,
+        half d0,
+        half d1,
+        half d2,
+        half d3,
         constant EnhanceUniforms& u
     ) {
-        float mn1 = min(min(c, n), min(s, min(w, e)));
-        float mx1 = max(max(c, n), max(s, max(w, e)));
-        float mnAll = min(mn1, min(min(nw, ne), min(sw, se)));
-        float mxAll = max(mx1, max(max(nw, ne), max(sw, se)));
-        float working = c;
+        half mn1 = min(min(c, n), min(s, min(w, e)));
+        half mx1 = max(max(c, n), max(s, max(w, e)));
+        half working = c;
+        half deadzone = half(u.noiseDeadzone);
 
-        // 1. 多尺度假 4K 去糊 (1px + 2px USM) + 死区门控与邻域极值限幅（零光晕、零 exp 高能耗运算）
         if (u.deblurStrength > 0.001f) {
-            float blurFine = 0.25f * (n + s + w + e);
-            float blurWide = 0.125f * (n + s + w + e + n2 + s2 + w2 + e2);
-            float detailFine = c - blurFine;
-            float detailWide = c - blurWide;
-            float signF = detailFine >= 0.0f ? 1.0f : -1.0f;
-            float signW = detailWide >= 0.0f ? 1.0f : -1.0f;
-            float gatedFine = signF * max(0.0f, abs(detailFine) - u.noiseDeadzone * 0.65f);
-            float gatedWide = signW * max(0.0f, abs(detailWide) - u.noiseDeadzone);
-            float rawUnsharp = working + u.deblurStrength * (0.55f * gatedFine + 0.70f * gatedWide);
-            float haloMargin = 0.025f;
-            working = clamp(rawUnsharp, mnAll - haloMargin, mxAll + haloMargin);
+            half blurFine = half(0.25h) * (n + s + w + e);
+            half blurWide = half(0.25h) * (d0 + d1 + d2 + d3);
+            half detailFine = c - blurFine;
+            half detailWide = c - blurWide;
+            half signF = detailFine >= half(0.0h) ? half(1.0h) : half(-1.0h);
+            half signW = detailWide >= half(0.0h) ? half(1.0h) : half(-1.0h);
+            half gatedFine = signF * max(half(0.0h), abs(detailFine) - deadzone * half(0.65h));
+            half gatedWide = signW * max(half(0.0h), abs(detailWide) - deadzone);
+            half rawUnsharp = working + half(u.deblurStrength) * (half(0.55h) * gatedFine + half(0.70h) * gatedWide);
+            working = clamp(rawUnsharp, mn1 - half(0.025h), mx1 + half(0.025h));
         }
 
-        // 2. Contrast Adaptive Sharpening (CAS) 微反差与局部边缘重建
         if (u.casStrength > 0.001f) {
-            float mn = 0.5f * (mn1 + mnAll);
-            float mx = 0.5f * (mx1 + mxAll);
-            float peakAmp = sqrt(clamp(min(mn, 1.0f - mx) / max(mx, 0.001f), 0.0f, 1.0f));
-            float sharpenWeight = peakAmp * (-0.125f - 0.075f * clamp(u.casStrength, 0.0f, 1.0f));
-            float sharpened = (working + (n + s + w + e) * sharpenWeight) / (1.0f + 4.0f * sharpenWeight);
-            working = clamp(sharpened, max(0.0f, mnAll - 0.02f), min(1.0f, mxAll + 0.02f));
+            half peakAmp = sqrt(clamp(min(mn1, half(1.0h) - mx1) / max(mx1, half(0.001h)), half(0.0h), half(1.0h)));
+            half sharpenWeight = peakAmp * half(-0.125f - 0.075f * clamp(u.casStrength, 0.0f, 1.0f));
+            half sharpened = (working + (n + s + w + e) * sharpenWeight) / (half(1.0h) + half(4.0h) * sharpenWeight);
+            working = clamp(sharpened, max(half(0.0h), mn1 - half(0.02h)), min(half(1.0h), mx1 + half(0.02h)));
         }
 
-        // 3. 深色描边线条压实（动漫/漫画/字幕边缘黑位收紧）
         if (u.lineDarken > 0.001f) {
-            float avgLocal = 0.25f * (n + s + w + e);
-            float darkDelta = max(0.0f, avgLocal - working);
-            float gatedDark = max(0.0f, darkDelta - u.noiseDeadzone * 0.5f);
-            working = max(0.0f, working - gatedDark * (u.lineDarken * 1.55f));
+            half avgLocal = half(0.25h) * (n + s + w + e);
+            half darkDelta = max(half(0.0h), avgLocal - working);
+            half gatedDark = max(half(0.0h), darkDelta - deadzone * half(0.5h));
+            working = max(half(0.0h), working - gatedDark * half(u.lineDarken * 1.55f));
         }
 
-        // 4. 老片去灰 S 曲线微反差
         if (u.clarityStrength > 0.001f) {
-            float midOffset = working - 0.5f;
-            working = clamp(working + u.clarityStrength * (working * (1.0f - working) * (midOffset * 1.85f)), 0.0f, 1.0f);
+            half midOffset = working - half(0.5h);
+            working = clamp(working + half(u.clarityStrength) * (working * (half(1.0h) - working) * (midOffset * half(1.85h))), half(0.0h), half(1.0h));
         }
 
-        return clamp(working, 0.0f, 1.0f);
+        return clamp(working, half(0.0h), half(1.0h));
+    }
+
+    vertex QuadVaryings fullscreenQuadVertex(
+        uint vid [[vertex_id]],
+        constant DisplayVertexUniforms& v [[buffer(0)]]
+    ) {
+        float2 positions[4] = {
+            float2(-1.0f, -1.0f),
+            float2( 1.0f, -1.0f),
+            float2(-1.0f,  1.0f),
+            float2( 1.0f,  1.0f)
+        };
+        float2 uvs[4] = {
+            float2(0.0f, 1.0f),
+            float2(1.0f, 1.0f),
+            float2(0.0f, 0.0f),
+            float2(1.0f, 0.0f)
+        };
+        QuadVaryings out;
+        float2 pos = positions[vid];
+        out.position = float4(pos.x * v.scaleX, pos.y * v.scaleY, 0.0f, 1.0f);
+        out.uv = uvs[vid];
+        return out;
+    }
+
+    fragment half4 displayEnhanceYUVFragment(
+        QuadVaryings in [[stage_in]],
+        texture2d<half, access::sample> inY [[texture(0)]],
+        texture2d<half, access::sample> inUV [[texture(1)]],
+        constant EnhanceUniforms& u [[buffer(0)]]
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float2 uv = in.uv;
+        half2 chroma = inUV.sample(linearSampler, uv).rg;
+        half yCenter = toUnitLumaH(inY.sample(linearSampler, uv).r, u.isVideoRange);
+
+        if (u.compareMode == 2u) {
+            return half4(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+        }
+        float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
+        float invWidth = 1.0f / max(1.0f, float(inY.get_width()));
+        float invHeight = 1.0f / max(1.0f, float(inY.get_height()));
+        if (u.compareMode == 1u) {
+            if (abs(uv.x - splitRatio) <= max(0.0022f, invWidth * 1.5f)) {
+                return half4(half(0.25h), half(0.96h), half(0.98h), half(1.0h));
+            }
+            if (uv.x < splitRatio) {
+                return half4(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+            }
+        }
+
+        float2 dx = float2(invWidth, 0.0f);
+        float2 dy = float2(0.0f, invHeight);
+        float2 dDiagA = float2(invWidth * 1.35f, invHeight * 1.35f);
+        float2 dDiagB = float2(invWidth * 1.35f, -invHeight * 1.35f);
+
+        half yN = toUnitLumaH(inY.sample(linearSampler, uv - dy).r, u.isVideoRange);
+        half yS = toUnitLumaH(inY.sample(linearSampler, uv + dy).r, u.isVideoRange);
+        half yW = toUnitLumaH(inY.sample(linearSampler, uv - dx).r, u.isVideoRange);
+        half yE = toUnitLumaH(inY.sample(linearSampler, uv + dx).r, u.isVideoRange);
+        half d0 = toUnitLumaH(inY.sample(linearSampler, uv - dDiagA).r, u.isVideoRange);
+        half d1 = toUnitLumaH(inY.sample(linearSampler, uv + dDiagA).r, u.isVideoRange);
+        half d2 = toUnitLumaH(inY.sample(linearSampler, uv - dDiagB).r, u.isVideoRange);
+        half d3 = toUnitLumaH(inY.sample(linearSampler, uv + dDiagB).r, u.isVideoRange);
+
+        half yOut = computeEnhancedLumaFastH(yCenter, yN, yS, yW, yE, d0, d1, d2, d3, u);
+        return half4(yuvSampleToRGBH(yOut, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+    }
+
+    fragment half4 displayEnhanceBGRAFragment(
+        QuadVaryings in [[stage_in]],
+        texture2d<half, access::sample> inColor [[texture(0)]],
+        constant EnhanceUniforms& u [[buffer(0)]]
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float2 uv = in.uv;
+        half4 centerRGBA = inColor.sample(linearSampler, uv);
+        if (u.compareMode == 2u) {
+            return centerRGBA;
+        }
+        float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
+        float invWidth = 1.0f / max(1.0f, float(inColor.get_width()));
+        float invHeight = 1.0f / max(1.0f, float(inColor.get_height()));
+        if (u.compareMode == 1u) {
+            if (abs(uv.x - splitRatio) <= max(0.0022f, invWidth * 1.5f)) {
+                return half4(half(0.25h), half(0.96h), half(0.98h), half(1.0h));
+            }
+            if (uv.x < splitRatio) {
+                return centerRGBA;
+            }
+        }
+
+        float2 dx = float2(invWidth, 0.0f);
+        float2 dy = float2(0.0f, invHeight);
+        float2 dDiagA = float2(invWidth * 1.35f, invHeight * 1.35f);
+        float2 dDiagB = float2(invWidth * 1.35f, -invHeight * 1.35f);
+
+        half yC = rgbLumaH(centerRGBA.rgb);
+        half yN = rgbLumaH(inColor.sample(linearSampler, uv - dy).rgb);
+        half yS = rgbLumaH(inColor.sample(linearSampler, uv + dy).rgb);
+        half yW = rgbLumaH(inColor.sample(linearSampler, uv - dx).rgb);
+        half yE = rgbLumaH(inColor.sample(linearSampler, uv + dx).rgb);
+        half d0 = rgbLumaH(inColor.sample(linearSampler, uv - dDiagA).rgb);
+        half d1 = rgbLumaH(inColor.sample(linearSampler, uv + dDiagA).rgb);
+        half d2 = rgbLumaH(inColor.sample(linearSampler, uv - dDiagB).rgb);
+        half d3 = rgbLumaH(inColor.sample(linearSampler, uv + dDiagB).rgb);
+
+        half yOut = computeEnhancedLumaFastH(yC, yN, yS, yW, yE, d0, d1, d2, d3, u);
+        half3 finalRGB = clamp(centerRGBA.rgb + half3(yOut - yC), half(0.0h), half(1.0h));
+        return half4(finalRGB, centerRGBA.a);
     }
 
     kernel void enhanceLuma(
-        texture2d<float, access::read> inY [[texture(0)]],
-        texture2d<float, access::write> outY [[texture(1)]],
+        texture2d<half, access::sample> inY [[texture(0)]],
+        texture2d<half, access::write> outY [[texture(1)]],
         constant EnhanceUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -190,50 +331,51 @@ final class MetalVideoEnhancer {
         if (gid.x >= width || gid.y >= height) {
             return;
         }
-        float rawCenter = inY.read(gid).r;
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float invW = 1.0f / max(1.0f, float(inY.get_width()));
+        float invH = 1.0f / max(1.0f, float(inY.get_height()));
+        float2 uv = (float2(gid) + 0.5f) * float2(invW, invH);
+        half rawCenter = inY.sample(linearSampler, uv).r;
+
         if (u.compareMode == 2u) {
-            outY.write(float4(rawCenter, 0.0f, 0.0f, 1.0f), gid);
+            outY.write(half4(rawCenter, 0.0h, 0.0h, 1.0h), gid);
             return;
         }
         if (u.compareMode == 1u) {
             int splitPixelX = int(float(width) * clamp(u.splitX, 0.1f, 0.9f));
             if (abs(int(gid.x) - splitPixelX) <= 1) {
-                outY.write(float4(fromUnitLuma(0.96f, u.isVideoRange), 0.0f, 0.0f, 1.0f), gid);
+                outY.write(half4(fromUnitLumaH(0.96h, u.isVideoRange), 0.0h, 0.0h, 1.0h), gid);
                 return;
             }
             if (int(gid.x) < splitPixelX) {
-                outY.write(float4(rawCenter, 0.0f, 0.0f, 1.0f), gid);
+                outY.write(half4(rawCenter, 0.0h, 0.0h, 1.0h), gid);
                 return;
             }
         }
 
-        int maxX = int(inY.get_width()) - 1;
-        int maxY = int(inY.get_height()) - 1;
-        int x = int(gid.x);
-        int y = int(gid.y);
+        float2 dx = float2(invW, 0.0f);
+        float2 dy = float2(0.0f, invH);
+        float2 dDiagA = float2(invW * 1.35f, invH * 1.35f);
+        float2 dDiagB = float2(invW * 1.35f, -invH * 1.35f);
 
-        float enhanced = computeEnhancedLuma(
-            toUnitLuma(rawCenter, u.isVideoRange),
-            sampleUnitLuma(inY, x, y - 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x, y + 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x - 1, y, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x + 1, y, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x - 1, y - 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x + 1, y - 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x - 1, y + 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x + 1, y + 1, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x, y - 2, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x, y + 2, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x - 2, y, maxX, maxY, u.isVideoRange),
-            sampleUnitLuma(inY, x + 2, y, maxX, maxY, u.isVideoRange),
+        half yOut = computeEnhancedLumaFastH(
+            toUnitLumaH(rawCenter, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv - dy).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv + dy).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv - dx).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv + dx).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv - dDiagA).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv + dDiagA).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv - dDiagB).r, u.isVideoRange),
+            toUnitLumaH(inY.sample(linearSampler, uv + dDiagB).r, u.isVideoRange),
             u
         );
-        outY.write(float4(fromUnitLuma(enhanced, u.isVideoRange), 0.0f, 0.0f, 1.0f), gid);
+        outY.write(half4(fromUnitLumaH(yOut, u.isVideoRange), 0.0h, 0.0h, 1.0h), gid);
     }
 
     kernel void copyChroma(
-        texture2d<float, access::read> inUV [[texture(0)]],
-        texture2d<float, access::write> outUV [[texture(1)]],
+        texture2d<half, access::read> inUV [[texture(0)]],
+        texture2d<half, access::write> outUV [[texture(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         if (gid.x >= outUV.get_width() || gid.y >= outUV.get_height()) {
@@ -243,8 +385,8 @@ final class MetalVideoEnhancer {
     }
 
     kernel void enhanceBGRA(
-        texture2d<float, access::read> inColor [[texture(0)]],
-        texture2d<float, access::write> outColor [[texture(1)]],
+        texture2d<half, access::sample> inColor [[texture(0)]],
+        texture2d<half, access::write> outColor [[texture(1)]],
         constant EnhanceUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -253,7 +395,12 @@ final class MetalVideoEnhancer {
         if (gid.x >= width || gid.y >= height) {
             return;
         }
-        float4 centerRGBA = inColor.read(gid);
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float invW = 1.0f / max(1.0f, float(inColor.get_width()));
+        float invH = 1.0f / max(1.0f, float(inColor.get_height()));
+        float2 uv = (float2(gid) + 0.5f) * float2(invW, invH);
+        half4 centerRGBA = inColor.sample(linearSampler, uv);
+
         if (u.compareMode == 2u) {
             outColor.write(centerRGBA, gid);
             return;
@@ -261,7 +408,7 @@ final class MetalVideoEnhancer {
         if (u.compareMode == 1u) {
             int splitPixelX = int(float(width) * clamp(u.splitX, 0.1f, 0.9f));
             if (abs(int(gid.x) - splitPixelX) <= 1) {
-                outColor.write(float4(0.95f, 0.96f, 0.25f, 1.0f), gid);
+                outColor.write(half4(0.95h, 0.96h, 0.25h, 1.0h), gid);
                 return;
             }
             if (int(gid.x) < splitPixelX) {
@@ -270,36 +417,32 @@ final class MetalVideoEnhancer {
             }
         }
 
-        int maxX = int(inColor.get_width()) - 1;
-        int maxY = int(inColor.get_height()) - 1;
-        int x = int(gid.x);
-        int y = int(gid.y);
+        float2 dx = float2(invW, 0.0f);
+        float2 dy = float2(0.0f, invH);
+        float2 dDiagA = float2(invW * 1.35f, invH * 1.35f);
+        float2 dDiagB = float2(invW * 1.35f, -invH * 1.35f);
 
-        float yCenter = rgbLuma(centerRGBA.rgb);
-        float yOut = computeEnhancedLuma(
-            yCenter,
-            sampleRGBLuma(inColor, x, y - 1, maxX, maxY),
-            sampleRGBLuma(inColor, x, y + 1, maxX, maxY),
-            sampleRGBLuma(inColor, x - 1, y, maxX, maxY),
-            sampleRGBLuma(inColor, x + 1, y, maxX, maxY),
-            sampleRGBLuma(inColor, x - 1, y - 1, maxX, maxY),
-            sampleRGBLuma(inColor, x + 1, y - 1, maxX, maxY),
-            sampleRGBLuma(inColor, x - 1, y + 1, maxX, maxY),
-            sampleRGBLuma(inColor, x + 1, y + 1, maxX, maxY),
-            sampleRGBLuma(inColor, x, y - 2, maxX, maxY),
-            sampleRGBLuma(inColor, x, y + 2, maxX, maxY),
-            sampleRGBLuma(inColor, x - 2, y, maxX, maxY),
-            sampleRGBLuma(inColor, x + 2, y, maxX, maxY),
+        half yC = rgbLumaH(centerRGBA.rgb);
+        half yOut = computeEnhancedLumaFastH(
+            yC,
+            rgbLumaH(inColor.sample(linearSampler, uv - dy).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv + dy).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv - dx).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv + dx).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv - dDiagA).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv + dDiagA).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv - dDiagB).rgb),
+            rgbLumaH(inColor.sample(linearSampler, uv + dDiagB).rgb),
             u
         );
-        float3 finalRGB = clamp(centerRGBA.rgb + float3(yOut - yCenter), 0.0f, 1.0f);
-        outColor.write(float4(finalRGB, centerRGBA.a), gid);
+        half3 finalRGB = clamp(centerRGBA.rgb + half3(yOut - yC), half(0.0h), half(1.0h));
+        outColor.write(half4(finalRGB, centerRGBA.a), gid);
     }
 
     kernel void yuvToBGRAClean(
-        texture2d<float, access::read> inY [[texture(0)]],
-        texture2d<float, access::sample> inUV [[texture(1)]],
-        texture2d<float, access::write> outColor [[texture(2)]],
+        texture2d<half, access::read> inY [[texture(0)]],
+        texture2d<half, access::sample> inUV [[texture(1)]],
+        texture2d<half, access::write> outColor [[texture(2)]],
         constant EnhanceUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -307,11 +450,11 @@ final class MetalVideoEnhancer {
             return;
         }
         constexpr sampler chromaSampler(address::clamp_to_edge, filter::linear);
-        float yRaw = inY.read(gid).r;
+        half yUnit = toUnitLumaH(inY.read(gid).r, u.isVideoRange);
         float2 normCoord = (float2(gid) + 0.5f) / float2(float(outColor.get_width()), float(outColor.get_height()));
-        float2 uvRaw = inUV.sample(chromaSampler, normCoord).rg;
-        float3 rgb = yuvSampleToRGB(yRaw, uvRaw, u.isVideoRange, u.isBT601);
-        outColor.write(float4(rgb, 1.0f), gid);
+        half2 uvRaw = inUV.sample(chromaSampler, normCoord).rg;
+        half3 rgb = yuvSampleToRGBH(yUnit, uvRaw, u.isVideoRange, u.isBT601);
+        outColor.write(half4(rgb, 1.0h), gid);
     }
 
     inline float catmullRomWeight(float x) {
@@ -387,12 +530,31 @@ final class MetalVideoEnhancer {
                 if let fn = library.makeFunction(name: "bicubicUpscaleBGRA") {
                     self.bicubicBGRAPipeline = try dev.makeComputePipelineState(function: fn)
                 }
+
+                if let vertexFn = library.makeFunction(name: "fullscreenQuadVertex") {
+                    if let yuvFrag = library.makeFunction(name: "displayEnhanceYUVFragment") {
+                        let desc = MTLRenderPipelineDescriptor()
+                        desc.vertexFunction = vertexFn
+                        desc.fragmentFunction = yuvFrag
+                        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+                        self.displayYUVRenderPipeline = try dev.makeRenderPipelineState(descriptor: desc)
+                    }
+                    if let bgraFrag = library.makeFunction(name: "displayEnhanceBGRAFragment") {
+                        let desc = MTLRenderPipelineDescriptor()
+                        desc.vertexFunction = vertexFn
+                        desc.fragmentFunction = bgraFrag
+                        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+                        self.displayBGRARenderPipeline = try dev.makeRenderPipelineState(descriptor: desc)
+                    }
+                }
             } catch {
                 self.enhanceLumaPipeline = nil
                 self.copyChromaPipeline = nil
                 self.enhanceBGRAPipeline = nil
                 self.yuvToBGRAPipeline = nil
                 self.bicubicBGRAPipeline = nil
+                self.displayYUVRenderPipeline = nil
+                self.displayBGRARenderPipeline = nil
             }
         }
     }
@@ -410,9 +572,245 @@ final class MetalVideoEnhancer {
         activePipelineLabel = "关闭"
         averageProcessMs = 0
         enhancedFrameCount = 0
+        gpuTimingTracker.reset()
         if let textureCache {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
+    }
+
+    /// 计算将原始视频帧铺满或等比嵌入 CAMetalLayer 的顶点缩放系数
+    nonisolated static func aspectVertexScale(
+        videoWidth: Int,
+        videoHeight: Int,
+        drawableWidth: Int,
+        drawableHeight: Int,
+        aspectFill: Bool
+    ) -> SIMD2<Float> {
+        let vw = Float(max(1, videoWidth))
+        let vh = Float(max(1, videoHeight))
+        let dw = Float(max(1, drawableWidth))
+        let dh = Float(max(1, drawableHeight))
+        let videoAspect = vw / vh
+        let viewAspect = dw / dh
+        if aspectFill {
+            if videoAspect > viewAspect {
+                return SIMD2<Float>(videoAspect / viewAspect, 1.0)
+            }
+            return SIMD2<Float>(1.0, viewAspect / videoAspect)
+        } else {
+            if videoAspect > viewAspect {
+                return SIMD2<Float>(1.0, viewAspect / videoAspect)
+            }
+            return SIMD2<Float>(videoAspect / viewAspect, 1.0)
+        }
+    }
+
+    /// 零拷贝全异步 FP16 直绘路径：直接由 Fragment Shader 采样解码帧输出至 CAMetalLayer，消除 waitUntilCompleted 与中间像素池拷贝
+    func renderToLayer(
+        _ sourceBuffer: CVPixelBuffer,
+        on metalLayer: CAMetalLayer,
+        preset: VideoEnhancementPreset,
+        strength: VideoEnhancementStrength,
+        aspectFill: Bool,
+        compareMode: VideoEnhancementCompareMode = .off,
+        outputFPS: Double = 24.0,
+        thermalState: ProcessInfo.ThermalState = .nominal
+    ) -> Bool {
+        guard preset != .off, compareMode != .original else {
+            activePipelineLabel = compareMode == .original ? "原画对比" : "关闭"
+            return false
+        }
+        guard let device,
+              let commandQueue,
+              let textureCache,
+              let displayYUVRenderPipeline,
+              let displayBGRARenderPipeline else {
+            return false
+        }
+
+        let pixFmt = CVPixelBufferGetPixelFormatType(sourceBuffer)
+        let is8BitBiPlanar = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let isBGRA = (pixFmt == kCVPixelFormatType_32BGRA)
+        guard is8BitBiPlanar || isBGRA else {
+            return false
+        }
+
+        let srcW = CVPixelBufferGetWidth(sourceBuffer)
+        let srcH = CVPixelBufferGetHeight(sourceBuffer)
+        guard srcW >= 2, srcH >= 2 else { return false }
+
+        guard let drawable = metalLayer.nextDrawable(),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return false
+        }
+
+        let params = VideoEnhancementPlanner.parameters(for: preset, strength: strength)
+        let isVideoRange: UInt32 = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
+        let isBT601: UInt32 = Self.isBT601Matrix(on: sourceBuffer) ? 1 : 0
+        var uniforms = makeUniforms(
+            params: params,
+            isVideoRange: isVideoRange,
+            isBT601: isBT601,
+            compareUniform: compareMode.uniformValue
+        )
+
+        let scaleVec = Self.aspectVertexScale(
+            videoWidth: srcW,
+            videoHeight: srcH,
+            drawableWidth: drawable.texture.width,
+            drawableHeight: drawable.texture.height,
+            aspectFill: aspectFill
+        )
+        var vertexUniforms = MetalDisplayVertexUniforms(scaleX: scaleVec.x, scaleY: scaleVec.y)
+
+        let upscaleBudget = VideoEnhancementPlanner.effectiveUpscaleBudget(
+            outputFPS: outputFPS,
+            thermalState: thermalState
+        )
+
+        var renderedBGRAInput: MTLTexture?
+        var nextLabel = "\(preset.rawValue) 直绘"
+
+        if params.wantsSpatialUpscale,
+           upscaleBudget.allowSpatialUpscale,
+           let yuvToBGRAPipeline,
+           let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
+               inputWidth: srcW,
+               inputHeight: srcH,
+               maxLongSide: upscaleBudget.maxLongSide,
+               maxShortSide: upscaleBudget.maxShortSide
+           ) {
+            ensureScalerResources(device: device, inW: srcW, inH: srcH, outW: outDims.width, outH: outDims.height)
+            if let upscaledTex = scalerOutputTexture {
+                let upscaleInputTex: MTLTexture?
+                if is8BitBiPlanar {
+                    if let preBGRATex = scalerInputTexture,
+                       let yTex = makeTexture(from: sourceBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+                       let uvTex = makeTexture(from: sourceBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+                       let preEncoder = commandBuffer.makeComputeCommandEncoder() {
+                        var preUniforms = makeUniforms(
+                            params: params,
+                            isVideoRange: isVideoRange,
+                            isBT601: isBT601,
+                            compareUniform: 0
+                        )
+                        preEncoder.setComputePipelineState(yuvToBGRAPipeline)
+                        preEncoder.setTexture(yTex, index: 0)
+                        preEncoder.setTexture(uvTex, index: 1)
+                        preEncoder.setTexture(preBGRATex, index: 2)
+                        preEncoder.setBytes(&preUniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
+                        dispatch2D(encoder: preEncoder, pipeline: yuvToBGRAPipeline, width: srcW, height: srcH)
+                        preEncoder.endEncoding()
+                        upscaleInputTex = preBGRATex
+                    } else {
+                        upscaleInputTex = nil
+                    }
+                } else {
+                    upscaleInputTex = makeTexture(from: sourceBuffer, pixelFormat: .bgra8Unorm, plane: 0, cache: textureCache)
+                }
+
+                if let upscaleInputTex {
+                    var encodedScale = false
+#if canImport(MetalFX) && !targetEnvironment(simulator)
+                    if let spatialScaler, isUsingHardwareMetalFX {
+                        spatialScaler.colorTexture = upscaleInputTex
+                        spatialScaler.outputTexture = upscaledTex
+                        spatialScaler.encode(commandBuffer: commandBuffer)
+                        encodedScale = true
+                    } else if let bicubicBGRAPipeline,
+                              let upEncoder = commandBuffer.makeComputeCommandEncoder() {
+                        upEncoder.setComputePipelineState(bicubicBGRAPipeline)
+                        upEncoder.setTexture(upscaleInputTex, index: 0)
+                        upEncoder.setTexture(upscaledTex, index: 1)
+                        dispatch2D(encoder: upEncoder, pipeline: bicubicBGRAPipeline, width: outDims.width, height: outDims.height)
+                        upEncoder.endEncoding()
+                        encodedScale = true
+                    }
+#else
+                    if let bicubicBGRAPipeline,
+                       let upEncoder = commandBuffer.makeComputeCommandEncoder() {
+                        upEncoder.setComputePipelineState(bicubicBGRAPipeline)
+                        upEncoder.setTexture(upscaleInputTex, index: 0)
+                        upEncoder.setTexture(upscaledTex, index: 1)
+                        dispatch2D(encoder: upEncoder, pipeline: bicubicBGRAPipeline, width: outDims.width, height: outDims.height)
+                        upEncoder.endEncoding()
+                        encodedScale = true
+                    }
+#endif
+                    if encodedScale {
+                        renderedBGRAInput = upscaledTex
+                        uniforms.isVideoRange = 0
+                        let prefix = isUsingHardwareMetalFX ? "MetalFX直绘" : "超分直绘"
+                        nextLabel = "\(prefix) \(srcW)×\(srcH)→\(outDims.width)×\(outDims.height)"
+                    }
+                }
+            }
+        }
+
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = drawable.texture
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        rpd.colorAttachments[0].storeAction = .store
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else {
+            return false
+        }
+
+        if let bgraTex = renderedBGRAInput {
+            renderEncoder.setRenderPipelineState(displayBGRARenderPipeline)
+            renderEncoder.setVertexBytes(&vertexUniforms, length: MemoryLayout<MetalDisplayVertexUniforms>.size, index: 0)
+            renderEncoder.setFragmentTexture(bgraTex, index: 0)
+            renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
+            renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        } else if is8BitBiPlanar,
+                  let yTex = makeTexture(from: sourceBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+                  let uvTex = makeTexture(from: sourceBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache) {
+            renderEncoder.setRenderPipelineState(displayYUVRenderPipeline)
+            renderEncoder.setVertexBytes(&vertexUniforms, length: MemoryLayout<MetalDisplayVertexUniforms>.size, index: 0)
+            renderEncoder.setFragmentTexture(yTex, index: 0)
+            renderEncoder.setFragmentTexture(uvTex, index: 1)
+            renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
+            renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
+                let tag = (thermalState == .serious || thermalState == .critical) ? "温控直绘" : "省电直绘"
+                nextLabel = "\(tag) \(srcW)×\(srcH)"
+            } else {
+                nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"
+            }
+        } else if isBGRA,
+                  let bgraTex = makeTexture(from: sourceBuffer, pixelFormat: .bgra8Unorm, plane: 0, cache: textureCache) {
+            renderEncoder.setRenderPipelineState(displayBGRARenderPipeline)
+            renderEncoder.setVertexBytes(&vertexUniforms, length: MemoryLayout<MetalDisplayVertexUniforms>.size, index: 0)
+            renderEncoder.setFragmentTexture(bgraTex, index: 0)
+            renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
+            renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"
+        } else {
+            renderEncoder.endEncoding()
+            return false
+        }
+
+        renderEncoder.endEncoding()
+        let commitHost = CACurrentMediaTime()
+        let tracker = gpuTimingTracker
+        commandBuffer.addCompletedHandler { cb in
+            tracker.record(gpuStart: cb.gpuStartTime, gpuEnd: cb.gpuEndTime, fallbackStart: commitHost)
+        }
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+
+        activePipelineLabel = nextLabel
+        enhancedFrameCount += 1
+        let snapMs = gpuTimingTracker.snapshotAverageMs()
+        if snapMs > 0 {
+            averageProcessMs = snapMs
+        }
+        if enhancedFrameCount % 60 == 0 {
+            CVMetalTextureCacheFlush(textureCache, 0)
+        }
+        return true
     }
 
     func process(

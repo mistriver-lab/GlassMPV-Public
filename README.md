@@ -27,7 +27,7 @@
 
 ## 云端自动编译 `.ipa`（GitHub Actions）
 
-1. 推送代码至仓库 `main` 分支，GitHub Actions（`macos-latest`）自动执行 `xcodegen generate`、iOS 模拟器 `GlassMPVTests` 单元测试与无签 Release `.ipa` 打包。
+1. 推送代码至仓库 `main` 分支，GitHub Actions（`macos-latest`）自动执行 `xcodegen generate`、iOS 模拟器 `GlassMPVTests` 单元测试与无签 Release `.ipa`（`GlassMPV-0.1.0-beta.1-b<N>-unsigned.ipa`）打包。
 2. 在 Actions 构建记录的 **Artifacts** 下载 **`GlassMPV-unsigned-ipa`**，通过 Sideloadly / AltStore 签名安装至 iPhone 即可使用。
 
 ---

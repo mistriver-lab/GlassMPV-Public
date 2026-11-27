@@ -66,9 +66,10 @@ def test_version_changelog_and_app_icon():
     from PIL import Image
 
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    assert version == "2026.11.27", f"Expected VERSION 2026.11.27, got {version}"
+    assert version.startswith("0.1.0-beta."), f"Expected 0.1.0-beta.x in VERSION, got {version}"
+    short_version = version.split("-", 1)[0]
     project_cfg = yaml.safe_load((ROOT / "project.yml").read_text(encoding="utf-8"))
-    assert project_cfg["targets"]["GlassMPV"]["settings"]["base"]["MARKETING_VERSION"] == version
+    assert project_cfg["targets"]["GlassMPV"]["settings"]["base"]["MARKETING_VERSION"] == short_version
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert f"[v{version}]" in changelog
@@ -218,6 +219,15 @@ def test_swift_sources_non_empty_and_balanced():
     metal_enhancer_src = metal_enhancer.read_text(encoding="utf-8")
     assert "final class MetalVideoEnhancer" in metal_enhancer_src
     assert "MTLFXSpatialScaler" in metal_enhancer_src
+    assert "renderToLayer" in metal_enhancer_src
+    assert "displayEnhanceYUVFragment" in metal_enhancer_src
+
+    local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
+    assert local_proxy.is_file(), f"Missing {local_proxy}"
+    local_proxy_src = local_proxy.read_text(encoding="utf-8")
+    assert "NWListener" in local_proxy_src
+    assert "mergeSetCookieHeaders" in local_proxy_src
+    assert "rewriteHLSManifest" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -353,6 +363,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testEmbyClientParsersAndStreamBuilders" in swift_test_src
     assert "testWebDAVPropfindXMLParser" in swift_test_src
     assert "testMediaSourceStoreAndCloudPlaybackRequest" in swift_test_src
+    assert "testLocalHTTPStreamProxyParsersCookieMergeAndHLSRewrite" in swift_test_src
+    assert "testLocalHTTPStreamProxyLiveLoopbackRoundTrip" in swift_test_src
+    assert "testMetalDirectRendererAspectMathAndZeroWaitMetrics" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

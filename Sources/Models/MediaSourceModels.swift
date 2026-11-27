@@ -169,4 +169,21 @@ struct PlaybackMediaRequest: Sendable, Equatable {
     let displayTitle: String
     let sourceLabel: String
     let alternatives: [StreamVariantOption]
+    let accountID: UUID?
+
+    init(
+        url: URL,
+        headers: [String: String],
+        displayTitle: String,
+        sourceLabel: String,
+        alternatives: [StreamVariantOption],
+        accountID: UUID? = nil
+    ) {
+        self.url = url
+        self.headers = headers
+        self.displayTitle = displayTitle
+        self.sourceLabel = sourceLabel
+        self.alternatives = alternatives
+        self.accountID = accountID
+    }
 }

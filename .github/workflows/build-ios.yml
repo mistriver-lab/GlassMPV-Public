@@ -66,17 +66,18 @@ jobs:
 
       - name: Build unsigned Release app
         run: |
-          DATE_VER=$(TZ=Asia/Shanghai date +%Y.%m.%d)
-          BUILD_TIME=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
-          echo "DATE_VER=$DATE_VER" >> "$GITHUB_ENV"
-          echo "BUILD_TIME=$BUILD_TIME" >> "$GITHUB_ENV"
+          VERSION_TAG=$(tr -d '\r\n' < VERSION)
+          SHORT_VER="${VERSION_TAG%%-*}"
+          BUILD_NUM="${GITHUB_RUN_NUMBER:-1}"
+          echo "VERSION_TAG=$VERSION_TAG" >> "$GITHUB_ENV"
+          echo "BUILD_NUM=$BUILD_NUM" >> "$GITHUB_ENV"
           xcodebuild \
             -project GlassMPV.xcodeproj \
             -scheme GlassMPV \
             -configuration Release \
             -destination "generic/platform=iOS" \
-            MARKETING_VERSION="$DATE_VER" \
-            CURRENT_PROJECT_VERSION="$BUILD_TIME" \
+            MARKETING_VERSION="$SHORT_VER" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -96,7 +97,7 @@ jobs:
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q CADisableMinimumFrameDurationOnPhone
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q UILaunchScreen
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q CFBundleIcons
-          zip -qry "GlassMPV-${DATE_VER}-${BUILD_TIME}-unsigned.ipa" Payload
+          zip -qry "GlassMPV-${VERSION_TAG}-b${BUILD_NUM}-unsigned.ipa" Payload
 
       - name: Upload GlassMPV-unsigned.ipa
         uses: actions/upload-artifact@v4

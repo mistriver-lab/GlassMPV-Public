@@ -652,6 +652,17 @@ final class PlayerCoordinator: ObservableObject {
         opticalFlowController.setEDREnabled(isEDREnabled)
         opticalFlowController.setAspectFill(isAspectFill)
         opticalFlowController.isLoopingEnabled = isLooping
+        if let accountID = activeMediaRequest?.accountID,
+           let matchedAccount = mediaSourceStore.accounts.first(where: { $0.id == accountID }) {
+            let storeRef = mediaSourceStore
+            opticalFlowController.onRemoteCookieRefresh = { refreshedCookie in
+                Task { @MainActor in
+                    storeRef.addOrUpdate(account: matchedAccount, secret: refreshedCookie)
+                }
+            }
+        } else {
+            opticalFlowController.onRemoteCookieRefresh = nil
+        }
         let enableInterp = (interpolationMode == .vtOpticalFlow)
         opticalFlowController.load(
             url: url,
