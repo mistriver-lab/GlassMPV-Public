@@ -1777,8 +1777,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var remoteStatusObserver: NSKeyValueObservation?
     var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
     var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
-    @MainActor var onRemoteAssetReady: ((_ asset: AVAsset, _ playerItem: AVPlayerItem) -> Void)?
-    @MainActor var onLocalAssetReady: ((_ asset: AVAsset, _ url: URL) -> Void)?
+    var onRemoteAssetReady: (@MainActor (_ asset: AVAsset, _ playerItem: AVPlayerItem) -> Void)?
+    var onLocalAssetReady: (@MainActor (_ asset: AVAsset, _ url: URL) -> Void)?
     private var didLogFirstRemoteFrame: Bool = false
     private final class RemoteWatchdogHolder: @unchecked Sendable {
         var task: Task<Void, Never>?
