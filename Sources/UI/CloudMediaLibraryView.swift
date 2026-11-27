@@ -1048,6 +1048,9 @@ struct CloudSourceBrowserSheet: View {
         let secret = store.secret(for: account.id)
         let subCandidates = buildSubtitleCandidates(for: item, secret: secret)
 
+        let videoPlaylist = items.filter { !$0.isDirectory && !$0.isSubtitle }
+        let playlistIdx = videoPlaylist.firstIndex(where: { $0.id == item.id })
+
         Task { @MainActor in
             do {
                 let resolved = try await resolveStream(for: item, secret: secret, preferAlternate: preferAlternate)
@@ -1060,7 +1063,10 @@ struct CloudSourceBrowserSheet: View {
                     alternatives: resolved.alternatives,
                     accountID: account.id,
                     cloudItem: item,
-                    subtitleCandidates: subCandidates
+                    subtitleCandidates: subCandidates,
+                    playlist: videoPlaylist,
+                    playlistIndex: playlistIdx,
+                    directorySubtitles: directorySubtitleItems
                 )
                 busyMessage = nil
                 dismiss()

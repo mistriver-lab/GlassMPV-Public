@@ -1708,6 +1708,12 @@ private final class VTDecompressionSessionHolder: @unchecked Sendable {
     }
 }
 
+struct AudioTrackOption: Identifiable, Equatable, Hashable, Sendable {
+    let id: Int
+    let displayName: String
+    let languageCode: String
+}
+
 /// Apple Silicon ANE 硬件光流真补帧播放控制器（基于 VideoToolbox VTFrameProcessor）
 final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isPaused: Bool = true
@@ -1755,6 +1761,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var displayTitle: String = ""
     @Published @MainActor var activeStreamLabel: String = ""
     @Published @MainActor var isRemoteStream: Bool = false
+    @Published @MainActor var availableAudioTracks: [AudioTrackOption] = []
+    @Published @MainActor var selectedAudioTrackIndex: Int? = nil
+    @MainActor private var activeAudibleGroup: AVMediaSelectionGroup? = nil
     @MainActor private var rawHDRTransferName: String? = nil
     @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
     @MainActor private var rawDroppedFrames: Int64 = 0
@@ -1779,11 +1788,21 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
     var onRemoteAssetReady: (@MainActor (_ asset: AVAsset, _ playerItem: AVPlayerItem) -> Void)?
     var onLocalAssetReady: (@MainActor (_ asset: AVAsset, _ url: URL) -> Void)?
+    var onPlaybackFinished: (@MainActor () -> Void)?
     private var didLogFirstRemoteFrame: Bool = false
     private final class RemoteWatchdogHolder: @unchecked Sendable {
         var task: Task<Void, Never>?
     }
     private let remoteWatchdogHolder = RemoteWatchdogHolder()
+    private final class EndObserverHolder: @unchecked Sendable {
+        var observer: NSObjectProtocol?
+        deinit {
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+    }
+    private let endObserverHolder = EndObserverHolder()
     private var activeActivityIncludesLatencyCritical: Bool = false
 
     @MainActor
@@ -2059,6 +2078,26 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         player.rate = 0
         self.audioPlayer = player
 
+        if let prevEnd = endObserverHolder.observer {
+            NotificationCenter.default.removeObserver(prevEnd)
+            endObserverHolder.observer = nil
+        }
+        endObserverHolder.observer = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isTokenValid(token) else { return }
+                if self.isLoopingEnabled {
+                    self.seek(to: 0)
+                } else {
+                    self.pause()
+                    self.onPlaybackFinished?()
+                }
+            }
+        }
+
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         self.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             let seconds = time.seconds.isFinite ? time.seconds : 0
@@ -2204,6 +2243,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         worker.reconfigure(targetFPS: tier, sourceFPS: srcRate)
                     }
                     self.onRemoteAssetReady?(observedItem.asset, observedItem)
+                    if let audibleGroup = try? await observedItem.asset.loadMediaSelectionGroup(for: .audible),
+                       self.isTokenValid(token) {
+                        self.activeAudibleGroup = audibleGroup
+                        self.availableAudioTracks = audibleGroup.options.enumerated().map { idx, opt in
+                            let title = opt.displayName.isEmpty ? "音轨 \(idx + 1)" : opt.displayName
+                            let lang = opt.locale?.identifier ?? opt.extendedLanguageTag ?? "und"
+                            return AudioTrackOption(id: idx, displayName: title, languageCode: lang)
+                        }
+                        let selected = observedItem.currentMediaSelection.selectedMediaOption(in: audibleGroup)
+                        self.selectedAudioTrackIndex = selected.flatMap { audibleGroup.options.firstIndex(of: $0) }
+                            ?? (audibleGroup.options.isEmpty ? nil : 0)
+                    }
                     self.isLoadingPipeline = false
                     self.pipelineStatusText = ""
                     self.isPipelineReadyToPlay = true
@@ -2759,6 +2810,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    func selectAudioTrack(at index: Int) {
+        guard let group = activeAudibleGroup,
+              index >= 0, index < group.options.count,
+              let item = audioPlayer?.currentItem else {
+            return
+        }
+        item.select(group.options[index], in: group)
+        selectedAudioTrackIndex = index
+        appendLog("[audio] 切换音轨 -> \(group.options[index].displayName)")
+    }
+
+    @MainActor
     func seekRelative(_ delta: Double) {
         seek(to: currentTime + delta)
     }
@@ -2853,6 +2916,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         isRemoteStream = false
         displayTitle = ""
         activeStreamLabel = ""
+        availableAudioTracks = []
+        selectedAudioTrackIndex = nil
+        activeAudibleGroup = nil
+        if let prevEnd = endObserverHolder.observer {
+            NotificationCenter.default.removeObserver(prevEnd)
+            endObserverHolder.observer = nil
+        }
         lastRawPresentedBuffer = nil
         lastRawPresentedPTS = 0
         metalEnhancerStorage?.reset()
@@ -4079,8 +4149,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             flushPublishedTelemetryIfNeeded()
         }
 
-        if isLoopingEnabled,
-           isPipelineReadyToPlay,
+        if isPipelineReadyToPlay,
            !isPaused,
            eofReached,
            remainingQueueCount == 0,
@@ -4088,8 +4157,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             let reachedDurationEnd = duration > 0 && now >= duration - 0.05
             let passedLastFrame = lastPTS > 0 && now >= lastPTS + 0.08
             if reachedDurationEnd || passedLastFrame {
-                appendLog("[ane] 播放到达末尾，自动循环重播")
-                seek(to: 0)
+                if isLoopingEnabled {
+                    appendLog("[ane] 播放到达末尾，自动循环重播")
+                    seek(to: 0)
+                } else {
+                    pause()
+                    onPlaybackFinished?()
+                }
             }
         }
     }
@@ -4204,7 +4278,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             activeCompareMode = qualityCompareMode
         }
 
-        if videoEnhancementPreset != .off {
+        let wantsHighFPSMetalPassthrough = !isDolbyVisionContent
+            && !isHDRContent
+            && isInterpolationEnabled
+            && (effectiveTargetFPS == .fps60 || effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
+
+        if videoEnhancementPreset != .off || wantsHighFPSMetalPassthrough {
             let enhancer = metalEnhancer
             let liveOutputFPS = isInterpolationEnabled
                 ? max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 48.0)
@@ -4217,7 +4296,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
             if !isDolbyVisionContent,
                !isHDRContent,
-               activeCompareMode != .original,
+               (activeCompareMode != .original || wantsHighFPSMetalPassthrough),
                let container = displayContainer {
                 let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
                     outputFPS: liveOutputFPS,
@@ -4232,7 +4311,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     aspectFill: isAspectFill,
                     compareMode: activeCompareMode,
                     outputFPS: liveOutputFPS,
-                    thermalState: thermalNow
+                    thermalState: thermalNow,
+                    allowPassthrough: wantsHighFPSMetalPassthrough
                 )
                 switch renderStatus {
                 case .rendered:
@@ -4240,7 +4320,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     if activeQualityPipelineLabel != enhancer.activePipelineLabel {
                         activeQualityPipelineLabel = enhancer.activePipelineLabel
                     }
-                    updatePresentedFrameMetrics(isRefresh: isRefresh, enhanceMs: enhancer.averageProcessMs)
+                    let reportedEnhanceMs = (videoEnhancementPreset == .off || activeCompareMode == .original)
+                        ? 0
+                        : enhancer.averageProcessMs
+                    updatePresentedFrameMetrics(isRefresh: isRefresh, enhanceMs: reportedEnhanceMs)
                     return
                 case .skippedBusy:
                     container.setMetalOverlayActive(true)
@@ -4251,21 +4334,29 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
 
             displayContainer?.setMetalOverlayActive(false)
-            displayBuffer = enhancer.process(
-                buffer,
-                preset: videoEnhancementPreset,
-                strength: videoEnhancementStrength,
-                isHDRContent: isHDRContent,
-                isDolbyVision: isDolbyVisionContent,
-                bypassForComparison: activeCompareMode == .original,
-                compareMode: activeCompareMode,
-                outputFPS: liveOutputFPS,
-                thermalState: thermalNow
-            )
-            if activeQualityPipelineLabel != enhancer.activePipelineLabel {
-                activeQualityPipelineLabel = enhancer.activePipelineLabel
+            if videoEnhancementPreset != .off {
+                displayBuffer = enhancer.process(
+                    buffer,
+                    preset: videoEnhancementPreset,
+                    strength: videoEnhancementStrength,
+                    isHDRContent: isHDRContent,
+                    isDolbyVision: isDolbyVisionContent,
+                    bypassForComparison: activeCompareMode == .original,
+                    compareMode: activeCompareMode,
+                    outputFPS: liveOutputFPS,
+                    thermalState: thermalNow
+                )
+                if activeQualityPipelineLabel != enhancer.activePipelineLabel {
+                    activeQualityPipelineLabel = enhancer.activePipelineLabel
+                }
+                rawQualityEnhanceMs = enhancer.averageProcessMs
+            } else {
+                displayBuffer = buffer
+                if activeQualityPipelineLabel != "关闭" {
+                    activeQualityPipelineLabel = "关闭"
+                }
+                rawQualityEnhanceMs = 0
             }
-            rawQualityEnhanceMs = enhancer.averageProcessMs
         } else {
             displayContainer?.setMetalOverlayActive(false)
             displayBuffer = buffer

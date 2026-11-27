@@ -2092,4 +2092,77 @@ final class GlassMPVTests: XCTestCase {
         store2.remove(id: entryID)
         XCTAssertTrue(store2.entries.isEmpty)
     }
+
+    @MainActor
+    func testMetalDirectPassthroughModeForHighFPSOriginalQuality() throws {
+        let enhancer = MetalVideoEnhancer()
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.drawableSize = CGSize(width: 256, height: 144)
+
+        var yuvOpt: CVPixelBuffer?
+        let st = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            72,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ] as CFDictionary,
+            &yuvOpt
+        )
+        XCTAssertEqual(st, kCVReturnSuccess)
+        let yuv = try XCTUnwrap(yuvOpt)
+
+        let blockedStatus = enhancer.renderToLayerStatus(
+            yuv,
+            on: metalLayer,
+            preset: .off,
+            strength: .standard,
+            aspectFill: false,
+            compareMode: .off,
+            outputFPS: 120.0,
+            thermalState: .nominal,
+            allowPassthrough: false
+        )
+        XCTAssertEqual(blockedStatus, .unavailable)
+
+        let passthroughStatus = enhancer.renderToLayerStatus(
+            yuv,
+            on: metalLayer,
+            preset: .off,
+            strength: .standard,
+            aspectFill: false,
+            compareMode: .off,
+            outputFPS: 120.0,
+            thermalState: .nominal,
+            allowPassthrough: true
+        )
+        if MTLCreateSystemDefaultDevice() != nil {
+            XCTAssertEqual(passthroughStatus, .rendered)
+            XCTAssertTrue(enhancer.activePipelineLabel.contains("原画直绘"))
+        } else {
+            XCTAssertEqual(passthroughStatus, .unavailable)
+        }
+    }
+
+    func testPlayerGestureMathZonesScrubAndLevels() {
+        XCTAssertEqual(PlayerGestureMath.zone(forX: 50, inWidth: 400), .left)
+        XCTAssertEqual(PlayerGestureMath.zone(forX: 200, inWidth: 400), .center)
+        XCTAssertEqual(PlayerGestureMath.zone(forX: 350, inWidth: 400), .right)
+
+        let forwardDelta = PlayerGestureMath.seekDeltaSeconds(translationX: 200, viewWidth: 400, duration: 1200)
+        let backwardDelta = PlayerGestureMath.seekDeltaSeconds(translationX: -200, viewWidth: 400, duration: 1200)
+        XCTAssertGreaterThan(forwardDelta, 40.0)
+        XCTAssertEqual(forwardDelta, -backwardDelta, accuracy: 0.01)
+
+        let upLevel = PlayerGestureMath.adjustedLevel(start: 0.5, translationY: -100, viewHeight: 400)
+        XCTAssertGreaterThan(upLevel, 0.5)
+        let clampedMax = PlayerGestureMath.adjustedLevel(start: 0.9, translationY: -300, viewHeight: 400)
+        XCTAssertEqual(clampedMax, 1.0, accuracy: 0.001)
+        let clampedMin = PlayerGestureMath.adjustedLevel(start: 0.1, translationY: 300, viewHeight: 400)
+        XCTAssertEqual(clampedMin, 0.0, accuracy: 0.001)
+    }
 }

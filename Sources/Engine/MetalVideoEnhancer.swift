@@ -649,7 +649,8 @@ final class MetalVideoEnhancer {
         aspectFill: Bool,
         compareMode: VideoEnhancementCompareMode = .off,
         outputFPS: Double = 24.0,
-        thermalState: ProcessInfo.ThermalState = .nominal
+        thermalState: ProcessInfo.ThermalState = .nominal,
+        allowPassthrough: Bool = false
     ) -> Bool {
         renderToLayerStatus(
             sourceBuffer,
@@ -659,7 +660,8 @@ final class MetalVideoEnhancer {
             aspectFill: aspectFill,
             compareMode: compareMode,
             outputFPS: outputFPS,
-            thermalState: thermalState
+            thermalState: thermalState,
+            allowPassthrough: allowPassthrough
         ) != .unavailable
     }
 
@@ -672,9 +674,11 @@ final class MetalVideoEnhancer {
         aspectFill: Bool,
         compareMode: VideoEnhancementCompareMode = .off,
         outputFPS: Double = 24.0,
-        thermalState: ProcessInfo.ThermalState = .nominal
+        thermalState: ProcessInfo.ThermalState = .nominal,
+        allowPassthrough: Bool = false
     ) -> MetalDirectRenderResult {
-        guard preset != .off, compareMode != .original else {
+        let isPassthroughDraw = allowPassthrough && (preset == .off || compareMode == .original)
+        guard isPassthroughDraw || (preset != .off && compareMode != .original) else {
             activePipelineLabel = compareMode == .original ? "原画对比" : "关闭"
             return .unavailable
         }
@@ -718,11 +722,12 @@ final class MetalVideoEnhancer {
         let params = VideoEnhancementPlanner.parameters(for: preset, strength: strength)
         let isVideoRange: UInt32 = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: sourceBuffer) ? 1 : 0
+        let effectiveCompareUniform: UInt32 = isPassthroughDraw ? 2 : compareMode.uniformValue
         var uniforms = makeUniforms(
             params: params,
             isVideoRange: isVideoRange,
             isBT601: isBT601,
-            compareUniform: compareMode.uniformValue
+            compareUniform: effectiveCompareUniform
         )
 
         let scaleVec = Self.aspectVertexScale(
@@ -740,9 +745,12 @@ final class MetalVideoEnhancer {
         )
 
         var renderedBGRAInput: MTLTexture?
-        var nextLabel = "\(preset.rawValue) 直绘"
+        var nextLabel = isPassthroughDraw
+            ? (preset == .off ? "原画直绘" : "原画对比直绘")
+            : "\(preset.rawValue) 直绘"
 
-        if params.wantsSpatialUpscale,
+        if !isPassthroughDraw,
+           params.wantsSpatialUpscale,
            upscaleBudget.allowSpatialUpscale,
            let yuvToBGRAPipeline,
            let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
@@ -843,7 +851,9 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(uvTex, index: 1)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
+            if isPassthroughDraw {
+                nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"
+            } else if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
                 let tag = (thermalState == .serious || thermalState == .critical) ? "温控直绘" : "省电直绘"
                 nextLabel = "\(tag) \(srcW)×\(srcH)"
             } else {
@@ -856,7 +866,11 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(bgraTex, index: 0)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"
+            if isPassthroughDraw {
+                nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"
+            } else {
+                nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"
+            }
         } else {
             renderEncoder.endEncoding()
             return .unavailable

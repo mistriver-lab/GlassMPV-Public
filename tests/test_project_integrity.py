@@ -229,6 +229,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "renderToLayer" in metal_enhancer_src
     assert "renderToLayerStatus" in metal_enhancer_src
     assert "displayEnhanceYUVFragment" in metal_enhancer_src
+    assert "allowPassthrough" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -247,8 +248,14 @@ def test_swift_sources_non_empty_and_balanced():
         ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift",
         ROOT / "Sources" / "Engine" / "SubtitleManager.swift",
         ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
+        ROOT / "Sources" / "UI" / "PlayerGestureOverlay.swift",
     ):
         assert required_cloud_file.is_file(), f"Missing {required_cloud_file}"
+
+    gesture_src = (ROOT / "Sources" / "UI" / "PlayerGestureOverlay.swift").read_text(encoding="utf-8")
+    assert "enum PlayerGestureMath" in gesture_src
+    assert "struct PlayerGestureOverlay" in gesture_src
+    assert "MPVolumeView" in gesture_src
 
     remote_worker_src = (ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift").read_text(encoding="utf-8")
     assert "RemoteOpticalFlowBudgetPlanner" in remote_worker_src
@@ -386,6 +393,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "DeviceDiagnosticsSampler" in player_view
     assert "SubtitleControlSheet" in player_view
     assert "WatchHistorySheet" in player_view
+    assert "EpisodePlaylistSheet" in player_view
+    assert "PlayerGestureOverlay" in player_view
     assert "subtitleManager" in player_view
     assert "watchHistoryStore" in player_view
 
@@ -410,6 +419,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testRemoteOpticalFlowBudgetPlannerAndAdaptiveLag" in swift_test_src
     assert "testSubtitleParserSRTWebVTTASSAndActiveLookup" in swift_test_src
     assert "testWatchHistoryStorePersistenceProgressAndContinueWatching" in swift_test_src
+    assert "testMetalDirectPassthroughModeForHighFPSOriginalQuality" in swift_test_src
+    assert "testPlayerGestureMathZonesScrubAndLevels" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

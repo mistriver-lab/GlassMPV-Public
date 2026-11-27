@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.4"
+    static let releaseTag = "0.1.0-beta.5"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.5",
+            date: "2026-11-27",
+            highlights: [
+                "根治「原画关闭画质增强掉至 ~100fps、开增强才满 120fps」差异：MetalVideoEnhancer 新增零滤镜 CAMetalLayer 原画直通模式 (allowPassthrough)，SDR 高刷光流 (60/96/120fps) 下的原画不再经过 AVSampleBufferDisplayLayer 分辨率重配置背压，不开滤镜同样锁满 120.0 fps",
+                "全面对标 Infuse 8 影院级多手势与防误触体验：支持左/右双击 ±10s 连续叠加快进退、居中双击或双指轻点播放/暂停、长按屏幕 2.0× 临时倍速松手恢复、水平滑动精准拖进度、左半屏上下滑调亮度、右半屏上下滑调系统音量，以及独立防误触屏幕锁",
+                "重塑首页与剧集连播体验：首页升级为极简顶栏 + 首屏 C 位「继续观看」宽银幕卡片墙 + 2 列「我的片源」网格 + 紧凑快速打开三联；支持云盘目录选集抽屉、自动连播下一集、多音轨切换、点击切换剩余时长与顶栏影片元数据展示"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.4",
             date: "2026-11-27",

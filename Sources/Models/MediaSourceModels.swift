@@ -184,6 +184,9 @@ struct PlaybackMediaRequest: Sendable, Equatable {
     let accountID: UUID?
     let cloudItem: CloudMediaItem?
     let subtitleCandidates: [CloudSubtitleCandidate]
+    let playlist: [CloudMediaItem]
+    let playlistIndex: Int?
+    let directorySubtitles: [CloudMediaItem]
 
     init(
         url: URL,
@@ -194,7 +197,10 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         alternatives: [StreamVariantOption],
         accountID: UUID? = nil,
         cloudItem: CloudMediaItem? = nil,
-        subtitleCandidates: [CloudSubtitleCandidate] = []
+        subtitleCandidates: [CloudSubtitleCandidate] = [],
+        playlist: [CloudMediaItem] = [],
+        playlistIndex: Int? = nil,
+        directorySubtitles: [CloudMediaItem] = []
     ) {
         self.url = url
         self.headers = headers
@@ -205,5 +211,8 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         self.accountID = accountID
         self.cloudItem = cloudItem
         self.subtitleCandidates = subtitleCandidates
+        self.playlist = playlist
+        self.playlistIndex = playlistIndex
+        self.directorySubtitles = directorySubtitles
     }
 }

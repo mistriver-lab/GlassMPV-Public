@@ -2,6 +2,17 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.5] - 2026-11-27
+
+### 新增与优化 (Added & Improved)
+- **零滤镜 `CAMetalLayer` 原画 120fps 直通 (`MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - 针对 `192203` 实机日志定位的「关闭画质增强时 `AVSampleBufferDisplayLayer` 因 `656×480 ↔ 2960×2160` 分辨率频繁切换产生背压导致帧率跌至 ~100fps」，为 `renderToLayerStatus` 新增 `allowPassthrough` 零滤镜直绘路径（命中 Shader `compareMode == 2` 纯 YUV→RGB/BGRA 硬件直出），使高刷原画与原画对比同样全程稳定锁满 `120.0 fps`。
+- **对标 Infuse 8 的完整影院手势与防误触锁 (`PlayerGestureOverlay` + `PlayerGestureFeedbackOverlay`)**：
+  - 实现 5 路协调原生手势：左/右双击 ±10s 连击叠加、中间双击 / 双指轻点播放暂停、长按 2.0× 临时快进（松手自动恢复）、水平滑动非线性精准 Seek、左半屏上下滑调亮度、右半屏上下滑调系统音量，并配备独立屏幕锁与精美半透明反馈浮层。
+- **全面对标 Infuse 8 首页、剧集连播与多音轨 (`LiquidGlassPlayerView` + `CloudMediaLibraryView` + `MediaSourceModels`)**：
+  - **首页重塑**：极简顶栏 + 首屏 C 位 `248×140`「继续观看」卡片墙 + 2 列「我的片源」网格 + 紧凑三联快速打开 + 单行增强预设胶囊。
+  - **播放体验细节**：顶栏展示影片标题与来源/分辨率/HDR 标签；居中大号盲按播控（快退/播放/快进/上集/下集）；底栏支持点击切换总时长/剩余时长、多音轨选择（`AVMediaSelectionGroup.audible`）与云盘目录剧集抽屉（`EpisodePlaylistSheet`），非循环模式下播完自动连播下一集。
+
 ## [v0.1.0-beta.4] - 2026-11-27
 
 ### 新增与修复 (Added & Fixed)
