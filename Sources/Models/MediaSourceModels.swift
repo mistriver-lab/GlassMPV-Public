@@ -187,6 +187,7 @@ struct PlaybackMediaRequest: Sendable, Equatable {
     let playlist: [CloudMediaItem]
     let playlistIndex: Int?
     let directorySubtitles: [CloudMediaItem]
+    let folderKey: String?
 
     init(
         url: URL,
@@ -200,7 +201,8 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         subtitleCandidates: [CloudSubtitleCandidate] = [],
         playlist: [CloudMediaItem] = [],
         playlistIndex: Int? = nil,
-        directorySubtitles: [CloudMediaItem] = []
+        directorySubtitles: [CloudMediaItem] = [],
+        folderKey: String? = nil
     ) {
         self.url = url
         self.headers = headers
@@ -214,5 +216,6 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         self.playlist = playlist
         self.playlistIndex = playlistIndex
         self.directorySubtitles = directorySubtitles
+        self.folderKey = folderKey
     }
 }

@@ -40,6 +40,17 @@ enum PlayerGestureMath: Sendable {
         let delta = -translationY / max(120.0, viewHeight * 0.62)
         return min(1.0, max(0.0, clampedStart + delta))
     }
+
+    static func pinchTargetAspectFill(scale: Double, currentFill: Bool) -> Bool? {
+        guard scale.isFinite else { return nil }
+        if scale >= 1.15 && !currentFill {
+            return true
+        }
+        if scale <= 0.85 && currentFill {
+            return false
+        }
+        return nil
+    }
 }
 
 enum PlayerGestureFeedbackState: Equatable {
@@ -48,11 +59,15 @@ enum PlayerGestureFeedbackState: Equatable {
     case scrub(target: Double, duration: Double, delta: Double)
     case brightness(Double)
     case volume(Double)
+    case zoom(isFill: Bool)
 }
 
 @MainActor
 struct PlayerGestureOverlay: UIViewRepresentable {
     let isLocked: Bool
+    let isGesturesEnabled: Bool
+    let skipIntervalSeconds: Int
+    let isAspectFill: Bool
     let currentTime: Double
     let duration: Double
     let onSingleTap: () -> Void
@@ -63,6 +78,7 @@ struct PlayerGestureOverlay: UIViewRepresentable {
     let onScrubEnded: (Double) -> Void
     let onBrightnessChanged: (Double) -> Void
     let onVolumeChanged: (Double) -> Void
+    let onPinchZoomChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -79,6 +95,7 @@ struct PlayerGestureOverlay: UIViewRepresentable {
         singleTap.numberOfTapsRequired = 1
         singleTap.numberOfTouchesRequired = 1
         singleTap.delegate = coord
+        coord.singleTapRef = singleTap
 
         let doubleTap = UITapGestureRecognizer(target: coord, action: #selector(Coordinator.handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
@@ -102,11 +119,15 @@ struct PlayerGestureOverlay: UIViewRepresentable {
         pan.maximumNumberOfTouches = 1
         pan.delegate = coord
 
+        let pinch = UIPinchGestureRecognizer(target: coord, action: #selector(Coordinator.handlePinch(_:)))
+        pinch.delegate = coord
+
         view.addGestureRecognizer(singleTap)
         view.addGestureRecognizer(doubleTap)
         view.addGestureRecognizer(twoFingerTap)
         view.addGestureRecognizer(longPress)
         view.addGestureRecognizer(pan)
+        view.addGestureRecognizer(pinch)
 
         coord.setupVolumeHelper(in: view)
         return view
@@ -130,11 +151,13 @@ struct PlayerGestureOverlay: UIViewRepresentable {
         }
 
         var parent: PlayerGestureOverlay
+        weak var singleTapRef: UITapGestureRecognizer?
         private weak var hostView: GestureHostView?
         private var panMode: PanMode = .undecided
         private var startTime: Double = 0
         private var startLevel: Double = 0.5
         private var lastScrubTarget: Double = 0
+        private var didTriggerPinch: Bool = false
 
         init(parent: PlayerGestureOverlay) {
             self.parent = parent
@@ -186,16 +209,17 @@ struct PlayerGestureOverlay: UIViewRepresentable {
         }
 
         @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended, !parent.isLocked, let view = recognizer.view else { return }
+            guard recognizer.state == .ended, !parent.isLocked, parent.isGesturesEnabled, let view = recognizer.view else { return }
             let loc = recognizer.location(in: view)
             let zone = PlayerGestureMath.zone(forX: Double(loc.x), inWidth: Double(view.bounds.width))
+            let step = Double(max(5, parent.skipIntervalSeconds))
             let haptic = UIImpactFeedbackGenerator(style: .light)
             haptic.impactOccurred()
             switch zone {
             case .left:
-                parent.onDoubleTapSkip(-10)
+                parent.onDoubleTapSkip(-step)
             case .right:
-                parent.onDoubleTapSkip(10)
+                parent.onDoubleTapSkip(step)
             case .center:
                 parent.onTogglePlayPause()
             }
@@ -304,6 +328,36 @@ struct PlayerGestureOverlay: UIViewRepresentable {
             default:
                 break
             }
+        }
+
+        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            guard !parent.isLocked, parent.isGesturesEnabled else { return }
+            switch recognizer.state {
+            case .began:
+                didTriggerPinch = false
+            case .changed:
+                guard !didTriggerPinch else { return }
+                if let targetFill = PlayerGestureMath.pinchTargetAspectFill(
+                    scale: Double(recognizer.scale),
+                    currentFill: parent.isAspectFill
+                ) {
+                    didTriggerPinch = true
+                    let haptic = UIImpactFeedbackGenerator(style: .medium)
+                    haptic.impactOccurred()
+                    parent.onPinchZoomChanged(targetFill)
+                }
+            case .ended, .cancelled, .failed:
+                didTriggerPinch = false
+            default:
+                break
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            if gestureRecognizer === singleTapRef {
+                return true
+            }
+            return !parent.isLocked && parent.isGesturesEnabled
         }
 
         func gestureRecognizer(
@@ -426,6 +480,23 @@ struct PlayerGestureFeedbackOverlay: View {
                     title: "音量",
                     level: level,
                     tint: .cyan
+                )
+
+            case .zoom(let isFill):
+                HStack(spacing: 8) {
+                    Image(systemName: isFill ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left")
+                        .font(.callout.weight(.bold))
+                        .foregroundStyle(.cyan)
+                    Text(isFill ? "充满屏幕" : "原始比例")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.white)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 11)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(0.76))
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.20), lineWidth: 0.8))
                 )
             }
         }

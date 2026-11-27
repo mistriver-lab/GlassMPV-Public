@@ -751,11 +751,13 @@ private struct CloudFolderCrumb: Identifiable, Hashable {
     let folderKey: String
 }
 
-struct CloudSourceBrowserSheet: View {
+struct CloudDirectoryBrowserView: View {
     @Environment(\.dismiss) private var dismiss
     let account: MediaSourceAccount
     @ObservedObject var store: MediaSourceStore
     @ObservedObject var watchHistoryStore: WatchHistoryStore
+    @ObservedObject var preferencesStore: UserPreferencesStore
+    let showsCloseButton: Bool
     let onPlay: (PlaybackMediaRequest, Double) -> Void
     let onDownloadLocal: (URL) -> Void
 
@@ -770,22 +772,30 @@ struct CloudSourceBrowserSheet: View {
         account: MediaSourceAccount,
         store: MediaSourceStore,
         watchHistoryStore: WatchHistoryStore,
+        preferencesStore: UserPreferencesStore,
+        initialFolderKey: String? = nil,
+        initialFolderTitle: String? = nil,
+        showsCloseButton: Bool = false,
         onPlay: @escaping (PlaybackMediaRequest, Double) -> Void,
         onDownloadLocal: @escaping (URL) -> Void
     ) {
         self.account = account
         self.store = store
         self.watchHistoryStore = watchHistoryStore
+        self.preferencesStore = preferencesStore
+        self.showsCloseButton = showsCloseButton
         self.onPlay = onPlay
         self.onDownloadLocal = onDownloadLocal
 
-        let rootKey: String
+        let defaultRootKey: String
         switch account.kind {
-        case .quark: rootKey = "0"
-        case .emby: rootKey = ""
-        case .webdav: rootKey = account.baseURL
+        case .quark: defaultRootKey = "0"
+        case .emby: defaultRootKey = ""
+        case .webdav: defaultRootKey = account.baseURL
         }
-        _crumbs = State(initialValue: [CloudFolderCrumb(id: rootKey, title: account.name, folderKey: rootKey)])
+        let startKey = initialFolderKey ?? defaultRootKey
+        let startTitle = initialFolderTitle ?? account.name
+        _crumbs = State(initialValue: [CloudFolderCrumb(id: startKey, title: startTitle, folderKey: startKey)])
     }
 
     private var currentCrumb: CloudFolderCrumb {
@@ -804,116 +814,121 @@ struct CloudSourceBrowserSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                if crumbs.count > 1 {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(Array(crumbs.enumerated()), id: \.element.id) { index, crumb in
-                                Button {
-                                    navigateToCrumb(at: index)
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Text(crumb.title)
-                                            .font(.caption.weight(index == crumbs.count - 1 ? .bold : .medium))
-                                        if index < crumbs.count - 1 {
-                                            Image(systemName: "chevron.right")
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                        }
+        VStack(spacing: 0) {
+            if crumbs.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(Array(crumbs.enumerated()), id: \.element.id) { index, crumb in
+                            Button {
+                                navigateToCrumb(at: index)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(crumb.title)
+                                        .font(.caption.weight(index == crumbs.count - 1 ? .bold : .medium))
+                                    if index < crumbs.count - 1 {
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
                                     }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
                                 }
-                                .buttonStyle(.plain)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
                             }
+                            .buttonStyle(.plain)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
                     }
-                    .background(.ultraThinMaterial)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
                 }
+                .background(.ultraThinMaterial)
+            }
 
-                List {
-                    if let errorMessage {
-                        Section {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Label("加载失败", systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.orange)
-                                Text(errorMessage)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-
-                    if !directorySubtitleItems.isEmpty {
-                        Section {
-                            Label("当前目录已自动发现 \(directorySubtitleItems.count) 个外挂字幕，播放影片将自动匹配加载", systemImage: "captions.bubble.fill")
+            List {
+                if let errorMessage {
+                    Section {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("加载失败", systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.orange)
+                            Text(errorMessage)
                                 .font(.caption)
-                                .foregroundStyle(.cyan)
+                                .foregroundStyle(.secondary)
                         }
                     }
+                }
 
-                    if filteredItems.isEmpty && !isLoading && errorMessage == nil {
-                        ContentUnavailableView(
-                            searchText.isEmpty ? "当前目录暂无支持视频" : "无匹配结果",
-                            systemImage: account.kind.iconName,
-                            description: Text("支持 mp4 / mov / mkv / ts / avi 等主流封装")
+                if !directorySubtitleItems.isEmpty {
+                    Section {
+                        Label("当前目录已自动发现 \(directorySubtitleItems.count) 个外挂字幕，播放影片将自动匹配加载", systemImage: "captions.bubble.fill")
+                            .font(.caption)
+                            .foregroundStyle(.cyan)
+                    }
+                }
+
+                if filteredItems.isEmpty && !isLoading && errorMessage == nil {
+                    ContentUnavailableView(
+                        searchText.isEmpty ? "当前目录暂无支持视频" : "无匹配结果",
+                        systemImage: account.kind.iconName,
+                        description: Text("支持 mp4 / mov / mkv / ts / avi 等主流封装")
+                    )
+                } else {
+                    ForEach(filteredItems) { item in
+                        let history = item.isDirectory ? nil : watchHistoryStore.entry(forCloudItemID: item.id, accountID: account.id)
+                        let folderPinned = item.isDirectory && preferencesStore.isPinned(accountID: account.id, folderKey: item.id)
+                        CloudMediaRowView(
+                            item: item,
+                            historyEntry: history,
+                            isPinnedFolder: folderPinned,
+                            onTap: {
+                                let seekPos: Double
+                                if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
+                                    seekPos = max(0, history.positionSeconds - 2.0)
+                                } else {
+                                    seekPos = 0
+                                }
+                                handleItemTap(item, seekTo: seekPos)
+                            },
+                            onPlayFromBeginning: { handleItemTap(item, seekTo: 0) },
+                            onPlayPreferringAlt: {
+                                let seekPos: Double
+                                if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
+                                    seekPos = max(0, history.positionSeconds - 2.0)
+                                } else {
+                                    seekPos = 0
+                                }
+                                handleItemTap(item, preferAlternate: true, seekTo: seekPos)
+                            },
+                            onCacheOffline: { cacheItemOffline(item) },
+                            onTogglePinFolder: item.isDirectory ? {
+                                preferencesStore.togglePin(account: account, folderKey: item.id, folderTitle: item.name)
+                            } : nil
                         )
-                    } else {
-                        ForEach(filteredItems) { item in
-                            let history = item.isDirectory ? nil : watchHistoryStore.entry(forCloudItemID: item.id, accountID: account.id)
-                            CloudMediaRowView(
-                                item: item,
-                                historyEntry: history,
-                                onTap: {
-                                    let seekPos: Double
-                                    if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
-                                        seekPos = max(0, history.positionSeconds - 2.0)
-                                    } else {
-                                        seekPos = 0
-                                    }
-                                    handleItemTap(item, seekTo: seekPos)
-                                },
-                                onPlayFromBeginning: { handleItemTap(item, seekTo: 0) },
-                                onPlayPreferringAlt: {
-                                    let seekPos: Double
-                                    if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
-                                        seekPos = max(0, history.positionSeconds - 2.0)
-                                    } else {
-                                        seekPos = 0
-                                    }
-                                    handleItemTap(item, preferAlternate: true, seekTo: seekPos)
-                                },
-                                onCacheOffline: { cacheItemOffline(item) }
-                            )
-                        }
                     }
                 }
-                .listStyle(.insetGrouped)
-                .refreshable {
-                    await loadCurrentDirectory()
-                }
             }
-            .overlay {
-                if let busyMessage {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text(busyMessage)
-                            .font(.caption.weight(.medium))
-                    }
-                    .padding(18)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                } else if isLoading && items.isEmpty {
-                    ProgressView("正在读取目录...")
-                }
+            .listStyle(.insetGrouped)
+            .refreshable {
+                await loadCurrentDirectory()
             }
-            .searchable(text: $searchText, prompt: "搜索当前目录影片...")
-            .navigationTitle(currentCrumb.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
+        }
+        .overlay {
+            if let busyMessage {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text(busyMessage)
+                        .font(.caption.weight(.medium))
+                }
+                .padding(18)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            } else if isLoading && items.isEmpty {
+                ProgressView("正在读取目录...")
+            }
+        }
+        .searchable(text: $searchText, prompt: "搜索当前目录影片...")
+        .navigationTitle(currentCrumb.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if showsCloseButton || crumbs.count > 1 {
                 ToolbarItem(placement: .topBarLeading) {
                     if crumbs.count > 1 {
                         Button {
@@ -921,17 +936,34 @@ struct CloudSourceBrowserSheet: View {
                         } label: {
                             Label("上一级", systemImage: "chevron.left")
                         }
-                    } else {
+                    } else if showsCloseButton {
                         Button("关闭") { dismiss() }
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") { dismiss() }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack(spacing: 12) {
+                    let isCurPinned = preferencesStore.isPinned(accountID: account.id, folderKey: currentCrumb.folderKey)
+                    Button {
+                        preferencesStore.togglePin(
+                            account: account,
+                            folderKey: currentCrumb.folderKey,
+                            folderTitle: currentCrumb.title
+                        )
+                    } label: {
+                        Image(systemName: isCurPinned ? "star.fill" : "star")
+                            .foregroundStyle(isCurPinned ? .yellow : .primary)
+                    }
+                    .accessibilityLabel(isCurPinned ? "取消首页收藏" : "钉选到首页收藏")
+
+                    if showsCloseButton {
+                        Button("关闭") { dismiss() }
+                    }
                 }
             }
-            .task(id: currentCrumb.folderKey) {
-                await loadCurrentDirectory()
-            }
+        }
+        .task(id: currentCrumb.folderKey) {
+            await loadCurrentDirectory()
         }
     }
 
@@ -1050,6 +1082,7 @@ struct CloudSourceBrowserSheet: View {
 
         let videoPlaylist = items.filter { !$0.isDirectory && !$0.isSubtitle }
         let playlistIdx = videoPlaylist.firstIndex(where: { $0.id == item.id })
+        let folderKeyID = PinnedFolder.makeID(accountID: account.id, folderKey: currentCrumb.folderKey)
 
         Task { @MainActor in
             do {
@@ -1066,10 +1099,13 @@ struct CloudSourceBrowserSheet: View {
                     subtitleCandidates: subCandidates,
                     playlist: videoPlaylist,
                     playlistIndex: playlistIdx,
-                    directorySubtitles: directorySubtitleItems
+                    directorySubtitles: directorySubtitleItems,
+                    folderKey: folderKeyID
                 )
                 busyMessage = nil
-                dismiss()
+                if showsCloseButton {
+                    dismiss()
+                }
                 onPlay(request, seekTo)
             } catch {
                 busyMessage = nil
@@ -1105,7 +1141,9 @@ struct CloudSourceBrowserSheet: View {
                     suggestedFilename: item.name
                 )
                 busyMessage = nil
-                dismiss()
+                if showsCloseButton {
+                    dismiss()
+                }
                 onDownloadLocal(localURL)
             } catch {
                 busyMessage = nil
@@ -1153,13 +1191,38 @@ struct CloudSourceBrowserSheet: View {
     }
 }
 
+struct CloudSourceBrowserSheet: View {
+    let account: MediaSourceAccount
+    @ObservedObject var store: MediaSourceStore
+    @ObservedObject var watchHistoryStore: WatchHistoryStore
+    @ObservedObject var preferencesStore: UserPreferencesStore
+    let onPlay: (PlaybackMediaRequest, Double) -> Void
+    let onDownloadLocal: (URL) -> Void
+
+    var body: some View {
+        NavigationStack {
+            CloudDirectoryBrowserView(
+                account: account,
+                store: store,
+                watchHistoryStore: watchHistoryStore,
+                preferencesStore: preferencesStore,
+                showsCloseButton: true,
+                onPlay: onPlay,
+                onDownloadLocal: onDownloadLocal
+            )
+        }
+    }
+}
+
 private struct CloudMediaRowView: View {
     let item: CloudMediaItem
     let historyEntry: WatchHistoryEntry?
+    var isPinnedFolder: Bool = false
     let onTap: () -> Void
     let onPlayFromBeginning: () -> Void
     let onPlayPreferringAlt: () -> Void
     let onCacheOffline: () -> Void
+    var onTogglePinFolder: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1222,9 +1285,16 @@ private struct CloudMediaRowView: View {
             Spacer(minLength: 4)
 
             if item.isDirectory {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    if isPinnedFolder {
+                        Image(systemName: "star.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 Menu {
                     Button {
@@ -1265,6 +1335,13 @@ private struct CloudMediaRowView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             onTap()
+        }
+        .contextMenu {
+            if item.isDirectory, let onTogglePinFolder {
+                Button(action: onTogglePinFolder) {
+                    Label(isPinnedFolder ? "取消首页收藏" : "钉选到首页收藏", systemImage: isPinnedFolder ? "star.slash" : "star.fill")
+                }
+            }
         }
     }
 

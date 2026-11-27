@@ -246,18 +246,25 @@ def test_swift_sources_non_empty_and_balanced():
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
         ROOT / "Sources" / "Models" / "SubtitleModels.swift",
         ROOT / "Sources" / "Models" / "WatchHistoryStore.swift",
+        ROOT / "Sources" / "Models" / "UserPreferencesStore.swift",
         ROOT / "Sources" / "Engine" / "MediaSourceClients.swift",
         ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift",
         ROOT / "Sources" / "Engine" / "SubtitleManager.swift",
         ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
         ROOT / "Sources" / "UI" / "PlayerGestureOverlay.swift",
+        ROOT / "Sources" / "UI" / "InfuseHomeShellView.swift",
+        ROOT / "Sources" / "UI" / "PlayerUnifiedSettingsSheet.swift",
     ):
         assert required_cloud_file.is_file(), f"Missing {required_cloud_file}"
 
     gesture_src = (ROOT / "Sources" / "UI" / "PlayerGestureOverlay.swift").read_text(encoding="utf-8")
     assert "enum PlayerGestureMath" in gesture_src
+    assert "pinchTargetAspectFill" in gesture_src
     assert "struct PlayerGestureOverlay" in gesture_src
     assert "MPVolumeView" in gesture_src
+
+    cloud_view_src = (ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift").read_text(encoding="utf-8")
+    assert "struct CloudDirectoryBrowserView" in cloud_view_src
 
     remote_worker_src = (ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift").read_text(encoding="utf-8")
     assert "RemoteOpticalFlowBudgetPlanner" in remote_worker_src
@@ -424,6 +431,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testMetalDirectPassthroughModeForHighFPSOriginalQuality" in swift_test_src
     assert "testPlayerGestureMathZonesScrubAndLevels" in swift_test_src
     assert "testLocalHTTPStreamProxyErrorStatusAndMediaHeaders" in swift_test_src
+    assert "testUserPreferencesStorePinnedFoldersAndSkipIntro" in swift_test_src
+    assert "testPlayerGestureMathPinchZoom" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src

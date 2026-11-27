@@ -2,6 +2,19 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.7] - 2026-11-27
+
+### 新增与重塑 (Added & Redesigned)
+- **原生 3 Tab Infuse 8 信息架构与首页收藏夹 (`InfuseHomeShellView` + `CloudDirectoryBrowserView` + `UserPreferencesStore`)**：
+  - 摒弃单页模态弹窗，重构为原生底部三 Tab 架构：**首页**（「继续观看」剧照卡片墙 + 「收藏夹」钉选目录网格 + 快速打开 + 「本地离线片库」）、**片源**（`NavigationStack` 原生推入浏览夸克/Emby/WebDAV）、**设置**（追剧/手势/默认画质/离线缓存与诊断独立分组页）。
+  - 支持将任意网盘/Emby/WebDAV 目录右上角标星（或长按）钉选到「首页 -> 收藏夹」，进 App 两步直接看剧。
+- **极简影院 HUD 与统一 `⚙️` 四分区设置面板 (`LiquidGlassPlayerView` + `PlayerUnifiedSettingsSheet`)**：
+  - 移除底栏 10 键高噪点彩色胶囊条，加入上下影院暗角渐变与克制底栏，默认隐藏顶部工程师参数角标（可在「设置」或播放面板按需开启）；右侧 `⚙️` 呼出「**视频 \| 音频 \| 字幕 \| 播放**」统一分层面板。
+- **追剧微交互闭环 (`PlayerGestureOverlay` + `UserPreferencesStore` + `LiquidGlassPlayerView`)**：
+  - **双指捏合缩放**：随时捏合切换「原始比例 / 充满屏幕」并带震动与胶囊反馈。
+  - **默认连续播放 + Up Next 卡片**：默认关闭单集循环（可随时开启），片尾最后 15 秒右下角浮现「即将播放下一集」倒计时与立即跳转卡片。
+  - **跳过片头 & 自定义快进退**：片头区间右上角/右下角智能浮现「跳过片头」胶囊，支持按文件夹记住专属片头时长，支持 10s / 15s / 30s 双击与按钮步长切换。
+
 ## [v0.1.0-beta.6] - 2026-11-27
 
 ### 修复与增强 (Fixed & Improved)

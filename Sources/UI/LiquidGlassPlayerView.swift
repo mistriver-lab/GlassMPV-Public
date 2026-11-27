@@ -56,6 +56,7 @@ final class PlayerCoordinator: ObservableObject {
     let mediaSourceStore = MediaSourceStore()
     let subtitleManager = SubtitleManager()
     let watchHistoryStore = WatchHistoryStore()
+    let preferencesStore = UserPreferencesStore()
     private let thermalToken = ThermalObserverToken()
     private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
@@ -73,6 +74,8 @@ final class PlayerCoordinator: ObservableObject {
     }()
 
     init() {
+        isLooping = !preferencesStore.continuousPlayback
+        isAspectFill = preferencesStore.defaultAspectFill
         opticalFlowController.setEDREnabled(isEDREnabled)
         opticalFlowController.setAspectFill(isAspectFill)
         opticalFlowController.isLoopingEnabled = isLooping
@@ -306,6 +309,41 @@ final class PlayerCoordinator: ObservableObject {
         return idx > 0
     }
 
+    var nextEpisodeItem: CloudMediaItem? {
+        guard let idx = activePlaylistIndex, idx + 1 < activePlaylist.count else { return nil }
+        return activePlaylist[idx + 1]
+    }
+
+    var activeFolderKey: String? {
+        activeMediaRequest?.folderKey
+    }
+
+    var currentFolderIntroSeconds: Int {
+        preferencesStore.introDuration(forFolderKey: activeFolderKey)
+    }
+
+    func skipIntro() {
+        let target = Double(currentFolderIntroSeconds)
+        guard target >= 5 else { return }
+        let clamped = activeDuration > 1 ? min(target, max(0, activeDuration - 5)) : target
+        recordUISwitch("skipIntro -> \(Int(clamped))s")
+        seek(to: clamped)
+    }
+
+    func rememberCurrentPositionAsIntro() {
+        guard let folderKey = activeFolderKey, activeCurrentTime >= 15 else { return }
+        let rounded = Int(activeCurrentTime.rounded())
+        preferencesStore.setIntroDuration(rounded, forFolderKey: folderKey)
+        showStreamNotice("已记住本目录片头 \(WatchHistoryEntry.formatClock(Double(rounded)))")
+        recordUISwitch("rememberIntro -> \(rounded)s for \(folderKey)")
+    }
+
+    func resetCurrentFolderIntro() {
+        guard let folderKey = activeFolderKey else { return }
+        preferencesStore.clearIntroDuration(forFolderKey: folderKey)
+        showStreamNotice("已恢复默认片头时长")
+    }
+
     func beginHoldFastForward() {
         guard !isHoldFastForwarding, currentURL != nil else { return }
         speedBeforeHold = speed
@@ -451,7 +489,8 @@ final class PlayerCoordinator: ObservableObject {
                     subtitleCandidates: subCandidates,
                     playlist: playlistSnapshot,
                     playlistIndex: index,
-                    directorySubtitles: dirSubs
+                    directorySubtitles: dirSubs,
+                    folderKey: self.activeMediaRequest?.folderKey
                 )
                 self.openCloudStream(req, seekTo: seekTarget)
             } catch {
@@ -496,7 +535,8 @@ final class PlayerCoordinator: ObservableObject {
             subtitleCandidates: currentReq.subtitleCandidates,
             playlist: currentReq.playlist,
             playlistIndex: currentReq.playlistIndex,
-            directorySubtitles: currentReq.directorySubtitles
+            directorySubtitles: currentReq.directorySubtitles,
+            folderKey: currentReq.folderKey
         )
         recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
         activeMediaRequest = updated
@@ -583,7 +623,8 @@ final class PlayerCoordinator: ObservableObject {
                     subtitleCandidates: req.subtitleCandidates,
                     playlist: req.playlist,
                     playlistIndex: req.playlistIndex,
-                    directorySubtitles: req.directorySubtitles
+                    directorySubtitles: req.directorySubtitles,
+                    folderKey: req.folderKey
                 )
                 self.openCloudStream(updated, seekTo: resumeTime)
             } catch {
@@ -1289,7 +1330,7 @@ final class PlayerCoordinator: ObservableObject {
 
 // MARK: - Smart Source-Adaptive Frame-Rate Preset Strip
 
-private struct FrameRatePresetStrip: View {
+struct FrameRatePresetStrip: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject var optical: OpticalFlowPlayerController
     var compact: Bool = false
@@ -1382,7 +1423,7 @@ private struct FrameRatePresetStrip: View {
 
 // MARK: - Quality Enhancement Preset & Comparison Strip
 
-private struct QualityPresetStrip: View {
+struct QualityPresetStrip: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject var optical: OpticalFlowPlayerController
     var compact: Bool = false
@@ -1502,6 +1543,7 @@ struct LiquidGlassPlayerView: View {
     @ObservedObject private var mediaSourceStore: MediaSourceStore
     @ObservedObject private var subtitleManager: SubtitleManager
     @ObservedObject private var watchHistoryStore: WatchHistoryStore
+    @ObservedObject private var preferencesStore: UserPreferencesStore
 
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = false
@@ -1517,12 +1559,15 @@ struct LiquidGlassPlayerView: View {
     @State private var showChangelogSheet: Bool = false
     @State private var showDiagnosticSheet: Bool = false
     @State private var showAddMediaSourceSheet: Bool = false
-    @State private var activeBrowseAccount: MediaSourceAccount?
+    @State private var showUnifiedSettingsSheet: Bool = false
+    @State private var unifiedSettingsInitialTab: PlayerSettingsTab = .video
+    @State private var dismissedSkipIntro: Bool = false
+    @State private var dismissedUpNext: Bool = false
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
     @State private var isScreenLocked: Bool = false
     @State private var showUnlockPill: Bool = false
-    @State private var showRemainingTime: Bool = false
+    @State private var showRemainingTime: Bool = true
     @State private var gestureFeedback: PlayerGestureFeedbackState = .none
     @State private var skipAccumulatedSeconds: Int = 0
     @State private var skipIsRight: Bool = true
@@ -1537,6 +1582,7 @@ struct LiquidGlassPlayerView: View {
         self._mediaSourceStore = ObservedObject(wrappedValue: coordinator.mediaSourceStore)
         self._subtitleManager = ObservedObject(wrappedValue: coordinator.subtitleManager)
         self._watchHistoryStore = ObservedObject(wrappedValue: coordinator.watchHistoryStore)
+        self._preferencesStore = ObservedObject(wrappedValue: coordinator.preferencesStore)
     }
 
     var body: some View {
@@ -1549,6 +1595,9 @@ struct LiquidGlassPlayerView: View {
 
                 PlayerGestureOverlay(
                     isLocked: isScreenLocked,
+                    isGesturesEnabled: preferencesStore.gesturesEnabled,
+                    skipIntervalSeconds: preferencesStore.skipIntervalSeconds,
+                    isAspectFill: coordinator.isAspectFill,
                     currentTime: coordinator.activeCurrentTime,
                     duration: coordinator.activeDuration,
                     onSingleTap: {
@@ -1625,13 +1674,44 @@ struct LiquidGlassPlayerView: View {
                             gestureFeedbackTask?.cancel()
                             gestureFeedback = .volume(level)
                         }
+                    },
+                    onPinchZoomChanged: { targetFill in
+                        coordinator.setAspectFill(targetFill)
+                        gestureFeedbackTask?.cancel()
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            gestureFeedback = .zoom(isFill: targetFill)
+                        }
+                        scheduleGestureFeedbackClear(delay: 0.9)
                     }
                 )
                 .ignoresSafeArea()
             }
 
             if coordinator.currentURL == nil {
-                welcomeOverlay
+                InfuseHomeShellView(
+                    coordinator: coordinator,
+                    showURLPrompt: $showURLPrompt,
+                    showAddMediaSourceSheet: $showAddMediaSourceSheet,
+                    showHistorySheet: $showHistorySheet,
+                    showEnhancementSheet: $showEnhancementSheet,
+                    showDiagnosticSheet: $showDiagnosticSheet,
+                    showChangelogSheet: $showChangelogSheet
+                ) {
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                        VStack(spacing: 6) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.title3)
+                                .foregroundStyle(.indigo)
+                            Text("系统相册")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.primary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
+                }
             } else {
                 if optical.qualityCompareMode != .off {
                     VStack {
@@ -1765,9 +1845,14 @@ struct LiquidGlassPlayerView: View {
                         }
                         .transition(.opacity)
                     }
-                } else if showHUD {
-                    playerHUDOverlay
-                        .transition(.opacity)
+                } else {
+                    if showHUD {
+                        playerHUDOverlay
+                            .transition(.opacity)
+                    }
+
+                    skipIntroOverlayCard
+                    upNextEpisodeOverlayCard
                 }
             }
 
@@ -1779,6 +1864,12 @@ struct LiquidGlassPlayerView: View {
                 playbackErrorBanner(error)
             }
         }
+        .onAppear {
+            showStatsHUD = preferencesStore.showDeveloperHUD
+        }
+        .onChange(of: preferencesStore.showDeveloperHUD) { _, val in
+            showStatsHUD = val
+        }
         .onChange(of: selectedPhotoItem) { _, newItem in
             guard let newItem else { return }
             selectedPhotoItem = nil
@@ -1788,12 +1879,16 @@ struct LiquidGlassPlayerView: View {
             if newURL != nil {
                 isScreenLocked = false
                 showUnlockPill = false
+                dismissedSkipIntro = false
+                dismissedUpNext = false
                 gestureFeedback = .none
                 showHUD = true
                 scheduleHUDAutoHide()
             } else {
                 isScreenLocked = false
                 showUnlockPill = false
+                dismissedSkipIntro = false
+                dismissedUpNext = false
                 gestureFeedback = .none
                 hudAutoHideTask?.cancel()
             }
@@ -1826,6 +1921,11 @@ struct LiquidGlassPlayerView: View {
             }
         }
         .onChange(of: showPlaylistSheet) { _, presented in
+            if !presented && showHUD {
+                scheduleHUDAutoHide()
+            }
+        }
+        .onChange(of: showUnifiedSettingsSheet) { _, presented in
             if !presented && showHUD {
                 scheduleHUDAutoHide()
             }
@@ -1882,19 +1982,14 @@ struct LiquidGlassPlayerView: View {
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.ultraThinMaterial)
         }
-        .sheet(item: $activeBrowseAccount) { account in
-            CloudSourceBrowserSheet(
-                account: account,
-                store: mediaSourceStore,
-                watchHistoryStore: watchHistoryStore,
-                onPlay: { request, seekTo in
-                    coordinator.openCloudStream(request, seekTo: seekTo)
-                },
-                onDownloadLocal: { localURL in
-                    coordinator.open(url: localURL, isSecurityScoped: false)
-                }
-            )
-            .presentationDetents([.large])
+        .sheet(isPresented: $showUnifiedSettingsSheet) {
+            PlayerUnifiedSettingsSheet(
+                coordinator: coordinator,
+                initialTab: unifiedSettingsInitialTab
+            ) {
+                showDiagnosticSheet = true
+            }
+            .presentationDetents([.medium, .large])
             .presentationBackground(.ultraThinMaterial)
         }
     }
@@ -1910,6 +2005,7 @@ struct LiquidGlassPlayerView: View {
               !showEnhancementSheet,
               !showSubtitleSheet,
               !showPlaylistSheet,
+              !showUnifiedSettingsSheet,
               !showDiagnosticSheet else {
             return
         }
@@ -1925,6 +2021,7 @@ struct LiquidGlassPlayerView: View {
                   !showEnhancementSheet,
                   !showSubtitleSheet,
                   !showPlaylistSheet,
+                  !showUnifiedSettingsSheet,
                   !showDiagnosticSheet else {
                 return
             }
@@ -1986,310 +2083,7 @@ struct LiquidGlassPlayerView: View {
         }
     }
 
-    // MARK: - Infuse 8 Cinema Home
-
-    private var welcomeOverlay: some View {
-        ScrollView(showsIndicators: false) {
-            GlassEffectContainer(spacing: 16) {
-                VStack(alignment: .leading, spacing: 18) {
-                    // 极简顶部标题栏
-                    HStack(spacing: 10) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                .fill(
-                                    LinearGradient(
-                                        colors: [Color.cyan.opacity(0.35), Color.indigo.opacity(0.30)],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                )
-                                .frame(width: 38, height: 38)
-                            Image(systemName: "sparkles.tv")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(.cyan)
-                        }
-
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("GlassMPV")
-                                .font(.title2.bold())
-                            Text("120Hz 光流 · 杜比视界")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Spacer()
-
-                        HStack(spacing: 8) {
-                            Button {
-                                showEnhancementSheet = true
-                            } label: {
-                                Image(systemName: "slider.horizontal.3")
-                                    .font(.callout.weight(.semibold))
-                                    .frame(width: 34, height: 34)
-                                    .contentShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .circle)
-
-                            Button {
-                                showDiagnosticSheet = true
-                            } label: {
-                                Image(systemName: "waveform.path.ecg")
-                                    .font(.footnote.weight(.semibold))
-                                    .frame(width: 34, height: 34)
-                                    .contentShape(Circle())
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .circle)
-
-                            Button {
-                                showChangelogSheet = true
-                            } label: {
-                                Text("v\(AppReleaseInfo.shortVersion)")
-                                    .font(.caption2.monospacedDigit().weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 8)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .capsule)
-                        }
-                    }
-
-                    // 首屏 C 位：继续观看卡片墙
-                    if !watchHistoryStore.entries.isEmpty {
-                        continueWatchingSection
-                    }
-
-                    // 第二区：我的片源（2 列网格）
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("我的片源")
-                                .font(.headline.weight(.bold))
-                            Spacer()
-                            Button {
-                                showAddMediaSourceSheet = true
-                            } label: {
-                                Label("添加", systemImage: "plus")
-                                    .font(.caption.weight(.bold))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
-                        }
-
-                        if mediaSourceStore.accounts.isEmpty {
-                            Button {
-                                showAddMediaSourceSheet = true
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "icloud.and.arrow.down.fill")
-                                        .font(.title3)
-                                        .foregroundStyle(.cyan)
-                                        .frame(width: 40, height: 40)
-                                        .background(Color.cyan.opacity(0.16), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("添加夸克网盘 / Emby / WebDAV")
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(.primary)
-                                        Text("挂载后自动同步剧集列表、内嵌字幕与续播进度")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(14)
-                                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 20))
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
-                            LazyVGrid(columns: columns, spacing: 10) {
-                                ForEach(mediaSourceStore.accounts) { account in
-                                    Button {
-                                        activeBrowseAccount = account
-                                    } label: {
-                                        HStack(spacing: 10) {
-                                            Image(systemName: account.kind.iconName)
-                                                .font(.callout.weight(.semibold))
-                                                .foregroundStyle(account.kind == .emby ? Color.green : (account.kind == .quark ? Color.cyan : Color.indigo))
-                                                .frame(width: 34, height: 34)
-                                                .background(
-                                                    (account.kind == .emby ? Color.green : (account.kind == .quark ? Color.cyan : Color.indigo)).opacity(0.18),
-                                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                )
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(account.name)
-                                                    .font(.subheadline.weight(.semibold))
-                                                    .foregroundStyle(.primary)
-                                                    .lineLimit(1)
-                                                Text(account.kind.displayName)
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                            Spacer(minLength: 0)
-                                        }
-                                        .padding(12)
-                                        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .contextMenu {
-                                        Button(role: .destructive) {
-                                            mediaSourceStore.delete(accountID: account.id)
-                                        } label: {
-                                            Label("删除片源", systemImage: "trash")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 第三区：快速打开（三联紧凑图标卡）
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("快速打开")
-                            .font(.headline.weight(.bold))
-
-                        HStack(spacing: 10) {
-                            Button {
-                                coordinator.presentLocalVideoPicker()
-                            } label: {
-                                VStack(spacing: 6) {
-                                    Image(systemName: "folder.fill")
-                                        .font(.title3)
-                                        .foregroundStyle(.cyan)
-                                    Text("本地文件")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
-
-                            PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
-                                VStack(spacing: 6) {
-                                    Image(systemName: "photo.on.rectangle.angled")
-                                        .font(.title3)
-                                        .foregroundStyle(.indigo)
-                                    Text("系统相册")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
-
-                            Button {
-                                showURLPrompt = true
-                            } label: {
-                                VStack(spacing: 6) {
-                                    Image(systemName: "link")
-                                        .font(.title3)
-                                        .foregroundStyle(.green)
-                                    Text("网络串流")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
-                        }
-                    }
-
-                    // 第四区：单行紧凑预设条（点击进播控与画质设置）
-                    Button {
-                        showEnhancementSheet = true
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: "sparkles")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(.cyan)
-                            Text("增强预设")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text("\(coordinator.currentEnhancementSummary) · \(coordinator.videoEnhancementPreset == .off ? "原画直绘" : coordinator.videoEnhancementPreset.rawValue)")
-                                .font(.caption.monospacedDigit().weight(.semibold))
-                                .foregroundStyle(.primary)
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                        .glassEffect(.regular.interactive(), in: .capsule)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .frame(maxWidth: 560)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 22)
-            }
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    private var continueWatchingSection: some View {
-        let carouselItems = watchHistoryStore.continueWatchingEntries.isEmpty
-            ? Array(watchHistoryStore.entries.prefix(10))
-            : watchHistoryStore.continueWatchingEntries
-
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("继续观看")
-                    .font(.headline.weight(.bold))
-                Spacer()
-                Button {
-                    showHistorySheet = true
-                } label: {
-                    HStack(spacing: 3) {
-                        Text("全部 (\(watchHistoryStore.entries.count))")
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.08), in: Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(carouselItems) { entry in
-                        ContinueWatchingCard(
-                            entry: entry,
-                            thumbnailURL: watchHistoryStore.thumbnailURL(for: entry),
-                            onPlay: {
-                                coordinator.resumeFromHistory(entry)
-                            },
-                            onPlayFromBeginning: {
-                                coordinator.resumeFromHistory(entry, fromBeginning: true)
-                            },
-                            onToggleCompleted: {
-                                watchHistoryStore.markCompleted(id: entry.id, completed: !entry.isCompleted)
-                            },
-                            onDelete: {
-                                watchHistoryStore.remove(id: entry.id)
-                            }
-                        )
-                    }
-                }
-                .padding(.vertical, 2)
-            }
-        }
-    }
-
-    // MARK: - Clean Floating Player HUD
+    // MARK: - Minimalist Infuse 8 Floating Player HUD
 
     private var usesLightweightHighFPSHUD: Bool {
         optical.isInterpolationEnabled
@@ -2327,20 +2121,41 @@ struct LiquidGlassPlayerView: View {
 
     private var playerHUDOverlay: some View {
         ZStack {
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [Color.black.opacity(0.70), Color.clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 120)
+
+                Spacer()
+
+                LinearGradient(
+                    colors: [Color.clear, Color.black.opacity(0.75)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 150)
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+
             VStack {
-                // 顶栏：返回 + 影片标题/元数据 + 快捷工具 + 指标角标
+                // 顶栏：关闭 + 片名/元数据 + 屏幕工具 + 可选开发者角标
                 HStack(spacing: 10) {
                     Button {
                         coordinator.closeToHome()
                     } label: {
-                        Image(systemName: "chevron.backward")
-                            .font(.body.weight(.semibold))
+                        Image(systemName: "xmark")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
                             .frame(width: 34, height: 34)
+                            .background(Color.black.opacity(0.42), in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.7))
                             .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(.regular.interactive(), in: .circle)
 
                     VStack(alignment: .leading, spacing: 1) {
                         Text(optical.displayTitle.isEmpty ? (coordinator.currentURL?.lastPathComponent ?? "GlassMPV") : optical.displayTitle)
@@ -2367,7 +2182,9 @@ struct LiquidGlassPlayerView: View {
                     Spacer(minLength: 8)
 
                     toolbarActionButtons
-                    topRightMetricsBadge
+                    if preferencesStore.showDeveloperHUD {
+                        topRightMetricsBadge
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
@@ -2454,11 +2271,12 @@ struct LiquidGlassPlayerView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
 
-                    hudPanelSurface(cornerRadius: 24) {
+                    hudPanelSurface(cornerRadius: 22) {
                         VStack(spacing: 10) {
                             HStack(spacing: 10) {
                                 Text(formatTime(displayTime))
                                     .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.9))
                                     .frame(width: 48, alignment: .leading)
 
                                 Slider(
@@ -2493,274 +2311,125 @@ struct LiquidGlassPlayerView: View {
                                 .buttonStyle(.plain)
                             }
 
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    let fpsSummary = OpticalFlowTargetFPS.activeCapsuleSummary(
-                                        isOff: coordinator.interpolationMode == .off,
-                                        requested: coordinator.opticalFlowTargetFPS,
-                                        effective: optical.effectiveTargetFPS,
-                                        sourceFPS: optical.sourceFPS,
-                                        spatial2x: coordinator.vtSpatial2x
-                                    )
-                                    let isInterpActive = (coordinator.interpolationMode == .vtOpticalFlow)
-                                    Button {
-                                        fpsAutoCloseTask?.cancel()
-                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                            showQualityPicker = false
-                                            showFPSPicker.toggle()
-                                        }
-                                        if showFPSPicker {
-                                            hudAutoHideTask?.cancel()
-                                        } else {
-                                            scheduleHUDAutoHide()
-                                        }
-                                    } label: {
-                                        HStack(spacing: 5) {
-                                            Image(systemName: coordinator.interpolationMode == .off ? "film" : "sparkles")
-                                                .font(.caption2.weight(.bold))
-                                            VStack(alignment: .leading, spacing: 0) {
-                                                Text(fpsSummary.title)
-                                                    .font(.caption2.monospacedDigit().weight(.bold))
-                                                Text(fpsSummary.subtitle)
-                                                    .font(.system(size: 8.5, weight: .medium))
-                                                    .opacity(0.82)
-                                            }
-                                            Image(systemName: showFPSPicker ? "chevron.down" : "chevron.up")
-                                                .font(.system(size: 9, weight: .bold))
-                                                .opacity(0.78)
-                                        }
-                                        .foregroundStyle(isInterpActive ? .black : .white)
-                                        .padding(.horizontal, 11)
-                                        .padding(.vertical, 6)
-                                        .background(
-                                            Capsule().fill(isInterpActive ? Color.cyan : Color.white.opacity(0.14))
-                                        )
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                isInterpActive ? Color.cyan.opacity(0.9) : Color.white.opacity(0.16),
-                                                lineWidth: 0.7
-                                            )
-                                        )
-                                        .contentShape(Capsule())
-                                    }
-                                    .buttonStyle(.plain)
-
-                                    let isQualityActive = (coordinator.videoEnhancementPreset != .off)
-                                    Button {
-                                        fpsAutoCloseTask?.cancel()
-                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                            showFPSPicker = false
-                                            showQualityPicker.toggle()
-                                        }
-                                        if showQualityPicker {
-                                            hudAutoHideTask?.cancel()
-                                        } else {
-                                            scheduleHUDAutoHide()
-                                        }
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: coordinator.videoEnhancementPreset.iconName)
-                                                .font(.caption2.weight(.bold))
-                                            Text(coordinator.videoEnhancementPreset.shortBadge)
-                                                .font(.caption2.weight(.bold))
-                                        }
-                                        .foregroundStyle(isQualityActive ? .white : Color.primary)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 8)
-                                        .background(
-                                            Capsule().fill(isQualityActive ? Color.purple.opacity(0.92) : Color.white.opacity(0.14))
-                                        )
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                isQualityActive ? Color.purple.opacity(0.9) : Color.white.opacity(0.16),
-                                                lineWidth: 0.7
-                                            )
-                                        )
-                                        .contentShape(Capsule())
-                                    }
-                                    .buttonStyle(.plain)
-
-                                    let isSubActive = subtitleManager.isEnabled && subtitleManager.selectedTrackID != nil
-                                    Button {
-                                        hudAutoHideTask?.cancel()
-                                        showFPSPicker = false
+                            HStack(spacing: 10) {
+                                let fpsSummary = OpticalFlowTargetFPS.activeCapsuleSummary(
+                                    isOff: coordinator.interpolationMode == .off,
+                                    requested: coordinator.opticalFlowTargetFPS,
+                                    effective: optical.effectiveTargetFPS,
+                                    sourceFPS: optical.sourceFPS,
+                                    spatial2x: coordinator.vtSpatial2x
+                                )
+                                let isInterpActive = (coordinator.interpolationMode == .vtOpticalFlow)
+                                Button {
+                                    fpsAutoCloseTask?.cancel()
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
                                         showQualityPicker = false
-                                        showSubtitleSheet = true
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: isSubActive ? "captions.bubble.fill" : "captions.bubble")
-                                                .font(.caption2.weight(.bold))
-                                            Text("字幕")
-                                                .font(.caption2.weight(.bold))
-                                        }
-                                        .foregroundStyle(isSubActive ? .black : .white)
-                                        .padding(.horizontal, 9)
-                                        .padding(.vertical, 8)
-                                        .background(
-                                            Capsule().fill(isSubActive ? Color.cyan : Color.white.opacity(0.14))
-                                        )
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                isSubActive ? Color.cyan.opacity(0.9) : Color.white.opacity(0.16),
-                                                lineWidth: 0.7
-                                            )
-                                        )
-                                        .contentShape(Capsule())
+                                        showFPSPicker.toggle()
                                     }
-                                    .buttonStyle(.plain)
-
-                                    if optical.availableAudioTracks.count > 1 {
-                                        Menu {
-                                            ForEach(optical.availableAudioTracks) { track in
-                                                Button {
-                                                    coordinator.selectAudioTrack(at: track.id)
-                                                    scheduleHUDAutoHide()
-                                                } label: {
-                                                    if optical.selectedAudioTrackIndex == track.id {
-                                                        Label(track.displayName, systemImage: "checkmark")
-                                                    } else {
-                                                        Text(track.displayName)
-                                                    }
-                                                }
-                                            }
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "waveform")
-                                                    .font(.caption2.weight(.bold))
-                                                Text("音轨")
-                                                    .font(.caption2.weight(.bold))
-                                            }
-                                            .foregroundStyle(.white)
-                                            .padding(.horizontal, 9)
-                                            .padding(.vertical, 8)
-                                            .background(Capsule().fill(Color.white.opacity(0.14)))
-                                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
-                                        }
-                                    }
-
-                                    if coordinator.activePlaylist.count > 1 {
-                                        Button {
-                                            hudAutoHideTask?.cancel()
-                                            showPlaylistSheet = true
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "list.bullet.rectangle")
-                                                    .font(.caption2.weight(.bold))
-                                                Text("选集 (\((coordinator.activePlaylistIndex ?? 0) + 1)/\(coordinator.activePlaylist.count))")
-                                                    .font(.caption2.monospacedDigit().weight(.bold))
-                                            }
-                                            .foregroundStyle(.white)
-                                            .padding(.horizontal, 9)
-                                            .padding(.vertical, 8)
-                                            .background(Capsule().fill(Color.white.opacity(0.14)))
-                                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-
-                                    if coordinator.currentStreamVariants.count > 1 {
-                                        Menu {
-                                            ForEach(coordinator.currentStreamVariants) { variant in
-                                                Button {
-                                                    coordinator.switchStreamVariant(variant)
-                                                    scheduleHUDAutoHide()
-                                                } label: {
-                                                    if variant.url == coordinator.currentURL {
-                                                        Label(variant.label, systemImage: "checkmark")
-                                                    } else {
-                                                        Text(variant.label)
-                                                    }
-                                                }
-                                            }
-                                        } label: {
-                                            Text(coordinator.activeMediaRequest?.sourceLabel ?? "切换画质流")
-                                                .font(.caption2.weight(.bold))
-                                                .foregroundStyle(.green)
-                                                .padding(.horizontal, 9)
-                                                .padding(.vertical, 8)
-                                                .background(Capsule().fill(Color.green.opacity(0.18)))
-                                                .overlay(Capsule().strokeBorder(Color.green.opacity(0.55), lineWidth: 0.7))
-                                        }
-                                    }
-
-                                    if optical.isHDRContent {
-                                        Button {
-                                            coordinator.setEDREnabled(!coordinator.isEDREnabled)
-                                            scheduleHUDAutoHide()
-                                        } label: {
-                                            Text(coordinator.isEDREnabled ? "HDR" : "SDR")
-                                                .font(.caption2.weight(.bold))
-                                                .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
-                                                .padding(.horizontal, 9)
-                                                .padding(.vertical, 8)
-                                                .background(
-                                                    Capsule().fill(coordinator.isEDREnabled ? Color.yellow.opacity(0.20) : Color.white.opacity(0.14))
-                                                )
-                                                .overlay(
-                                                    Capsule().strokeBorder(
-                                                        coordinator.isEDREnabled ? Color.yellow.opacity(0.55) : Color.white.opacity(0.16),
-                                                        lineWidth: 0.7
-                                                    )
-                                                )
-                                                .contentShape(Capsule())
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-
-                                    Button {
-                                        coordinator.setLooping(!coordinator.isLooping)
+                                    if showFPSPicker {
+                                        hudAutoHideTask?.cancel()
+                                    } else {
                                         scheduleHUDAutoHide()
-                                    } label: {
-                                        Image(systemName: "repeat")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
-                                            .frame(width: 34, height: 34)
-                                            .background(
-                                                Circle().fill(coordinator.isLooping ? Color.cyan.opacity(0.22) : Color.white.opacity(0.14))
-                                            )
-                                            .overlay(
-                                                Circle().strokeBorder(
-                                                    coordinator.isLooping ? Color.cyan.opacity(0.55) : Color.white.opacity(0.16),
-                                                    lineWidth: 0.7
-                                                )
-                                            )
-                                            .contentShape(Circle())
                                     }
-                                    .buttonStyle(.plain)
-
-                                    Menu {
-                                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
-                                            Button("\(rate, specifier: "%.2g")x") {
-                                                coordinator.setSpeed(rate)
-                                                scheduleHUDAutoHide()
-                                            }
-                                        }
-                                    } label: {
-                                        Text("\(coordinator.speed, specifier: "%.2g")x")
-                                            .font(.caption.monospacedDigit().weight(.semibold))
-                                            .padding(.horizontal, 9)
-                                            .padding(.vertical, 8)
-                                            .background(Capsule().fill(Color.white.opacity(0.14)))
-                                            .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: coordinator.interpolationMode == .off ? "film" : "sparkles")
+                                            .font(.caption2.weight(.bold))
+                                        Text(fpsSummary.title)
+                                            .font(.caption2.monospacedDigit().weight(.bold))
                                     }
+                                    .foregroundStyle(isInterpActive ? .black : .white)
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        Capsule().fill(isInterpActive ? Color.cyan : Color.white.opacity(0.14))
+                                    )
+                                }
+                                .buttonStyle(.plain)
 
+                                let isQualityActive = (coordinator.videoEnhancementPreset != .off)
+                                Button {
+                                    fpsAutoCloseTask?.cancel()
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                        showFPSPicker = false
+                                        showQualityPicker.toggle()
+                                    }
+                                    if showQualityPicker {
+                                        hudAutoHideTask?.cancel()
+                                    } else {
+                                        scheduleHUDAutoHide()
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: coordinator.videoEnhancementPreset.iconName)
+                                            .font(.caption2.weight(.bold))
+                                        Text(coordinator.videoEnhancementPreset.shortBadge)
+                                            .font(.caption2.weight(.bold))
+                                    }
+                                    .foregroundStyle(isQualityActive ? .white : .white.opacity(0.9))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        Capsule().fill(isQualityActive ? Color.purple.opacity(0.90) : Color.white.opacity(0.14))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer(minLength: 4)
+
+                                if coordinator.activePlaylist.count > 1 {
                                     Button {
                                         hudAutoHideTask?.cancel()
-                                        showEnhancementSheet = true
+                                        showPlaylistSheet = true
                                     } label: {
-                                        Image(systemName: "slider.horizontal.3")
-                                            .font(.callout.weight(.semibold))
-                                            .foregroundStyle(.white)
-                                            .frame(width: 34, height: 34)
-                                            .background(Color.indigo.opacity(0.32), in: Circle())
-                                            .overlay(Circle().strokeBorder(Color.indigo.opacity(0.60), lineWidth: 0.7))
-                                            .contentShape(Circle())
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "list.bullet.rectangle")
+                                                .font(.caption2.weight(.bold))
+                                            Text("选集 (\((coordinator.activePlaylistIndex ?? 0) + 1)/\(coordinator.activePlaylist.count))")
+                                                .font(.caption2.monospacedDigit().weight(.bold))
+                                        }
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 7)
+                                        .background(Capsule().fill(Color.white.opacity(0.14)))
                                     }
                                     .buttonStyle(.plain)
                                 }
+
+                                let isSubActive = subtitleManager.isEnabled && subtitleManager.selectedTrackID != nil
+                                Button {
+                                    hudAutoHideTask?.cancel()
+                                    showFPSPicker = false
+                                    showQualityPicker = false
+                                    unifiedSettingsInitialTab = .subtitles
+                                    showUnifiedSettingsSheet = true
+                                } label: {
+                                    Image(systemName: isSubActive ? "captions.bubble.fill" : "captions.bubble")
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(isSubActive ? .black : .white)
+                                        .frame(width: 34, height: 34)
+                                        .background(Capsule().fill(isSubActive ? Color.cyan : Color.white.opacity(0.14)))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    hudAutoHideTask?.cancel()
+                                    showFPSPicker = false
+                                    showQualityPicker = false
+                                    unifiedSettingsInitialTab = .video
+                                    showUnifiedSettingsSheet = true
+                                } label: {
+                                    Image(systemName: "gearshape.fill")
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .frame(width: 34, height: 34)
+                                        .background(Circle().fill(Color.white.opacity(0.16)))
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
-                        .padding(14)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
                     }
                     .frame(maxWidth: 700)
                 }
@@ -2794,6 +2463,7 @@ struct LiquidGlassPlayerView: View {
 
             // 正中 Infuse 风格盲按播控中心（弹层打开时避让）
             if !showFPSPicker && !showQualityPicker {
+                let skipStep = preferencesStore.skipIntervalSeconds
                 HStack(spacing: 24) {
                     if coordinator.activePlaylist.count > 1 {
                         Button {
@@ -2811,11 +2481,11 @@ struct LiquidGlassPlayerView: View {
                     }
 
                     Button {
-                        coordinator.seekRelative(-10)
-                        triggerSkipFeedback(delta: -10)
+                        coordinator.seekRelative(-Double(skipStep))
+                        triggerSkipFeedback(delta: -skipStep)
                         scheduleHUDAutoHide()
                     } label: {
-                        Image(systemName: "gobackward.10")
+                        Image(systemName: "gobackward.\(skipStep)")
                             .font(.title2.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(width: 48, height: 48)
@@ -2839,11 +2509,11 @@ struct LiquidGlassPlayerView: View {
                     .buttonStyle(.plain)
 
                     Button {
-                        coordinator.seekRelative(10)
-                        triggerSkipFeedback(delta: 10)
+                        coordinator.seekRelative(Double(skipStep))
+                        triggerSkipFeedback(delta: skipStep)
                         scheduleHUDAutoHide()
                     } label: {
-                        Image(systemName: "goforward.10")
+                        Image(systemName: "goforward.\(skipStep)")
                             .font(.title2.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(width: 48, height: 48)
@@ -2868,6 +2538,130 @@ struct LiquidGlassPlayerView: View {
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var skipIntroOverlayCard: some View {
+        let introSec = coordinator.currentFolderIntroSeconds
+        if introSec >= 15,
+           !dismissedSkipIntro,
+           coordinator.activeCurrentTime >= 1.5,
+           coordinator.activeCurrentTime < Double(introSec) - 2.0,
+           (coordinator.activeDuration <= 0 || Double(introSec) < coordinator.activeDuration - 10.0),
+           (coordinator.activePlaylist.count > 1 || coordinator.activeMediaRequest?.cloudItem != nil) {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    HStack(spacing: 8) {
+                        Button {
+                            coordinator.skipIntro()
+                            dismissedSkipIntro = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "forward.end.fill")
+                                    .font(.caption.weight(.bold))
+                                Text("跳过片头 · \(WatchHistoryEntry.formatClock(Double(introSec)))")
+                                    .font(.caption.monospacedDigit().weight(.bold))
+                            }
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(Capsule().fill(Color.white.opacity(0.94)))
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            dismissedSkipIntro = true
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .frame(width: 28, height: 28)
+                                .background(Color.black.opacity(0.58), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .shadow(color: .black.opacity(0.4), radius: 8, y: 2)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, showHUD ? 132 : 26)
+                }
+            }
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private var upNextEpisodeOverlayCard: some View {
+        let duration = coordinator.activeDuration
+        let remaining = max(0, duration - coordinator.activeCurrentTime)
+        if let nextItem = coordinator.nextEpisodeItem,
+           !coordinator.isLooping,
+           preferencesStore.autoShowUpNextCard,
+           !dismissedUpNext,
+           duration > 30,
+           remaining <= 15.0,
+           remaining > 0.5 {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("即将播放下一集 · \(Int(ceil(remaining)))s")
+                                .font(.caption2.monospacedDigit().weight(.bold))
+                                .foregroundStyle(.cyan)
+                            Text(nextItem.name)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: 190, alignment: .leading)
+
+                        Button {
+                            coordinator.playNextEpisode()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "play.fill")
+                                    .font(.caption2.weight(.bold))
+                                Text("立即播放")
+                                    .font(.caption.weight(.bold))
+                            }
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color.cyan))
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            dismissedUpNext = true
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.8))
+                                .frame(width: 26, height: 26)
+                                .background(Color.white.opacity(0.14), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.black.opacity(0.82))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.20), lineWidth: 0.8)
+                            )
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 10, y: 3)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, showHUD ? 132 : 26)
+                }
+            }
+            .transition(.move(edge: .trailing).combined(with: .opacity))
         }
     }
 
@@ -2911,18 +2705,20 @@ struct LiquidGlassPlayerView: View {
                 in: .circle
             )
 
-            Button {
-                hudAutoHideTask?.cancel()
-                showDiagnosticSheet = true
-            } label: {
-                Image(systemName: "waveform.path.ecg")
-                    .font(.footnote.weight(.semibold))
-                    .frame(width: 34, height: 34)
-                    .contentShape(Circle())
+            if preferencesStore.showDeveloperHUD {
+                Button {
+                    hudAutoHideTask?.cancel()
+                    showDiagnosticSheet = true
+                } label: {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.footnote.weight(.semibold))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Circle())
+                .glassEffect(.regular.interactive(), in: .circle)
             }
-            .buttonStyle(.plain)
-            .contentShape(Circle())
-            .glassEffect(.regular.interactive(), in: .circle)
         }
     }
 
@@ -3451,7 +3247,7 @@ struct DiagnosticLogSheet: View {
 
 // MARK: - Infuse-Style Watch History Cards & Sheet
 
-private struct ContinueWatchingCard: View {
+struct ContinueWatchingCard: View {
     let entry: WatchHistoryEntry
     let thumbnailURL: URL?
     let onPlay: () -> Void
@@ -3790,6 +3586,159 @@ private struct SubtitleOverlayView: View {
     }
 }
 
+struct SubtitleSettingsSections: View {
+    @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject var subtitleManager: SubtitleManager
+    let onDismissForFilePicker: () -> Void
+
+    var body: some View {
+        Section("字幕轨道") {
+            Toggle("显示字幕", isOn: $subtitleManager.isEnabled)
+
+            if subtitleManager.isLoadingTrack {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在加载并解析字幕...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let status = subtitleManager.statusMessage {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundStyle(.cyan)
+            }
+
+            if subtitleManager.availableTracks.isEmpty {
+                Text("未发现内嵌或同目录字幕，可点击下方按钮导入本地 .srt / .ass / .vtt 字幕")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Button {
+                    subtitleManager.selectTrack(nil)
+                } label: {
+                    HStack {
+                        Text("关闭字幕")
+                        Spacer()
+                        if subtitleManager.selectedTrackID == nil {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.cyan)
+                        }
+                    }
+                }
+
+                ForEach(subtitleManager.availableTracks) { track in
+                    Button {
+                        let storeRef = coordinator.mediaSourceStore
+                        subtitleManager.selectTrack(track) { accountID in
+                            storeRef.secret(for: accountID)
+                        }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(track.displayName)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.primary)
+                                Text(track.detail)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if subtitleManager.selectedTrackID == track.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.cyan)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button {
+                onDismissForFilePicker()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    coordinator.presentSubtitleFilePicker()
+                }
+            } label: {
+                Label("导入外挂字幕 (.srt / .ass / .vtt)", systemImage: "doc.badge.plus")
+                    .foregroundStyle(.cyan)
+            }
+        }
+
+        Section("样式与同步微调") {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("字号大小")
+                    Spacer()
+                    Text("\(Int(subtitleManager.style.fontSize)) pt")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $subtitleManager.style.fontSize, in: 14...34, step: 1)
+                    .tint(.cyan)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("底部边距")
+                    Spacer()
+                    Text("\(Int(subtitleManager.style.bottomPadding)) pt")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $subtitleManager.style.bottomPadding, in: 10...90, step: 2)
+                    .tint(.cyan)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("背景不透明度")
+                    Spacer()
+                    Text("\(Int((subtitleManager.style.backgroundOpacity * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $subtitleManager.style.backgroundOpacity, in: 0...0.85, step: 0.05)
+                    .tint(.cyan)
+            }
+
+            Picker("字体颜色", selection: $subtitleManager.style.colorPreset) {
+                ForEach(SubtitleColorPreset.allCases) { preset in
+                    Text(preset.rawValue).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            HStack {
+                Text("时间偏移")
+                Spacer()
+                Button("-0.25s") {
+                    subtitleManager.style.timeOffsetSeconds -= 0.25
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Text(String(format: "%+.2fs", subtitleManager.style.timeOffsetSeconds))
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .frame(minWidth: 56)
+
+                Button("+0.25s") {
+                    subtitleManager.style.timeOffsetSeconds += 0.25
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if abs(subtitleManager.style.timeOffsetSeconds) > 0.01 {
+                    Button("归零") {
+                        subtitleManager.style.timeOffsetSeconds = 0
+                    }
+                    .font(.caption2)
+                }
+            }
+        }
+    }
+}
+
 struct SubtitleControlSheet: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject private var subtitleManager: SubtitleManager
@@ -3803,150 +3752,11 @@ struct SubtitleControlSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("字幕轨道") {
-                    Toggle("显示字幕", isOn: $subtitleManager.isEnabled)
-
-                    if subtitleManager.isLoadingTrack {
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                            Text("正在加载并解析字幕...")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    if let status = subtitleManager.statusMessage {
-                        Text(status)
-                            .font(.caption2)
-                            .foregroundStyle(.cyan)
-                    }
-
-                    if subtitleManager.availableTracks.isEmpty {
-                        Text("未发现内嵌或同目录字幕，可点击下方按钮导入本地 .srt / .ass / .vtt 字幕")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Button {
-                            subtitleManager.selectTrack(nil)
-                        } label: {
-                            HStack {
-                                Text("关闭字幕")
-                                Spacer()
-                                if subtitleManager.selectedTrackID == nil {
-                                    Image(systemName: "checkmark")
-                                        .foregroundStyle(.cyan)
-                                }
-                            }
-                        }
-
-                        ForEach(subtitleManager.availableTracks) { track in
-                            Button {
-                                let storeRef = coordinator.mediaSourceStore
-                                subtitleManager.selectTrack(track) { accountID in
-                                    storeRef.secret(for: accountID)
-                                }
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(track.displayName)
-                                            .font(.subheadline)
-                                            .foregroundStyle(.primary)
-                                        Text(track.detail)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if subtitleManager.selectedTrackID == track.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.cyan)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Button {
-                        dismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            coordinator.presentSubtitleFilePicker()
-                        }
-                    } label: {
-                        Label("导入外挂字幕 (.srt / .ass / .vtt)", systemImage: "doc.badge.plus")
-                            .foregroundStyle(.cyan)
-                    }
-                }
-
-                Section("样式与同步微调") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("字号大小")
-                            Spacer()
-                            Text("\(Int(subtitleManager.style.fontSize)) pt")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        Slider(value: $subtitleManager.style.fontSize, in: 14...34, step: 1)
-                            .tint(.cyan)
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("底部边距")
-                            Spacer()
-                            Text("\(Int(subtitleManager.style.bottomPadding)) pt")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        Slider(value: $subtitleManager.style.bottomPadding, in: 10...90, step: 2)
-                            .tint(.cyan)
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("背景不透明度")
-                            Spacer()
-                            Text("\(Int((subtitleManager.style.backgroundOpacity * 100).rounded()))%")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        Slider(value: $subtitleManager.style.backgroundOpacity, in: 0...0.85, step: 0.05)
-                            .tint(.cyan)
-                    }
-
-                    Picker("字体颜色", selection: $subtitleManager.style.colorPreset) {
-                        ForEach(SubtitleColorPreset.allCases) { preset in
-                            Text(preset.rawValue).tag(preset)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    HStack {
-                        Text("时间偏移")
-                        Spacer()
-                        Button("-0.25s") {
-                            subtitleManager.style.timeOffsetSeconds -= 0.25
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Text(String(format: "%+.2fs", subtitleManager.style.timeOffsetSeconds))
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .frame(minWidth: 56)
-
-                        Button("+0.25s") {
-                            subtitleManager.style.timeOffsetSeconds += 0.25
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        if abs(subtitleManager.style.timeOffsetSeconds) > 0.01 {
-                            Button("归零") {
-                                subtitleManager.style.timeOffsetSeconds = 0
-                            }
-                            .font(.caption2)
-                        }
-                    }
-                }
+                SubtitleSettingsSections(
+                    coordinator: coordinator,
+                    subtitleManager: subtitleManager,
+                    onDismissForFilePicker: { dismiss() }
+                )
             }
             .navigationTitle("字幕设置")
             .navigationBarTitleDisplayMode(.inline)

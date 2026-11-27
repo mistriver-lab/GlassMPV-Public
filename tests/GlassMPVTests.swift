@@ -2211,4 +2211,52 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(http.statusCode, 502)
         XCTAssertTrue(logBox.snapshot().contains(where: { $0.contains("[proxy][error]") }))
     }
+
+    @MainActor
+    func testUserPreferencesStorePinnedFoldersAndSkipIntro() throws {
+        let suiteName = "glassmpv.prefs.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let store = UserPreferencesStore(defaults: defaults)
+        XCTAssertTrue(store.continuousPlayback)
+        XCTAssertTrue(store.gesturesEnabled)
+        XCTAssertEqual(store.skipIntervalSeconds, 10)
+        XCTAssertEqual(store.defaultSkipIntroSeconds, 85)
+        XCTAssertFalse(store.showDeveloperHUD)
+
+        store.continuousPlayback = false
+        store.skipIntervalSeconds = 15
+        let account = MediaSourceAccount(kind: .quark, name: "主力夸克")
+        store.togglePin(account: account, folderKey: "folder_1", folderTitle: "追剧合集")
+        XCTAssertTrue(store.isPinned(accountID: account.id, folderKey: "folder_1"))
+
+        let folderKey = PinnedFolder.makeID(accountID: account.id, folderKey: "folder_1")
+        XCTAssertEqual(store.introDuration(forFolderKey: folderKey), 85)
+        store.setIntroDuration(105, forFolderKey: folderKey)
+        XCTAssertEqual(store.introDuration(forFolderKey: folderKey), 105)
+        XCTAssertTrue(store.hasCustomIntroDuration(forFolderKey: folderKey))
+
+        let reloaded = UserPreferencesStore(defaults: defaults)
+        XCTAssertFalse(reloaded.continuousPlayback)
+        XCTAssertEqual(reloaded.skipIntervalSeconds, 15)
+        XCTAssertEqual(reloaded.pinnedFolders.count, 1)
+        XCTAssertEqual(reloaded.pinnedFolders.first?.folderTitle, "追剧合集")
+        XCTAssertEqual(reloaded.introDuration(forFolderKey: folderKey), 105)
+
+        reloaded.clearIntroDuration(forFolderKey: folderKey)
+        XCTAssertEqual(reloaded.introDuration(forFolderKey: folderKey), 85)
+        reloaded.removePins(forAccountID: account.id)
+        XCTAssertTrue(reloaded.pinnedFolders.isEmpty)
+    }
+
+    func testPlayerGestureMathPinchZoom() {
+        XCTAssertEqual(PlayerGestureMath.pinchTargetAspectFill(scale: 1.25, currentFill: false), true)
+        XCTAssertNil(PlayerGestureMath.pinchTargetAspectFill(scale: 1.25, currentFill: true))
+        XCTAssertEqual(PlayerGestureMath.pinchTargetAspectFill(scale: 0.78, currentFill: true), false)
+        XCTAssertNil(PlayerGestureMath.pinchTargetAspectFill(scale: 0.78, currentFill: false))
+        XCTAssertNil(PlayerGestureMath.pinchTargetAspectFill(scale: 1.02, currentFill: false))
+    }
 }

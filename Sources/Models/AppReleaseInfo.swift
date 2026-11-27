@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.6"
+    static let releaseTag = "0.1.0-beta.7"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.7",
+            date: "2026-11-27",
+            highlights: [
+                "深度对标 Infuse 8 商业级信息架构：全新原生 3 Tab 底部导航（「首页」继续观看+收藏夹+本地离线片库 / 「片源」NavigationStack 原生推入浏览 / 「设置」独立分组配置），支持任意云盘/Emby/WebDAV 目录右上角一键星标钉选到首页收藏，两步直达追剧",
+                "彻底重塑极简影院级播放 HUD 与统一齿轮面板：移除底部杂乱 10 颗彩色胶囊，引入上下影院暗角渐变、4~5 键克制底栏，将视频增强/画质流切换/多音轨/字幕样式/倍速/片头设定统一收口进 Infuse 风格「⚙️ 视频｜音频｜字幕｜播放」四分区设置面板",
+                "补齐核心追剧微交互闭环：默认开启连续播放下一集（片尾 15s 自动浮现「即将播放下一集」倒计时卡片）、双指捏合屏幕缩放比例（适应↔铺满）、可按剧集目录记忆秒数的「跳过片头」胶囊，以及 10s/15s/30s 自定义快进退步长"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.6",
             date: "2026-11-27",
