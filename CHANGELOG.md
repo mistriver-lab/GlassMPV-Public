@@ -2,6 +2,16 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.9] - 2026-11-27
+
+### 修复与增强 (Fixed & Improved)
+- **彻底根治真 4K 高刷「一闪一闪发糊」(`RemoteStreamOpticalFlowWorker` + `MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - **消除 25Hz 锐度频闪**：`RemoteStreamOpticalFlowWorker` 在分辨率降采样区间发射原帧时对齐输出 `preparedCurr`（并与 `shouldEmitPreparedOriginalFrame` 配合），彻底消除 `540p/480p ×4 ↔ 3840×2160 ×1` 交替闪烁导致的间歇发糊；同步移除 `640×360` / `512×288` 马赛克档（`2×` 抬高至 `1080p→720p`、`60/96fps` `720p→540p`、`120fps` `540p→480p`），并新增 4 对冷启动预热豁免避免首波编译尖峰误降画质。
+  - **原画降采样自动 MetalFX 重建**：`MetalVideoEnhancer.renderToLayerStatus` 在 `preset == .off` 且接收降采样光流帧（非过热状态）时，自动调用硬件 `MTLFXSpatialScaler`（零锐化滤镜、`compareMode == 2`）重建画面细节（`1600×900` / `1920×1080`）。
+- **彻底解决 5.86GB 真 4K 加载卡顿与开关补帧 24~32 秒假死 (`LocalHTTPStreamProxy` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - **MP4 Box-Aware 零扫描直通 + NWConnection 滑动窗口背压**：`MP4HEV1StreamPatcher(startsAtFileOffsetZero:)` 解析顶层 Box 边界，对 multi-GB `mdat` 负载零扫描、零拷贝透传并准确接管尾部 `moov`，对中途 Range 探测后直接 `.passthrough`；`UpstreamStreamRelay` 接入 `4MB / 1MB` `inFlightBytes` 滑动窗口控制 `URLSessionDataTask` `suspend()/resume()` 防止堆积卡死。
+  - **云端流热切换补帧 + 快速关键帧 Seek**：`OpticalFlowPlayerController.setRemoteInterpolationEnabled` 与 `LiquidGlassPlayerView.setInterpolation` 支持云端播放中零断流无缝热开关补帧（不再销毁重构 `AVPlayer`），开启 `preferredForwardBufferDuration = 10s` 并将云端 Seek 容差设为 `0.5s` 关键帧快跳。
+
 ## [v0.1.0-beta.8] - 2026-11-27
 
 ### 修复 (Fixed)

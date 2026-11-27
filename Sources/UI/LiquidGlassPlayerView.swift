@@ -1112,7 +1112,12 @@ final class PlayerCoordinator: ObservableObject {
         }
         recordUISwitch("setInterpolation \(previousMode.rawValue) -> \(mode.rawValue) (paused=\(wasPaused), t=\(String(format: "%.2f", resumeTime))s)")
         if currentURL != nil {
-            startPlayback(seekTo: resumeTime, autoPlay: !wasPaused)
+            if opticalFlowController.canHotToggleInterpolation {
+                opticalFlowController.setRemoteInterpolationEnabled(mode == .vtOpticalFlow, targetFPS: opticalFlowTargetFPS)
+                opticalFlowController.setSpeed(speed)
+            } else {
+                startPlayback(seekTo: resumeTime, autoPlay: !wasPaused)
+            }
         }
     }
 

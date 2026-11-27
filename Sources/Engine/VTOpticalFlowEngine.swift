@@ -2071,6 +2071,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 10.0
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -2127,45 +2129,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 averageInterpolationMs: 0,
                 targetFPS: targetFPS
             )
-            let worker = RemoteStreamOpticalFlowWorker(
-                targetFPS: targetFPS,
-                sourceFPS: 24.0,
-                onTargetDowngrade: { [weak self] lowerTier, reason in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.isTokenValid(token) else { return }
-                        let safeSrc = self.sourceFPS > 1.0 ? self.sourceFPS : 24.0
-                        self.effectiveTargetFPS = lowerTier
-                        self.interpolatedFPS = lowerTier.effectiveTargetFPS(sourceFPS: safeSrc)
-                        let nextLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(
-                            targetFPS: self.interpolatedFPS
-                        )
-                        self.updateQueueLimits(maxQueued: nextLimits.maxQueued, prebuffer: nextLimits.prebuffer)
-                        self.remotePacerLagSeconds = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
-                            sourceFPS: safeSrc,
-                            averageInterpolationMs: 0,
-                            targetFPS: lowerTier
-                        )
-                        self.syncDisplayLinkState()
-                        self.appendLog("[remote][perf] \(reason)")
-                    }
-                },
-                onLog: { [weak self] message in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.isTokenValid(token) else { return }
-                        self.appendLog(message)
-                    }
-                }
-            ) { [weak self] frames, delta, avgMs, label in
-                guard let self else { return }
-                self.enqueueRemoteInterpolatedFrames(
-                    frames,
-                    interpolatedDelta: delta,
-                    avgMs: avgMs,
-                    backendLabel: label,
-                    token: token
-                )
-            }
-            self.remoteFlowWorker = worker
+            self.remoteFlowWorker = makeRemoteFlowWorker(targetFPS: targetFPS, sourceFPS: 24.0, token: token)
         } else {
             self.remoteFlowWorker = nil
         }
@@ -2233,7 +2197,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                     if startAt > 0.25 {
                         let targetCM = CMTime(seconds: startAt, preferredTimescale: 600)
-                        _ = await player.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                        let remoteSeekTolerance = CMTime(seconds: 0.5, preferredTimescale: 600)
+                        _ = await player.seek(to: targetCM, toleranceBefore: remoteSeekTolerance, toleranceAfter: remoteSeekTolerance)
                     }
                     if let worker = self.remoteFlowWorker {
                         let srcRate = self.sourceFPS > 1 ? self.sourceFPS : 24.0
@@ -2290,6 +2255,52 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     break
                 }
             }
+        }
+    }
+
+    @MainActor
+    private func makeRemoteFlowWorker(
+        targetFPS: OpticalFlowTargetFPS,
+        sourceFPS: Double,
+        token: UUID
+    ) -> RemoteStreamOpticalFlowWorker {
+        RemoteStreamOpticalFlowWorker(
+            targetFPS: targetFPS,
+            sourceFPS: sourceFPS,
+            onTargetDowngrade: { [weak self] lowerTier, reason in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isTokenValid(token) else { return }
+                    let safeSrc = self.sourceFPS > 1.0 ? self.sourceFPS : 24.0
+                    self.effectiveTargetFPS = lowerTier
+                    self.interpolatedFPS = lowerTier.effectiveTargetFPS(sourceFPS: safeSrc)
+                    let nextLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(
+                        targetFPS: self.interpolatedFPS
+                    )
+                    self.updateQueueLimits(maxQueued: nextLimits.maxQueued, prebuffer: nextLimits.prebuffer)
+                    self.remotePacerLagSeconds = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
+                        sourceFPS: safeSrc,
+                        averageInterpolationMs: 0,
+                        targetFPS: lowerTier
+                    )
+                    self.syncDisplayLinkState()
+                    self.appendLog("[remote][perf] \(reason)")
+                }
+            },
+            onLog: { [weak self] message in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isTokenValid(token) else { return }
+                    self.appendLog(message)
+                }
+            }
+        ) { [weak self] frames, delta, avgMs, label in
+            guard let self else { return }
+            self.enqueueRemoteInterpolatedFrames(
+                frames,
+                interpolatedDelta: delta,
+                avgMs: avgMs,
+                backendLabel: label,
+                token: token
+            )
         }
     }
 
@@ -2747,7 +2758,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         } else if let audioPlayer {
             audioPlayer.rate = 0
             let targetCM = CMTime(seconds: clamped, preferredTimescale: 600)
-            audioPlayer.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+            let seekTolerance = isRemoteStream ? CMTime(seconds: 0.5, preferredTimescale: 600) : .zero
+            audioPlayer.seek(to: targetCM, toleranceBefore: seekTolerance, toleranceAfter: seekTolerance)
         }
 
         clearBufferedFrames()
@@ -4289,10 +4301,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             activeCompareMode = qualityCompareMode
         }
 
+        let bufLong = max(CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer))
+        let origLong = max(videoWidth, videoHeight)
+        let isDownsampledOpticalFlow = isInterpolationEnabled && origLong > 0 && (bufLong * 100 < origLong * 85)
+
         let wantsHighFPSMetalPassthrough = !isDolbyVisionContent
             && !isHDRContent
             && isInterpolationEnabled
-            && (effectiveTargetFPS == .fps60 || effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
+            && (isDownsampledOpticalFlow || effectiveTargetFPS == .fps60 || effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
 
         if videoEnhancementPreset != .off || wantsHighFPSMetalPassthrough {
             let enhancer = metalEnhancer
@@ -4309,9 +4325,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                !isHDRContent,
                (activeCompareMode != .original || wantsHighFPSMetalPassthrough),
                let container = displayContainer {
+                let allowMetalCapRaise = (videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale)
+                    || (videoEnhancementPreset == .off && isDownsampledOpticalFlow && liveOutputFPS <= 65.0)
                 let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
                     outputFPS: liveOutputFPS,
-                    allowSpatialUpscale: videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale
+                    allowSpatialUpscale: allowMetalCapRaise
                 )
                 container.updateMetalMaxLongSide(metalCap)
                 let renderStatus = enhancer.renderToLayerStatus(
@@ -4323,7 +4341,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     compareMode: activeCompareMode,
                     outputFPS: liveOutputFPS,
                     thermalState: thermalNow,
-                    allowPassthrough: wantsHighFPSMetalPassthrough
+                    allowPassthrough: wantsHighFPSMetalPassthrough,
+                    autoOpticalFlowUpscale: isDownsampledOpticalFlow
                 )
                 switch renderStatus {
                 case .rendered:
@@ -4628,6 +4647,59 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
         }
         return tracks.first
+    }
+
+    @MainActor
+    var canHotToggleInterpolation: Bool {
+        isRemoteStream
+            && currentURL != nil
+            && isPipelineReadyToPlay
+            && errorMessage == nil
+            && audioPlayer != nil
+            && remoteVideoOutput != nil
+    }
+
+    @MainActor
+    func setRemoteInterpolationEnabled(_ enabled: Bool, targetFPS: OpticalFlowTargetFPS) {
+        let safeSrc = sourceFPS > 1.0 ? sourceFPS : 24.0
+        if !enabled {
+            isInterpolationEnabled = false
+            enableSpatial2xUpscale = false
+            remoteFlowWorker = nil
+            clearBufferedFrames()
+            interpolatedFPS = safeSrc
+            activeBackendLabel = "远程硬解直通"
+            if videoEnhancementPreset == .off {
+                displayContainer?.setMetalOverlayActive(false)
+            }
+            syncDisplayLinkState()
+            appendLog("[remote][switch] 云端流在线热关闭补帧，无缝切回原画直通")
+            return
+        }
+
+        isInterpolationEnabled = true
+        requestedTargetFPS = targetFPS
+        effectiveTargetFPS = targetFPS
+        enableSpatial2xUpscale = false
+        let resolvedFPS = targetFPS.effectiveTargetFPS(sourceFPS: safeSrc)
+        interpolatedFPS = resolvedFPS
+        let newLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: resolvedFPS)
+        updateQueueLimits(maxQueued: newLimits.maxQueued, prebuffer: newLimits.prebuffer)
+        remotePacerLagSeconds = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
+            sourceFPS: safeSrc,
+            averageInterpolationMs: 0,
+            targetFPS: targetFPS
+        )
+        clearBufferedFrames()
+        lastRemoteSamplePTS = -1
+        remoteFlowWorker = makeRemoteFlowWorker(
+            targetFPS: targetFPS,
+            sourceFPS: safeSrc,
+            token: currentSessionToken()
+        )
+        activeBackendLabel = "远程·ANE准备中"
+        syncDisplayLinkState()
+        appendLog("[remote][switch] 云端流在线热开启补帧: \(targetFPS.shortBadge)")
     }
 
     @MainActor

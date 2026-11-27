@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.8"
+    static let releaseTag = "0.1.0-beta.9"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.9",
+            date: "2026-11-27",
+            highlights: [
+                "彻底消除 4K 高刷「一闪一闪发糊」频闪：RemoteStreamOpticalFlowWorker 原帧输出与插帧同分辨率基准对齐（消除 480p/360p ×4 ↔ 4K ×1 的 25Hz 锐度闪烁），移除 360p/288p 劣化档并抬高底线至 2×(1080p/720p)、60/96fps(720p/540p)、120fps(540p/480p)，同步增加 4 帧对冷启动预热豁免",
+                "原画降采样光流自动 MetalFX 重建：MetalVideoEnhancer 针对原画+降采样光流帧自动启用硬件 MTLFXSpatialScaler 零锐化感知重建，显著拉回 4K→720p/540p/480p 补帧观感",
+                "彻底优化 5.86GB 真 4K 加载卡顿与开关补帧假死 30s：LocalHTTPStreamProxy 新增 MP4 Box-Aware 状态机零拷贝跳过多 GB mdat 数据块并接入 NWConnection 4MB/1MB 滑动窗口背压；OpticalFlowPlayerController 支持云端流在线热开关补帧、10s 前向缓冲及 0.5s 关键帧快跳"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.8",
             date: "2026-11-27",

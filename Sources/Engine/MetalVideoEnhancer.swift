@@ -709,6 +709,20 @@ final class MetalVideoEnhancer {
         }
     }
 
+    /// 判断原画模式下是否对降采样后的光流帧自动启用硬件 MetalFX 空间重建
+    nonisolated static func shouldAutoMetalFXUpscaleOpticalFlow(
+        preset: VideoEnhancementPreset,
+        allowPassthrough: Bool,
+        isDownsampledOpticalFlow: Bool,
+        thermalState: ProcessInfo.ThermalState
+    ) -> Bool {
+        preset == .off
+            && allowPassthrough
+            && isDownsampledOpticalFlow
+            && thermalState != .serious
+            && thermalState != .critical
+    }
+
     /// 零拷贝全异步 FP16 直绘路径：直接由 Fragment Shader 采样解码帧输出至 CAMetalLayer，消除 waitUntilCompleted 与中间像素池拷贝
     func renderToLayer(
         _ sourceBuffer: CVPixelBuffer,
@@ -719,7 +733,8 @@ final class MetalVideoEnhancer {
         compareMode: VideoEnhancementCompareMode = .off,
         outputFPS: Double = 24.0,
         thermalState: ProcessInfo.ThermalState = .nominal,
-        allowPassthrough: Bool = false
+        allowPassthrough: Bool = false,
+        autoOpticalFlowUpscale: Bool = false
     ) -> Bool {
         renderToLayerStatus(
             sourceBuffer,
@@ -730,7 +745,8 @@ final class MetalVideoEnhancer {
             compareMode: compareMode,
             outputFPS: outputFPS,
             thermalState: thermalState,
-            allowPassthrough: allowPassthrough
+            allowPassthrough: allowPassthrough,
+            autoOpticalFlowUpscale: autoOpticalFlowUpscale
         ) != .unavailable
     }
 
@@ -744,10 +760,17 @@ final class MetalVideoEnhancer {
         compareMode: VideoEnhancementCompareMode = .off,
         outputFPS: Double = 24.0,
         thermalState: ProcessInfo.ThermalState = .nominal,
-        allowPassthrough: Bool = false
+        allowPassthrough: Bool = false,
+        autoOpticalFlowUpscale: Bool = false
     ) -> MetalDirectRenderResult {
         let isPassthroughDraw = allowPassthrough && (preset == .off || compareMode == .original)
         let useHighFPSNeutralCubic = isPassthroughDraw && preset == .off && compareMode != .original && outputFPS > 65.0
+        let wantsAutoMetalFX = Self.shouldAutoMetalFXUpscaleOpticalFlow(
+            preset: preset,
+            allowPassthrough: allowPassthrough,
+            isDownsampledOpticalFlow: autoOpticalFlowUpscale,
+            thermalState: thermalState
+        )
         guard isPassthroughDraw || (preset != .off && compareMode != .original) else {
             activePipelineLabel = compareMode == .original ? "原画对比" : "关闭"
             return .unavailable
@@ -896,6 +919,60 @@ final class MetalVideoEnhancer {
                     }
                 }
             }
+        } else if wantsAutoMetalFX,
+                  let yuvToBGRAPipeline {
+#if canImport(MetalFX) && !targetEnvironment(simulator)
+            let autoMaxLong = (outputFPS > 65.0) ? 1600 : 1920
+            let autoMaxShort = (outputFPS > 65.0) ? 900 : 1080
+            if let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
+                inputWidth: srcW,
+                inputHeight: srcH,
+                maxLongSide: autoMaxLong,
+                maxShortSide: autoMaxShort
+            ) {
+                ensureScalerResources(device: device, inW: srcW, inH: srcH, outW: outDims.width, outH: outDims.height)
+                if let spatialScaler,
+                   isUsingHardwareMetalFX,
+                   let upscaledTex = scalerOutputTexture {
+                    let upscaleInputTex: MTLTexture?
+                    if is8BitBiPlanar {
+                        if let preBGRATex = scalerInputTexture,
+                           let yTex = makeTexture(from: sourceBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+                           let uvTex = makeTexture(from: sourceBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+                           let preEncoder = commandBuffer.makeComputeCommandEncoder() {
+                            var preUniforms = makeUniforms(
+                                params: params,
+                                isVideoRange: isVideoRange,
+                                isBT601: isBT601,
+                                compareUniform: 0
+                            )
+                            preEncoder.setComputePipelineState(yuvToBGRAPipeline)
+                            preEncoder.setTexture(yTex, index: 0)
+                            preEncoder.setTexture(uvTex, index: 1)
+                            preEncoder.setTexture(preBGRATex, index: 2)
+                            preEncoder.setBytes(&preUniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
+                            dispatch2D(encoder: preEncoder, pipeline: yuvToBGRAPipeline, width: srcW, height: srcH)
+                            preEncoder.endEncoding()
+                            upscaleInputTex = preBGRATex
+                        } else {
+                            upscaleInputTex = nil
+                        }
+                    } else {
+                        upscaleInputTex = makeTexture(from: sourceBuffer, pixelFormat: .bgra8Unorm, plane: 0, cache: textureCache)
+                    }
+
+                    if let upscaleInputTex {
+                        spatialScaler.colorTexture = upscaleInputTex
+                        spatialScaler.outputTexture = upscaledTex
+                        spatialScaler.encode(commandBuffer: commandBuffer)
+                        renderedBGRAInput = upscaledTex
+                        uniforms.isVideoRange = 0
+                        uniforms.compareMode = 2
+                        nextLabel = "原画高刷·MetalFX \(srcW)×\(srcH)→\(outDims.width)×\(outDims.height)"
+                    }
+                }
+            }
+#endif
         }
 
         let rpd = MTLRenderPassDescriptor()

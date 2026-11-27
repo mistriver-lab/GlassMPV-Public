@@ -552,28 +552,286 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
 }
 
 struct MP4HEV1StreamPatcher: Sendable {
+    private enum Mode: Sendable {
+        case legacyRawScan
+        case boxAware(BoxState)
+        case probeMidRange
+        case passthrough
+    }
+
+    private enum BoxState: Sendable {
+        case readingHeader
+        case skippingMdat(remaining: UInt64)
+        case scanningBox(remaining: UInt64)
+    }
+
+    private var mode: Mode
     private var tail = Data()
     private let overlapSize: Int = 256
+    private var didValidateFirstBox: Bool = false
+
+    init() {
+        self.mode = .legacyRawScan
+    }
+
+    init(startsAtFileOffsetZero: Bool) {
+        self.mode = startsAtFileOffsetZero ? .boxAware(.readingHeader) : .probeMidRange
+    }
 
     mutating func processChunk(_ chunk: Data) -> Data {
         guard !chunk.isEmpty else { return Data() }
-        tail.append(chunk)
-        _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
-        guard tail.count > overlapSize else {
-            return Data()
+
+        switch mode {
+        case .passthrough:
+            return chunk
+
+        case .legacyRawScan:
+            tail.append(chunk)
+            _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+            guard tail.count > overlapSize else {
+                return Data()
+            }
+            let emitCount = tail.count - overlapSize
+            let out = Data(tail.prefix(emitCount))
+            tail = Data(tail.suffix(overlapSize))
+            return out
+
+        case .boxAware(.skippingMdat(let remaining)) where tail.isEmpty:
+            let chunkCount = UInt64(chunk.count)
+            if chunkCount <= remaining {
+                let left = remaining - chunkCount
+                mode = .boxAware(left == 0 ? .readingHeader : .skippingMdat(remaining: left))
+                return chunk
+            }
+            let prefixLen = Int(remaining)
+            var out = Data(chunk.prefix(prefixLen))
+            tail = Data(chunk.suffix(chunk.count - prefixLen))
+            mode = .boxAware(.readingHeader)
+            out.append(drainBoxAware())
+            return out
+
+        case .boxAware:
+            tail.append(chunk)
+            return drainBoxAware()
+
+        case .probeMidRange:
+            tail.append(chunk)
+            return drainProbeMidRange()
         }
-        let emitCount = tail.count - overlapSize
-        let out = Data(tail.prefix(emitCount))
-        tail = Data(tail.suffix(overlapSize))
-        return out
     }
 
     mutating func flush() -> Data {
         guard !tail.isEmpty else { return Data() }
-        _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
-        let out = tail
-        tail.removeAll(keepingCapacity: false)
-        return out
+        switch mode {
+        case .passthrough:
+            let out = tail
+            tail.removeAll(keepingCapacity: false)
+            return out
+        case .legacyRawScan:
+            _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+            let out = tail
+            tail.removeAll(keepingCapacity: false)
+            return out
+        case .probeMidRange:
+            if Self.containsMetadataSignature(in: tail) {
+                _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+            }
+            let out = tail
+            tail.removeAll(keepingCapacity: false)
+            mode = .passthrough
+            return out
+        case .boxAware(let boxState):
+            switch boxState {
+            case .readingHeader, .skippingMdat:
+                let out = tail
+                tail.removeAll(keepingCapacity: false)
+                return out
+            case .scanningBox:
+                _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+                let out = tail
+                tail.removeAll(keepingCapacity: false)
+                return out
+            }
+        }
+    }
+
+    private mutating func drainProbeMidRange() -> Data {
+        guard tail.count >= 8 else { return Data() }
+        if let topHeader = Self.parseTopBoxHeader(in: tail),
+           Self.isKnownTopLevelBoxFourCC(topHeader.fourCC) {
+            didValidateFirstBox = true
+            mode = .boxAware(.readingHeader)
+            return drainBoxAware()
+        }
+        if let moovRange = tail.range(of: Data("moov".utf8)), moovRange.lowerBound >= 4 {
+            let boxStart = moovRange.lowerBound - 4
+            if let moovHeader = Self.parseTopBoxHeader(in: tail, at: boxStart),
+               moovHeader.fourCC == "moov" {
+                let prefix = Data(tail.prefix(boxStart))
+                tail = Data(tail.suffix(tail.count - boxStart))
+                didValidateFirstBox = true
+                mode = .boxAware(.readingHeader)
+                var out = prefix
+                out.append(drainBoxAware())
+                return out
+            }
+        }
+        if Self.containsMetadataSignature(in: tail) {
+            mode = .legacyRawScan
+            _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+            guard tail.count > overlapSize else { return Data() }
+            let emitCount = tail.count - overlapSize
+            let out = Data(tail.prefix(emitCount))
+            tail = Data(tail.suffix(overlapSize))
+            return out
+        }
+        if tail.count >= 65536 {
+            let out = tail
+            tail.removeAll(keepingCapacity: false)
+            mode = .passthrough
+            return out
+        }
+        return Data()
+    }
+
+    private mutating func drainBoxAware() -> Data {
+        var output = Data()
+        while true {
+            guard case .boxAware(let boxState) = mode else {
+                if !tail.isEmpty {
+                    output.append(tail)
+                    tail.removeAll(keepingCapacity: false)
+                }
+                return output
+            }
+            switch boxState {
+            case .readingHeader:
+                guard let header = Self.parseTopBoxHeader(in: tail) else {
+                    return output
+                }
+                if !didValidateFirstBox {
+                    guard Self.isKnownTopLevelBoxFourCC(header.fourCC) else {
+                        output.append(tail)
+                        tail.removeAll(keepingCapacity: false)
+                        mode = .passthrough
+                        return output
+                    }
+                    didValidateFirstBox = true
+                }
+                if header.fourCC == "mdat" {
+                    output.append(tail.prefix(header.headerSize))
+                    tail = Data(tail.suffix(tail.count - header.headerSize))
+                    if header.sizeField == 0 {
+                        if !tail.isEmpty {
+                            output.append(tail)
+                            tail.removeAll(keepingCapacity: false)
+                        }
+                        mode = .passthrough
+                        return output
+                    }
+                    let payloadBytes = header.totalBoxSize - UInt64(header.headerSize)
+                    mode = .boxAware(payloadBytes == 0 ? .readingHeader : .skippingMdat(remaining: payloadBytes))
+                } else if header.sizeField == 0 {
+                    mode = .legacyRawScan
+                    _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+                    if tail.count > overlapSize {
+                        let emitCount = tail.count - overlapSize
+                        output.append(tail.prefix(emitCount))
+                        tail = Data(tail.suffix(overlapSize))
+                    }
+                    return output
+                } else {
+                    mode = .boxAware(.scanningBox(remaining: header.totalBoxSize))
+                }
+
+            case .skippingMdat(let remaining):
+                guard !tail.isEmpty else { return output }
+                let available = UInt64(tail.count)
+                if available <= remaining {
+                    output.append(tail)
+                    tail.removeAll(keepingCapacity: false)
+                    let left = remaining - available
+                    mode = .boxAware(left == 0 ? .readingHeader : .skippingMdat(remaining: left))
+                    return output
+                }
+                let take = Int(remaining)
+                output.append(tail.prefix(take))
+                tail = Data(tail.suffix(tail.count - take))
+                mode = .boxAware(.readingHeader)
+
+            case .scanningBox(let remaining):
+                guard !tail.isEmpty else { return output }
+                if UInt64(tail.count) >= remaining {
+                    let take = Int(remaining)
+                    var boxData = Data(tail.prefix(take))
+                    _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &boxData)
+                    output.append(boxData)
+                    tail = Data(tail.suffix(tail.count - take))
+                    mode = .boxAware(.readingHeader)
+                } else {
+                    _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+                    guard tail.count > overlapSize else {
+                        return output
+                    }
+                    let emitCount = tail.count - overlapSize
+                    output.append(tail.prefix(emitCount))
+                    tail = Data(tail.suffix(overlapSize))
+                    mode = .boxAware(.scanningBox(remaining: remaining - UInt64(emitCount)))
+                    return output
+                }
+            }
+        }
+    }
+
+    private struct TopBoxHeader {
+        let headerSize: Int
+        let sizeField: UInt32
+        let totalBoxSize: UInt64
+        let fourCC: String
+    }
+
+    private static func parseTopBoxHeader(in data: Data, at offset: Int = 0) -> TopBoxHeader? {
+        let available = data.count - offset
+        guard available >= 8 else { return nil }
+        let start = data.startIndex + offset
+        let size32 = (UInt32(data[start]) << 24)
+            | (UInt32(data[start + 1]) << 16)
+            | (UInt32(data[start + 2]) << 8)
+            | UInt32(data[start + 3])
+        let fourCCBytes = data[(start + 4)..<(start + 8)]
+        guard fourCCBytes.allSatisfy({ $0 >= 0x20 && $0 <= 0x7E }),
+              let fourCC = String(bytes: fourCCBytes, encoding: .ascii) else {
+            return nil
+        }
+        if size32 == 1 {
+            guard available >= 16 else { return nil }
+            var size64: UInt64 = 0
+            for idx in 8..<16 {
+                size64 = (size64 << 8) | UInt64(data[start + idx])
+            }
+            guard size64 >= 16 else { return nil }
+            return TopBoxHeader(headerSize: 16, sizeField: 1, totalBoxSize: size64, fourCC: fourCC)
+        }
+        if size32 == 0 {
+            return TopBoxHeader(headerSize: 8, sizeField: 0, totalBoxSize: 0, fourCC: fourCC)
+        }
+        guard size32 >= 8 else { return nil }
+        return TopBoxHeader(headerSize: 8, sizeField: size32, totalBoxSize: UInt64(size32), fourCC: fourCC)
+    }
+
+    private static func isKnownTopLevelBoxFourCC(_ fourCC: String) -> Bool {
+        switch fourCC {
+        case "ftyp", "moov", "mdat", "moof", "free", "skip", "wide", "meta", "sidx", "styp", "emsg", "uuid", "pdin", "mfra", "prft":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func containsMetadataSignature(in data: Data) -> Bool {
+        data.range(of: Data("moov".utf8)) != nil
+            || data.range(of: Data("stsd".utf8)) != nil
+            || data.range(of: Data("hvcC".utf8)) != nil
     }
 }
 
@@ -700,6 +958,10 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
     private var didSendHeaders = false
     private var shouldPatchMP4Stream = false
     private var mp4Patcher = MP4HEV1StreamPatcher()
+    private var inFlightBytes: Int = 0
+    private var isUpstreamSuspended = false
+    private let highWaterBytes: Int = 4 * 1024 * 1024
+    private let lowWaterBytes: Int = 1 * 1024 * 1024
 
     init(
         connection: NWConnection,
@@ -779,15 +1041,21 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
         onResponse(http)
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
         let isMP4OrBinary = !contentType.lowercased().contains("mpegurl") && !contentType.lowercased().contains("text/")
+        let contentRange = http.value(forHTTPHeaderField: "Content-Range")?.lowercased() ?? ""
+        let startsAtZero = (http.statusCode == 200) || contentRange.hasPrefix("bytes 0-")
         lock.lock()
         shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
+        if shouldPatchMP4Stream {
+            mp4Patcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: startsAtZero)
+        }
         didSendHeaders = true
         lock.unlock()
 
         let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
         let isImportant = http.statusCode >= 400
         let rangeDesc = rangeHeader ?? "full"
-        onLog(isImportant, "[proxy] \(requestMethod) \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms, range=\(rangeDesc))")
+        let pathSuffix = isImportant ? " path=...\(String((http.url?.path ?? "").suffix(48)))" : ""
+        onLog(isImportant, "[proxy] \(requestMethod) \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms, range=\(rangeDesc))\(pathSuffix)")
 
         var headerLines = ["HTTP/1.1 \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))"]
         headerLines.append("Content-Type: \(contentType)")
@@ -807,15 +1075,44 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
     func handleData(_ data: Data) {
         guard !data.isEmpty else { return }
         let outgoing: Data
+        var taskToSuspend: URLSessionDataTask?
         lock.lock()
+        guard !didFinish else {
+            lock.unlock()
+            return
+        }
         if shouldPatchMP4Stream {
             outgoing = mp4Patcher.processChunk(data)
         } else {
             outgoing = data
         }
+        let sentCount = outgoing.count
+        if sentCount > 0 {
+            inFlightBytes += sentCount
+            if inFlightBytes >= highWaterBytes && !isUpstreamSuspended {
+                isUpstreamSuspended = true
+                taskToSuspend = dataTask
+            }
+        }
         lock.unlock()
-        guard !outgoing.isEmpty else { return }
-        connection.send(content: outgoing, completion: .contentProcessed { _ in })
+        taskToSuspend?.suspend()
+        guard sentCount > 0 else { return }
+        connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
+            guard let self else { return }
+            if sendError != nil {
+                self.cancelAll()
+                return
+            }
+            var taskToResume: URLSessionDataTask?
+            self.lock.lock()
+            self.inFlightBytes = max(0, self.inFlightBytes - sentCount)
+            if self.inFlightBytes <= self.lowWaterBytes && self.isUpstreamSuspended && !self.didFinish {
+                self.isUpstreamSuspended = false
+                taskToResume = self.dataTask
+            }
+            self.lock.unlock()
+            taskToResume?.resume()
+        })
     }
 
     func handleCompletion(error: Error?) {

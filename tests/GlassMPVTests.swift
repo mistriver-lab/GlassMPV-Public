@@ -1944,28 +1944,44 @@ final class GlassMPVTests: XCTestCase {
 
     func testRemoteOpticalFlowBudgetPlannerAndAdaptiveLag() {
         let plan2x = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
-            sourceWidth: 2936,
+            sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 1
         )
-        XCTAssertEqual(plan2x.first?.height, 720)
-        XCTAssertEqual(plan2x.map(\.height), [720, 540, 480])
+        XCTAssertEqual(plan2x.map(\.height), [1080, 720])
 
         let plan96 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
-            sourceWidth: 2936,
+            sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 3
         )
-        XCTAssertEqual(plan96.first?.height, 540)
-        XCTAssertTrue(plan96.contains(where: { $0.height == 480 }))
+        XCTAssertEqual(plan96.map(\.height), [720, 540])
+        XCTAssertFalse(plan96.contains(where: { $0.height <= 360 }))
 
         let plan120 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
-            sourceWidth: 2936,
+            sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 4
         )
-        XCTAssertEqual(plan120.first?.height, 480)
-        XCTAssertTrue(plan120.contains(where: { $0.height == 360 }))
+        XCTAssertEqual(plan120.map(\.height), [540, 480])
+        XCTAssertFalse(plan120.contains(where: { $0.height <= 360 }))
+
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.shouldEmitPreparedOriginalFrame(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                candidateWidth: 1280,
+                candidateHeight: 720
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldEmitPreparedOriginalFrame(
+                sourceWidth: 1280,
+                sourceHeight: 720,
+                candidateWidth: 1280,
+                candidateHeight: 720
+            )
+        )
 
         let lagLow = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
             sourceFPS: 24.0,
@@ -2258,5 +2274,119 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(PlayerGestureMath.pinchTargetAspectFill(scale: 0.78, currentFill: true), false)
         XCTAssertNil(PlayerGestureMath.pinchTargetAspectFill(scale: 0.78, currentFill: false))
         XCTAssertNil(PlayerGestureMath.pinchTargetAspectFill(scale: 1.02, currentFill: false))
+    }
+
+    func testMP4HEV1StreamPatcherBoxAwareMdatSkipAndTailMoov() {
+        func makeBox(fourCC: String, payload: Data) -> Data {
+            var box = Data()
+            var total = UInt32(8 + payload.count).bigEndian
+            withUnsafeBytes(of: &total) { box.append(contentsOf: $0) }
+            box.append(contentsOf: fourCC.utf8.prefix(4))
+            box.append(payload)
+            return box
+        }
+
+        func makeValidHEV1Entry(width: UInt16, height: UInt16) -> Data {
+            var entry = Data()
+            var sizePlaceholder = UInt32(0).bigEndian
+            withUnsafeBytes(of: &sizePlaceholder) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: "hev1".utf8)
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 6))
+            var dataRefIdx = UInt16(1).bigEndian
+            withUnsafeBytes(of: &dataRefIdx) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 16))
+            var w = width.bigEndian
+            var h = height.bigEndian
+            withUnsafeBytes(of: &w) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &h) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 46))
+            var depth = UInt16(0x0018).bigEndian
+            var preDef = UInt16(0xFFFF).bigEndian
+            withUnsafeBytes(of: &depth) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &preDef) { entry.append(contentsOf: $0) }
+            var childLen = UInt32(16).bigEndian
+            withUnsafeBytes(of: &childLen) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: "hvcC".utf8)
+            entry.append(contentsOf: [UInt8](repeating: 0x01, count: 8))
+            var totalLen = UInt32(entry.count).bigEndian
+            entry.replaceSubrange(0..<4, with: withUnsafeBytes(of: &totalLen) { Data($0) })
+            return entry
+        }
+
+        let ftyp = makeBox(fourCC: "ftyp", payload: Data("isom\0\0\u{02}\0isomiso2mp41".utf8))
+        let fakeEntryInsideMdat = makeValidHEV1Entry(width: 3840, height: 2160)
+        let mdatPayload = Data(repeating: 0xAA, count: 4096) + fakeEntryInsideMdat + Data(repeating: 0x55, count: 4096)
+        let mdat = makeBox(fourCC: "mdat", payload: mdatPayload)
+        let tailMoovPayload = Data("trak_stbl_stsd".utf8) + makeValidHEV1Entry(width: 3840, height: 2160)
+        let tailMoov = makeBox(fourCC: "moov", payload: tailMoovPayload)
+
+        let fullMP4 = ftyp + mdat + tailMoov
+        var boxPatcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: true)
+        var out = Data()
+        let chunkSize = 1024
+        var cursor = 0
+        while cursor < fullMP4.count {
+            let next = min(fullMP4.count, cursor + chunkSize)
+            out.append(boxPatcher.processChunk(fullMP4.subdata(in: cursor..<next)))
+            cursor = next
+        }
+        out.append(boxPatcher.flush())
+
+        XCTAssertEqual(out.count, fullMP4.count)
+        let outMdatSlice = out.subdata(in: ftyp.count..<(ftyp.count + mdat.count))
+        XCTAssertEqual(outMdatSlice, mdat)
+        let outMoovSlice = out.subdata(in: (ftyp.count + mdat.count)..<out.count)
+        XCTAssertNotNil(outMoovSlice.range(of: Data("hvc1".utf8)))
+        XCTAssertNil(outMoovSlice.range(of: Data("hev1".utf8)))
+
+        let midRangePayload = Data(repeating: 0x3C, count: 81920)
+        var midPatcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: false)
+        var midOut = midPatcher.processChunk(midRangePayload)
+        midOut.append(midPatcher.flush())
+        XCTAssertEqual(midOut, midRangePayload)
+    }
+
+    @MainActor
+    func testAutoMetalFXUpscaleOpticalFlowDecision() {
+        XCTAssertTrue(
+            MetalVideoEnhancer.shouldAutoMetalFXUpscaleOpticalFlow(
+                preset: .off,
+                allowPassthrough: true,
+                isDownsampledOpticalFlow: true,
+                thermalState: .nominal
+            )
+        )
+        XCTAssertTrue(
+            MetalVideoEnhancer.shouldAutoMetalFXUpscaleOpticalFlow(
+                preset: .off,
+                allowPassthrough: true,
+                isDownsampledOpticalFlow: true,
+                thermalState: .fair
+            )
+        )
+        XCTAssertFalse(
+            MetalVideoEnhancer.shouldAutoMetalFXUpscaleOpticalFlow(
+                preset: .off,
+                allowPassthrough: true,
+                isDownsampledOpticalFlow: true,
+                thermalState: .serious
+            )
+        )
+        XCTAssertFalse(
+            MetalVideoEnhancer.shouldAutoMetalFXUpscaleOpticalFlow(
+                preset: .off,
+                allowPassthrough: true,
+                isDownsampledOpticalFlow: false,
+                thermalState: .nominal
+            )
+        )
+        XCTAssertFalse(
+            MetalVideoEnhancer.shouldAutoMetalFXUpscaleOpticalFlow(
+                preset: .old4KRestore,
+                allowPassthrough: true,
+                isDownsampledOpticalFlow: true,
+                thermalState: .nominal
+            )
+        )
     }
 }
