@@ -432,11 +432,12 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     /// 严格校验 Box 长度、保留字段、`data_reference_index`、合理分辨率、`depth=0x0018`、`pre_defined=0xFFFF` 与子 Box `hvcC`，
     /// 避免误伤 `mdat` 媒体负载中的偶然字节序列。
     static func patchHEV1ToHVC1(in data: inout Data) -> Int {
-        let count = data.count
-        guard count >= 90 else { return 0 }
+        let start = data.startIndex
+        let end = data.endIndex
+        guard end - start >= 90 else { return 0 }
         var patched = 0
-        var i = 4
-        while i + 86 <= count {
+        var i = start + 4
+        while i + 86 <= end {
             if data[i] == 0x68 && data[i + 1] == 0x65 && data[i + 2] == 0x76 && data[i + 3] == 0x31 {
                 let boxSize = (UInt32(data[i - 4]) << 24)
                     | (UInt32(data[i - 3]) << 16)
@@ -456,7 +457,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                        (16...16384).contains(height),
                        depth == 0x0018,
                        preDefined == 0xFFFF {
-                        let boxEnd = min(count, min(i + 240, i - 4 + Int(boxSize)))
+                        let boxEnd = min(end, min(i + 240, i - 4 + Int(boxSize)))
                         var hasHVCC = false
                         if i + 82 + 4 <= boxEnd {
                             var j = i + 82

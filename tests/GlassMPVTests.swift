@@ -1924,10 +1924,11 @@ final class GlassMPVTests: XCTestCase {
         let count = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &oneShot)
         XCTAssertEqual(count, 1)
         XCTAssertEqual(oneShot.count, packet.count)
-        let entrySlice = oneShot[prefixNoise.count..<(prefixNoise.count + validHEV1.count)]
+        let entrySlice = Data(oneShot[prefixNoise.count..<(prefixNoise.count + validHEV1.count)])
         XCTAssertEqual(String(data: entrySlice.subdata(in: 4..<8), encoding: .utf8), "hvc1")
         XCTAssertTrue(String(decoding: oneShot.prefix(prefixNoise.count), as: UTF8.self).contains("hev1"))
-        XCTAssertEqual(String(data: oneShot.subdata(in: (prefixNoise.count + validHEV1.count + 4)..<(prefixNoise.count + validHEV1.count + 8)), encoding: .utf8), "hev1")
+        let untouchedSlice = Data(oneShot[(prefixNoise.count + validHEV1.count)...])
+        XCTAssertEqual(String(data: untouchedSlice.subdata(in: 4..<8), encoding: .utf8), "hev1")
 
         // 切分跨 "hev1" 与 "hvcC" 边界的流式重组校验
         var patcher = MP4HEV1StreamPatcher()
