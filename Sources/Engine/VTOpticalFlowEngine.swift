@@ -12,6 +12,8 @@ final class SampleBufferDisplayContainerView: UIView {
     private let proMotionPulseLayer = CALayer()
     @MainActor private var proMotionToggle: Bool = false
     @MainActor private var updateLink: UIUpdateLink?
+    @MainActor private var desiredProMotionActive: Bool = false
+    @MainActor private var desiredProMotionRange: CAFrameRateRange = .default
     @MainActor var onProMotionTick: (@MainActor () -> Void)?
     @MainActor private(set) var videoTransform: CGAffineTransform = .identity
 
@@ -30,18 +32,17 @@ final class SampleBufferDisplayContainerView: UIView {
         proMotionPulseLayer.opacity = 0.01
         layer.addSublayer(proMotionPulseLayer)
 
-        let link = UIUpdateLink(view: self)
-        link.requiresContinuousUpdates = true
-        link.wantsImmediatePresentation = true
-        link.isEnabled = false
-        link.addAction { [weak self] _, _ in
-            MainActor.assumeIsolated {
-                self?.handleUpdateLinkTick()
-            }
-        }
-        self.updateLink = link
-
         layoutDisplayLayer()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window?.windowScene != nil {
+            updateProMotionLink(isActive: desiredProMotionActive, range: desiredProMotionRange)
+        } else {
+            updateLink?.isEnabled = false
+            updateLink = nil
+        }
     }
 
     @MainActor
@@ -52,6 +53,24 @@ final class SampleBufferDisplayContainerView: UIView {
 
     @MainActor
     func updateProMotionLink(isActive: Bool, range: CAFrameRateRange) {
+        desiredProMotionActive = isActive
+        desiredProMotionRange = range
+        guard window?.windowScene != nil else {
+            updateLink?.isEnabled = false
+            return
+        }
+        if updateLink == nil {
+            guard isActive else { return }
+            let link = UIUpdateLink(view: self)
+            link.addAction { [weak self] _, _ in
+                MainActor.assumeIsolated {
+                    self?.handleUpdateLinkTick()
+                }
+            }
+            link.wantsImmediatePresentation = true
+            link.requiresContinuousUpdates = true
+            self.updateLink = link
+        }
         updateLink?.preferredFrameRateRange = range
         updateLink?.isEnabled = isActive
     }
