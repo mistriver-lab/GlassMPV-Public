@@ -95,7 +95,14 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     private var wantsReconfigure = false
     private var droppedInputCounter: Int = 0
 
-    private var previousFrame: (pts: Double, buffer: CVPixelBuffer)?
+    private var previousFrame: (
+        pts: Double,
+        rawBuffer: CVPixelBuffer,
+        preparedBuffer: CVPixelBuffer?,
+        preparedWidth: Int,
+        preparedHeight: Int,
+        preparedFormat: OSType
+    )?
     private var phaseScheduler: OpticalFlowPhaseScheduler
     private var budgetGuard = OpticalFlowBudgetGuard(
         windowSize: 10,
@@ -160,7 +167,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
 
     func submitFrame(pts: Double, box: RemoteSendablePixelBuffer) {
         lock.lock()
-        if pendingInputs.count >= 2 {
+        if pendingInputs.count >= 3 {
             pendingInputs.removeFirst()
             droppedInputCounter += 1
         }
@@ -255,7 +262,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         skippedInputs: Int
     ) async -> OpticalFlowTargetFPS? {
 #if targetEnvironment(simulator)
-        previousFrame = (pts: currPTS, buffer: currBuffer)
+        previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
         let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
         onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
         return nil
@@ -270,7 +277,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         if let prev = previousFrame {
             let dt = currPTS - prev.pts
             if dt <= 0.008 || dt >= 0.35 {
-                previousFrame = (pts: currPTS, buffer: currBuffer)
+                previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
                 phaseScheduler.reset()
                 onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, activeCandidate?.displayLabel ?? "远程流直通")
                 return nil
@@ -282,9 +289,25 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                let destPool {
                 let maxSlots = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
                 let step = phaseScheduler.planStep(previousPTS: prev.pts, currentPTS: currPTS, maxAllowedSlots: maxSlots)
+                let pairStartHost = CACurrentMediaTime()
+                let reusedPrev: CVPixelBuffer? = (prev.preparedWidth == activeCandidate.width
+                    && prev.preparedHeight == activeCandidate.height
+                    && prev.preparedFormat == activePixelFormat)
+                    ? prev.preparedBuffer
+                    : nil
                 if !step.interpolatedSlots.isEmpty,
-                   let preparedPrev = prepareSourceBuffer(prev.buffer, targetWidth: activeCandidate.width, targetHeight: activeCandidate.height, targetFormat: activePixelFormat),
-                   let preparedCurr = prepareSourceBuffer(currBuffer, targetWidth: activeCandidate.width, targetHeight: activeCandidate.height, targetFormat: activePixelFormat),
+                   let preparedPrev = reusedPrev ?? prepareSourceBuffer(
+                       prev.rawBuffer,
+                       targetWidth: activeCandidate.width,
+                       targetHeight: activeCandidate.height,
+                       targetFormat: activePixelFormat
+                   ),
+                   let preparedCurr = prepareSourceBuffer(
+                       currBuffer,
+                       targetWidth: activeCandidate.width,
+                       targetHeight: activeCandidate.height,
+                       targetFormat: activePixelFormat
+                   ),
                    let prevFrame = VTFrameProcessorFrame(buffer: preparedPrev, presentationTimeStamp: CMTime(seconds: prev.pts, preferredTimescale: 600)),
                    let currFrame = VTFrameProcessorFrame(buffer: preparedCurr, presentationTimeStamp: CMTime(seconds: currPTS, preferredTimescale: 600)) {
 
@@ -318,10 +341,9 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                            destinationFrames: destFrames
                        ) {
                         do {
-                            let startHost = CACurrentMediaTime()
                             _ = try await processor.process(parameters: params)
                             guard readGeneration() == jobGeneration else { return nil }
-                            let elapsedMs = (CACurrentMediaTime() - startHost) * 1000.0
+                            let elapsedMs = (CACurrentMediaTime() - pairStartHost) * 1000.0
                             totalInterpolationMs += elapsedMs
                             batchCount += 1
                             let avgMs = totalInterpolationMs / Double(max(1, batchCount))
@@ -336,7 +358,14 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                 outFrames.append(RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer))
                             }
                             let emittedLabel = "远程·\(activeCandidate.displayLabel)"
-                            previousFrame = (pts: currPTS, buffer: currBuffer)
+                            previousFrame = (
+                                pts: currPTS,
+                                rawBuffer: currBuffer,
+                                preparedBuffer: preparedCurr,
+                                preparedWidth: activeCandidate.width,
+                                preparedHeight: activeCandidate.height,
+                                preparedFormat: activePixelFormat
+                            )
                             onBatch(outFrames, step.interpolatedSlots.count, avgMs, emittedLabel)
 
                             let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
@@ -402,7 +431,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                         }
                     }
                 } else if step.interpolatedSlots.isEmpty {
-                    previousFrame = (pts: currPTS, buffer: currBuffer)
+                    previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
                     let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
                     onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程·\(activeCandidate.displayLabel)")
                     return nil
@@ -410,7 +439,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             }
         }
 
-        previousFrame = (pts: currPTS, buffer: currBuffer)
+        previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
         let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
         onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
         return nil
@@ -471,7 +500,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                 : OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: supportedFormats, prefer10Bit: false)
 
-            let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 4]
+            let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 6]
             var srcNormAttrs: [String: Any] = [:]
             for (k, v) in config.sourcePixelBufferAttributes {
                 srcNormAttrs[k] = v

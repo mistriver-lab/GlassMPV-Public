@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.7"
+    static let releaseTag = "0.1.0-beta.8"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.8",
+            date: "2026-11-27",
+            highlights: [
+                "彻底根治「夸克实时流开 120fps 原画必须开画质增强才能满帧」的三重真因（基于 212117 实机黑匣子日志）：(1) VTOpticalFlowEngine 将 96/120fps 的 ProMotion 刷新率下限由 80Hz 锁死至 120Hz，消除隐藏 HUD 后系统自动跌至 80Hz 的半速掉帧",
+                "(2) RemoteStreamOpticalFlowWorker 缓存上一帧 480p 预处理缓冲（eliminating 2× 4K->480p 重复缩放，sourceNormPool 扩容至 6、pendingInputs 扩容至 3），并将预处理耗时纳入 BudgetGuard 真实计时",
+                "(3) MetalVideoEnhancer 为 65fps 以上原画接入无锐化无偏色的 3×3 中性 Mitchell-Netravali 立方采样直绘（compareMode == 3，原画高刷直绘），防止极轻 1-tap Shader 导致 GPU/内存总线降频拖慢 ANE 至 35ms+"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.7",
             date: "2026-11-27",

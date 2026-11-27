@@ -2,6 +2,14 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.8] - 2026-11-27
+
+### 修复 (Fixed)
+- **彻底根治夸克在线流「原画必须开增强才满 120fps」三重瓶颈 (`VTOpticalFlowEngine` + `RemoteStreamOpticalFlowWorker` + `MetalVideoEnhancer`)**：
+  - **锁定 ProMotion `minimum = 120Hz`**：`OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange` 针对 96/120fps 将下限从 `80Hz` 提升为 `120Hz`（非低电量模式），防止隐去控制栏后系统滑落至 `80Hz` 丢弃 `40fps`。
+  - **消除重复 4K 缩帧与真实预算计时**：`RemoteStreamOpticalFlowWorker` 为 `previousFrame` 缓存归一化后的 `preparedBuffer`（6.4MP 原帧每对少做一次 480p 缩放，`sourceNormPool` 增至 6、`pendingInputs` 上限增至 3），同时将缩放耗时计入 `BudgetGuard` 闭环。
+  - **高刷原画 3×3 中性 Mitchell 直绘保活 (`compareMode == 3u`)**：针对 `>65fps` 原画关闭增强路径启用无振铃、零偏色、均值守恒的 3×3 Mitchell-Netravali 重采样直绘，维持共享 GPU/内存总线频点，避免 ANE 推理受总线降频拖累跌至 `35ms+`。
+
 ## [v0.1.0-beta.7] - 2026-11-27
 
 ### 新增与重塑 (Added & Redesigned)

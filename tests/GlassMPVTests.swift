@@ -909,7 +909,7 @@ final class GlassMPVTests: XCTestCase {
             isInterpolationEnabled: true,
             maxScreenFPS: 120
         )
-        XCTAssertEqual(rangeInterp96Lock.minimum, 80)
+        XCTAssertEqual(rangeInterp96Lock.minimum, 120)
         XCTAssertEqual(rangeInterp96Lock.maximum, 120)
         XCTAssertEqual(rangeInterp96Lock.preferred, 120)
 
@@ -918,7 +918,7 @@ final class GlassMPVTests: XCTestCase {
             isInterpolationEnabled: true,
             maxScreenFPS: 120
         )
-        XCTAssertEqual(rangeInterp120.minimum, 80)
+        XCTAssertEqual(rangeInterp120.minimum, 120)
         XCTAssertEqual(rangeInterp120.maximum, 120)
         XCTAssertEqual(rangeInterp120.preferred, 120)
 
@@ -2142,7 +2142,7 @@ final class GlassMPVTests: XCTestCase {
         )
         if MTLCreateSystemDefaultDevice() != nil {
             XCTAssertEqual(passthroughStatus, .rendered)
-            XCTAssertTrue(enhancer.activePipelineLabel.contains("原画直绘"))
+            XCTAssertTrue(enhancer.activePipelineLabel.contains("原画高刷直绘"))
         } else {
             XCTAssertEqual(passthroughStatus, .unavailable)
         }

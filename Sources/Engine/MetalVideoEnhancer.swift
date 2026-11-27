@@ -191,6 +191,68 @@ final class MetalVideoEnhancer {
         return clamp(rgb, half(0.0h), half(1.0h));
     }
 
+    inline float sampleMitchellWeightH(float x) {
+        float ax = fabs(x);
+        if (ax < 1.0f) {
+            return ((7.0f * ax * ax * ax) - (12.0f * ax * ax) + 5.3333333f) / 6.0f;
+        }
+        if (ax < 2.0f) {
+            return ((-2.3333333f * ax * ax * ax) + (12.0f * ax * ax) - (20.0f * ax) + 10.6666667f) / 6.0f;
+        }
+        return 0.0f;
+    }
+
+    inline half sampleLumaNeutralCubicH(
+        texture2d<half, access::sample> inY,
+        float2 uv,
+        uint isVideoRange
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float texW = max(1.0f, float(inY.get_width()));
+        float texH = max(1.0f, float(inY.get_height()));
+        float2 texPos = uv * float2(texW, texH) - 0.5f;
+        float2 center = floor(texPos);
+        float2 frac = texPos - center;
+        half accum = half(0.0h);
+        half weightSum = half(0.0h);
+        for (int dy = -1; dy <= 1; ++dy) {
+            float wy = sampleMitchellWeightH(float(dy) - frac.y);
+            for (int dx = -1; dx <= 1; ++dx) {
+                float w = wy * sampleMitchellWeightH(float(dx) - frac.x);
+                half hw = half(w);
+                float2 sampleUV = (center + float2(float(dx), float(dy)) + 0.5f) / float2(texW, texH);
+                accum += toUnitLumaH(inY.sample(linearSampler, sampleUV).r, isVideoRange) * hw;
+                weightSum += hw;
+            }
+        }
+        return clamp(accum / max(weightSum, half(0.0001h)), half(0.0h), half(1.0h));
+    }
+
+    inline half3 sampleRGBNeutralCubicH(
+        texture2d<half, access::sample> inColor,
+        float2 uv
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float texW = max(1.0f, float(inColor.get_width()));
+        float texH = max(1.0f, float(inColor.get_height()));
+        float2 texPos = uv * float2(texW, texH) - 0.5f;
+        float2 center = floor(texPos);
+        float2 frac = texPos - center;
+        half3 accum = half3(0.0h);
+        half weightSum = half(0.0h);
+        for (int dy = -1; dy <= 1; ++dy) {
+            float wy = sampleMitchellWeightH(float(dy) - frac.y);
+            for (int dx = -1; dx <= 1; ++dx) {
+                float w = wy * sampleMitchellWeightH(float(dx) - frac.x);
+                half hw = half(w);
+                float2 sampleUV = (center + float2(float(dx), float(dy)) + 0.5f) / float2(texW, texH);
+                accum += inColor.sample(linearSampler, sampleUV).rgb * hw;
+                weightSum += hw;
+            }
+        }
+        return clamp(accum / max(weightSum, half(0.0001h)), half(0.0h), half(1.0h));
+    }
+
     // FP16 5-tap + 4-diagonal bilinear multi-scale luma restoration (halo-clamped, zero exp)
     inline half computeEnhancedLumaFastH(
         half c,
@@ -281,6 +343,10 @@ final class MetalVideoEnhancer {
         if (u.compareMode == 2u) {
             return half4(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), half(1.0h));
         }
+        if (u.compareMode == 3u) {
+            half yCubic = sampleLumaNeutralCubicH(inY, uv, u.isVideoRange);
+            return half4(yuvSampleToRGBH(yCubic, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+        }
         float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
         float invWidth = 1.0f / max(1.0f, float(inY.get_width()));
         float invHeight = 1.0f / max(1.0f, float(inY.get_height()));
@@ -321,6 +387,9 @@ final class MetalVideoEnhancer {
         half4 centerRGBA = inColor.sample(linearSampler, uv);
         if (u.compareMode == 2u) {
             return centerRGBA;
+        }
+        if (u.compareMode == 3u) {
+            return half4(sampleRGBNeutralCubicH(inColor, uv), centerRGBA.a);
         }
         float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
         float invWidth = 1.0f / max(1.0f, float(inColor.get_width()));
@@ -678,6 +747,7 @@ final class MetalVideoEnhancer {
         allowPassthrough: Bool = false
     ) -> MetalDirectRenderResult {
         let isPassthroughDraw = allowPassthrough && (preset == .off || compareMode == .original)
+        let useHighFPSNeutralCubic = isPassthroughDraw && preset == .off && compareMode != .original && outputFPS > 65.0
         guard isPassthroughDraw || (preset != .off && compareMode != .original) else {
             activePipelineLabel = compareMode == .original ? "原画对比" : "关闭"
             return .unavailable
@@ -722,7 +792,7 @@ final class MetalVideoEnhancer {
         let params = VideoEnhancementPlanner.parameters(for: preset, strength: strength)
         let isVideoRange: UInt32 = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: sourceBuffer) ? 1 : 0
-        let effectiveCompareUniform: UInt32 = isPassthroughDraw ? 2 : compareMode.uniformValue
+        let effectiveCompareUniform: UInt32 = useHighFPSNeutralCubic ? 3 : (isPassthroughDraw ? 2 : compareMode.uniformValue)
         var uniforms = makeUniforms(
             params: params,
             isVideoRange: isVideoRange,
@@ -745,9 +815,11 @@ final class MetalVideoEnhancer {
         )
 
         var renderedBGRAInput: MTLTexture?
-        var nextLabel = isPassthroughDraw
-            ? (preset == .off ? "原画直绘" : "原画对比直绘")
-            : "\(preset.rawValue) 直绘"
+        var nextLabel = useHighFPSNeutralCubic
+            ? "原画高刷直绘"
+            : (isPassthroughDraw
+                ? (preset == .off ? "原画直绘" : "原画对比直绘")
+                : "\(preset.rawValue) 直绘")
 
         if !isPassthroughDraw,
            params.wantsSpatialUpscale,
@@ -851,7 +923,9 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(uvTex, index: 1)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            if isPassthroughDraw {
+            if useHighFPSNeutralCubic {
+                nextLabel = "原画高刷直绘 \(srcW)×\(srcH)"
+            } else if isPassthroughDraw {
                 nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"
             } else if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
                 let tag = (thermalState == .serious || thermalState == .critical) ? "温控直绘" : "省电直绘"
@@ -866,7 +940,9 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(bgraTex, index: 0)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            if isPassthroughDraw {
+            if useHighFPSNeutralCubic {
+                nextLabel = "原画高刷直绘 \(srcW)×\(srcH)"
+            } else if isPassthroughDraw {
                 nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"
             } else {
                 nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"

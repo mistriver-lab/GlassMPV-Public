@@ -230,6 +230,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "renderToLayerStatus" in metal_enhancer_src
     assert "displayEnhanceYUVFragment" in metal_enhancer_src
     assert "allowPassthrough" in metal_enhancer_src
+    assert "sampleLumaNeutralCubicH" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -269,6 +270,7 @@ def test_swift_sources_non_empty_and_balanced():
     remote_worker_src = (ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift").read_text(encoding="utf-8")
     assert "RemoteOpticalFlowBudgetPlanner" in remote_worker_src
     assert "OpticalFlowBudgetGuard" in remote_worker_src
+    assert "preparedBuffer" in remote_worker_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src

@@ -1192,7 +1192,7 @@ enum OpticalFlowResolutionPlanner: Sendable {
                 if isLowPowerMode || safeFPS <= 60.5 {
                     return (60, 60, 60)
                 }
-                return (80, 120, 120)
+                return (120, 120, 120)
             }
             return (60, 60, 60)
         }
