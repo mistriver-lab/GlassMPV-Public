@@ -12,6 +12,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         var headers: [String: String]
         let isHLS: Bool
         let onCookieUpdate: (@Sendable (String) -> Void)?
+        let onLog: (@Sendable (String) -> Void)?
     }
 
     private let lock = NSLock()
@@ -19,6 +20,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     private var listener: NWListener?
     private var listeningPort: UInt16 = 0
     private var routes: [String: ProxyRoute] = [:]
+    private var routeNormalLogCounts: [String: Int] = [:]
 
     private init() {}
 
@@ -107,7 +109,8 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         url: URL,
         headers: [String: String],
         isHLS: Bool = false,
-        onCookieUpdate: (@Sendable (String) -> Void)? = nil
+        onCookieUpdate: (@Sendable (String) -> Void)? = nil,
+        onLog: (@Sendable (String) -> Void)? = nil
     ) -> URL {
         do {
             let port = try ensureStarted()
@@ -116,12 +119,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             lock.lock()
             if routes.count > 512 {
                 routes.removeAll()
+                routeNormalLogCounts.removeAll()
             }
             routes[token] = ProxyRoute(
                 upstreamURL: url,
                 headers: headers,
                 isHLS: isHLS || safeExt.lowercased() == "m3u8",
-                onCookieUpdate: onCookieUpdate
+                onCookieUpdate: onCookieUpdate,
+                onLog: onLog
             )
             lock.unlock()
             return URL(string: "http://127.0.0.1:\(port)/stream/\(token)/media.\(safeExt)") ?? url
@@ -141,12 +146,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         if routes.count > 1024 {
             let keepKeys = Set(routes.keys.prefix(256))
             routes = routes.filter { keepKeys.contains($0.key) }
+            routeNormalLogCounts = routeNormalLogCounts.filter { keepKeys.contains($0.key) }
         }
         routes[token] = ProxyRoute(
             upstreamURL: url,
             headers: route.headers,
             isHLS: ext.lowercased() == "m3u8",
-            onCookieUpdate: route.onCookieUpdate
+            onCookieUpdate: route.onCookieUpdate,
+            onLog: route.onLog
         )
         lock.unlock()
         return URL(string: "http://127.0.0.1:\(port)/sub/\(token)/seg.\(ext)") ?? url
@@ -155,6 +162,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     func resetRoutes() {
         lock.lock()
         routes.removeAll()
+        routeNormalLogCounts.removeAll()
         lock.unlock()
     }
 
@@ -164,6 +172,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         listener = nil
         listeningPort = 0
         routes.removeAll()
+        routeNormalLogCounts.removeAll()
         lock.unlock()
         active?.cancel()
     }
@@ -233,7 +242,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let activePort = listeningPort
         lock.unlock()
 
-        var upstreamReq = URLRequest(url: matchedRoute.upstreamURL, timeoutInterval: 30)
+        var upstreamReq = URLRequest(url: matchedRoute.upstreamURL, timeoutInterval: 12)
         upstreamReq.httpMethod = parsed.method == "HEAD" ? "HEAD" : "GET"
         for (k, v) in matchedRoute.headers {
             upstreamReq.setValue(v, forHTTPHeaderField: k)
@@ -242,6 +251,8 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             upstreamReq.setValue(rangeHeader, forHTTPHeaderField: "Range")
         }
 
+        let upstreamHost = matchedRoute.upstreamURL.host ?? "upstream"
+        let reqStartTime = CFAbsoluteTimeGetCurrent()
         let isManifest = matchedRoute.isHLS
             || matchedRoute.upstreamURL.pathExtension.lowercased() == "m3u8"
             || matchedRoute.upstreamURL.absoluteString.lowercased().contains(".m3u8")
@@ -257,20 +268,41 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                     connection.cancel()
                     return
                 }
+                let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - reqStartTime) * 1000).rounded())
                 if let error {
+                    let nsErr = error as NSError
+                    let status = Self.httpErrorStatus(for: error)
+                    self.emitRouteLog(
+                        token: token,
+                        route: matchedRoute,
+                        important: true,
+                        message: "[proxy][error] HLS \(upstreamHost) 失败: \(nsErr.domain)(\(nsErr.code)) \(error.localizedDescription) (\(elapsedMs)ms)"
+                    )
                     self.sendSimpleResponse(
                         connection: connection,
-                        status: "502 Bad Gateway",
+                        status: status,
                         body: Data(error.localizedDescription.utf8)
                     )
                     return
                 }
                 guard let http = response as? HTTPURLResponse, let data else {
+                    self.emitRouteLog(
+                        token: token,
+                        route: matchedRoute,
+                        important: true,
+                        message: "[proxy][error] HLS \(upstreamHost) 无 HTTP 响应 (\(elapsedMs)ms)"
+                    )
                     self.sendSimpleResponse(connection: connection, status: "502 Bad Gateway", body: Data())
                     return
                 }
                 self.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
                 guard (200...299).contains(http.statusCode) else {
+                    self.emitRouteLog(
+                        token: token,
+                        route: matchedRoute,
+                        important: true,
+                        message: "[proxy][error] HLS \(upstreamHost) HTTP \(http.statusCode) (\(elapsedMs)ms)"
+                    )
                     self.sendSimpleResponse(
                         connection: connection,
                         status: "\(http.statusCode) Error",
@@ -279,6 +311,12 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                     return
                 }
 
+                self.emitRouteLog(
+                    token: token,
+                    route: matchedRoute,
+                    important: false,
+                    message: "[proxy] HLS \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms)"
+                )
                 let rawManifest = String(data: data, encoding: .utf8) ?? ""
                 let baseURL = http.url ?? matchedRoute.upstreamURL
                 let rewritten = Self.rewriteHLSManifest(rawManifest, baseURL: baseURL) { childURL in
@@ -300,9 +338,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             connection: connection,
             headers: matchedRoute.headers,
             rangeHeader: parsed.rangeHeader,
+            requestMethod: parsed.method,
+            upstreamHost: upstreamHost,
             enableMP4HEV1Patch: parsed.method != "HEAD",
             onResponse: { [weak self] http in
                 self?.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
+            },
+            onLog: { [weak self] important, msg in
+                self?.emitRouteLog(token: token, route: matchedRoute, important: important, message: msg)
             }
         )
         streamRelay.start(with: upstreamReq)
@@ -329,6 +372,21 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         }
     }
 
+    private func emitRouteLog(token: String, route: ProxyRoute, important: Bool, message: String) {
+        guard let onLog = route.onLog else { return }
+        if !important {
+            lock.lock()
+            let count = routeNormalLogCounts[token, default: 0]
+            if count >= 2 {
+                lock.unlock()
+                return
+            }
+            routeNormalLogCounts[token] = count + 1
+            lock.unlock()
+        }
+        onLog(message)
+    }
+
     private func sendSimpleResponse(connection: NWConnection, status: String, body: Data) {
         let header = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         var packet = Data(header.utf8)
@@ -336,6 +394,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         connection.send(content: packet, completion: .contentProcessed { _ in
             connection.cancel()
         })
+    }
+
+    static func httpErrorStatus(for error: Error) -> String {
+        let nsErr = error as NSError
+        if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorTimedOut {
+            return "504 Gateway Timeout"
+        }
+        return "502 Bad Gateway"
     }
 
     // MARK: - Pure Testable Helpers
@@ -538,16 +604,100 @@ private final class RedirectHeaderPreservingDelegate: NSObject, URLSessionTaskDe
     }
 }
 
-private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    static let shared = ProxyUpstreamSessionPool()
+
+    private let lock = NSLock()
+    private var relays: [Int: UpstreamStreamRelay] = [:]
+    private var session: URLSession!
+
+    private override init() {
+        super.init()
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 1800
+        config.httpMaximumConnectionsPerHost = 6
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    func startTask(with request: URLRequest, relay: UpstreamStreamRelay) -> URLSessionDataTask {
+        let task = session.dataTask(with: request)
+        lock.lock()
+        relays[task.taskIdentifier] = relay
+        lock.unlock()
+        task.resume()
+        return task
+    }
+
+    func removeTask(withIdentifier taskId: Int) {
+        lock.lock()
+        relays.removeValue(forKey: taskId)
+        lock.unlock()
+    }
+
+    private func relay(for task: URLSessionTask) -> UpstreamStreamRelay? {
+        lock.lock()
+        let found = relays[task.taskIdentifier]
+        lock.unlock()
+        return found
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        if let relay = relay(for: task) {
+            relay.handleRedirect(newRequest: request, completionHandler: completionHandler)
+        } else {
+            completionHandler(request)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        if let relay = relay(for: dataTask) {
+            relay.handleResponse(response, completionHandler: completionHandler)
+        } else {
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        relay(for: dataTask)?.handleData(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let relay = relays.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+        relay?.handleCompletion(error: error)
+    }
+}
+
+private final class UpstreamStreamRelay: @unchecked Sendable {
     private let connection: NWConnection
     private let headers: [String: String]
     private let rangeHeader: String?
+    private let requestMethod: String
+    private let upstreamHost: String
     private let enableMP4HEV1Patch: Bool
     private let onResponse: @Sendable (HTTPURLResponse) -> Void
+    private let onLog: @Sendable (Bool, String) -> Void
     private let lock = NSLock()
-    private var session: URLSession?
+    private let startTimestamp = CFAbsoluteTimeGetCurrent()
     private var dataTask: URLSessionDataTask?
     private var didFinish = false
+    private var didSendHeaders = false
     private var shouldPatchMP4Stream = false
     private var mp4Patcher = MP4HEV1StreamPatcher()
 
@@ -555,14 +705,20 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         connection: NWConnection,
         headers: [String: String],
         rangeHeader: String?,
+        requestMethod: String = "GET",
+        upstreamHost: String = "upstream",
         enableMP4HEV1Patch: Bool = true,
-        onResponse: @escaping @Sendable (HTTPURLResponse) -> Void
+        onResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
+        onLog: @escaping @Sendable (Bool, String) -> Void
     ) {
         self.connection = connection
         self.headers = headers
         self.rangeHeader = rangeHeader
+        self.requestMethod = requestMethod
+        self.upstreamHost = upstreamHost
         self.enableMP4HEV1Patch = enableMP4HEV1Patch
         self.onResponse = onResponse
+        self.onLog = onLog
     }
 
     func start(with request: URLRequest) {
@@ -573,31 +729,31 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
                 self?.cancelAll()
             }
         }
-        let sess = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
-        let task = sess.dataTask(with: request)
+        let task = ProxyUpstreamSessionPool.shared.startTask(with: request, relay: self)
         lock.lock()
-        self.session = sess
+        if didFinish {
+            lock.unlock()
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
+            task.cancel()
+            return
+        }
         self.dataTask = task
         lock.unlock()
-        task.resume()
     }
 
     private func cancelAll() {
         lock.lock()
         let task = dataTask
-        let sess = session
         didFinish = true
         dataTask = nil
-        session = nil
         lock.unlock()
-        task?.cancel()
-        sess?.invalidateAndCancel()
+        if let task {
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
+            task.cancel()
+        }
     }
 
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
+    func handleRedirect(
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
@@ -611,10 +767,8 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         completionHandler(next)
     }
 
-    func urlSession(
-        _ session: URLSession,
-        dataTask: URLSessionDataTask,
-        didReceive response: URLResponse,
+    func handleResponse(
+        _ response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         guard let http = response as? HTTPURLResponse else {
@@ -627,7 +781,13 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         let isMP4OrBinary = !contentType.lowercased().contains("mpegurl") && !contentType.lowercased().contains("text/")
         lock.lock()
         shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
+        didSendHeaders = true
         lock.unlock()
+
+        let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+        let isImportant = http.statusCode >= 400
+        let rangeDesc = rangeHeader ?? "full"
+        onLog(isImportant, "[proxy] \(requestMethod) \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms, range=\(rangeDesc))")
 
         var headerLines = ["HTTP/1.1 \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))"]
         headerLines.append("Content-Type: \(contentType)")
@@ -644,7 +804,7 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         completionHandler(.allow)
     }
 
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    func handleData(_ data: Data) {
         guard !data.isEmpty else { return }
         let outgoing: Data
         lock.lock()
@@ -658,16 +818,41 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         connection.send(content: outgoing, completion: .contentProcessed { _ in })
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    func handleCompletion(error: Error?) {
         lock.lock()
         let alreadyFinished = didFinish
+        let sentHeaders = didSendHeaders
         didFinish = true
         self.dataTask = nil
-        self.session = nil
         let trailing = shouldPatchMP4Stream ? mp4Patcher.flush() : Data()
         lock.unlock()
-        session.finishTasksAndInvalidate()
         guard !alreadyFinished else { return }
+
+        if let error, !sentHeaders {
+            let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+            let nsErr = error as NSError
+            if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
+                onLog(true, "[proxy][error] \(upstreamHost) 请求失败: \(nsErr.domain)(\(nsErr.code)) \(error.localizedDescription) (\(elapsedMs)ms)")
+            }
+            let status = LocalHTTPStreamProxy.httpErrorStatus(for: error)
+            let body = Data(error.localizedDescription.utf8)
+            let head = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+            var packet = Data(head.utf8)
+            packet.append(body)
+            connection.send(content: packet, completion: .contentProcessed { [weak self] _ in
+                self?.connection.cancel()
+            })
+            return
+        }
+
+        if let error {
+            let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+            let nsErr = error as NSError
+            if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
+                onLog(true, "[proxy][warn] \(upstreamHost) 传输中断: \(nsErr.domain)(\(nsErr.code)) \(error.localizedDescription) (\(elapsedMs)ms)")
+            }
+        }
+
         if !trailing.isEmpty {
             connection.send(content: trailing, completion: .contentProcessed { _ in })
         }

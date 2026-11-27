@@ -239,6 +239,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "rewriteHLSManifest" in local_proxy_src
     assert "patchHEV1ToHVC1" in local_proxy_src
     assert "MP4HEV1StreamPatcher" in local_proxy_src
+    assert "ProxyUpstreamSessionPool" in local_proxy_src
+    assert "httpErrorStatus" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -421,6 +423,12 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testWatchHistoryStorePersistenceProgressAndContinueWatching" in swift_test_src
     assert "testMetalDirectPassthroughModeForHighFPSOriginalQuality" in swift_test_src
     assert "testPlayerGestureMathZonesScrubAndLevels" in swift_test_src
+    assert "testLocalHTTPStreamProxyErrorStatusAndMediaHeaders" in swift_test_src
+
+    engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
+    assert "onRemoteStreamFailed" in engine_src
+    player_view_src = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
+    assert "reResolveCurrentCloudStream" in player_view_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

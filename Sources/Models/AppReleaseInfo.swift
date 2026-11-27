@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.5"
+    static let releaseTag = "0.1.0-beta.6"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.6",
+            date: "2026-11-27",
+            highlights: [
+                "根治夸克原画直链请求超时（-1001）与无fallback 卡死：LocalHTTPStreamProxy 升级共享持久连接池（ProxyUpstreamSessionPool，12s 快速失败并回传真实 HTTP 504/502 状态与代理耗时日志）、QuarkDriveClient 透传刷新后的 __puus Cookie 并净化媒体下载请求头",
+                "云端主流加载失败秒级自动降级：OpticalFlowPlayerController 新增 onRemoteStreamFailed 回调，原画直链超时或连接失败时自动无感切换至「夸克 4K / 2K / 1080P」HLS 流并保留续播进度",
+                "异常提示弹窗新增一键「切换云端清晰度」与「刷新直链重试」恢复入口，无需返回重进片源列表"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.5",
             date: "2026-11-27",

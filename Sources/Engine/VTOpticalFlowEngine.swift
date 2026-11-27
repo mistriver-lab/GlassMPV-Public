@@ -1786,6 +1786,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var remoteStatusObserver: NSKeyValueObservation?
     var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
     var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
+    var onRemoteStreamFailed: (@MainActor (String) -> Bool)?
     var onRemoteAssetReady: (@MainActor (_ asset: AVAsset, _ playerItem: AVPlayerItem) -> Void)?
     var onLocalAssetReady: (@MainActor (_ asset: AVAsset, _ url: URL) -> Void)?
     var onPlaybackFinished: (@MainActor () -> Void)?
@@ -2054,7 +2055,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 url: url,
                 headers: httpHeaders,
                 isHLS: detectedHLS,
-                onCookieUpdate: onRemoteCookieRefresh
+                onCookieUpdate: onRemoteCookieRefresh,
+                onLog: { [weak self] message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isTokenValid(token) else { return }
+                        self.appendLog(message)
+                    }
+                }
             )
             options = nil
             appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(detectedHLS))")
@@ -2266,13 +2273,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     self.scheduleRemoteVideoWatchdog(token: token)
 
                 case .failed:
+                    let detail = errText ?? "未知网络或解码错误"
+                    self.appendLog("[remote][error] 流媒体加载失败: \(detail)")
+                    if self.onRemoteStreamFailed?(detail) == true {
+                        return
+                    }
                     self.isLoadingPipeline = false
                     self.pipelineStatusText = ""
                     self.isPaused = true
                     self.syncDisplayLinkState()
-                    let detail = errText ?? "未知网络或解码错误"
-                    self.appendLog("[remote][error] 流媒体加载失败: \(detail)")
-                    self.errorMessage = "云端流媒体打开失败（\(detail)）。如使用夸克原画直链，可尝试切回「夸克 4K / 1080P」或重新登录刷新 Cookie。"
+                    self.errorMessage = "云端流媒体打开失败（\(detail)）。如使用夸克原画直链，可尝试切回「夸克 4K / 1080P」或刷新直链重试。"
 
                 case .unknown:
                     break
@@ -2912,6 +2922,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         lastRemotePresentedHostTime = 0
         didLogFirstRemoteFrame = false
         onRemoteVideoTrackUnplayable = nil
+        onRemoteStreamFailed = nil
         currentHTTPHeaders = [:]
         isRemoteStream = false
         displayTitle = ""

@@ -179,6 +179,15 @@ enum QuarkDriveClient: Sendable {
         ]
     }
 
+    static func mediaHeaders(cookie: String) -> [String: String] {
+        [
+            "Cookie": cookie.trimmingCharacters(in: .whitespacesAndNewlines),
+            "Referer": "https://pan.quark.cn/",
+            "User-Agent": defaultUserAgent,
+            "Accept": "*/*"
+        ]
+    }
+
     static func extractRefreshedCookie(from response: URLResponse, currentCookie: String) -> String? {
         guard let http = response as? HTTPURLResponse,
               let url = http.url ?? URL(string: "https://pan.quark.cn/") else {
@@ -405,29 +414,44 @@ enum QuarkDriveClient: Sendable {
         guard !trimmedCookie.isEmpty else {
             throw MediaSourceClientError.invalidCredentials("夸克网盘 Cookie 为空，请重新登录。")
         }
-        let headers = requestHeaders(cookie: trimmedCookie)
+        let apiHeaders = requestHeaders(cookie: trimmedCookie)
+        let cookieBox = QuarkCookieRefreshBox(trimmedCookie)
+        let combinedRefresh: @Sendable (String) -> Void = { refreshed in
+            cookieBox.update(refreshed)
+            onCookieRefresh?(refreshed)
+        }
 
         async let downloadResult: URL? = try? fetchDownloadURL(
             fid: item.id,
-            headers: headers,
+            headers: apiHeaders,
             session: session,
-            onCookieRefresh: onCookieRefresh
+            onCookieRefresh: combinedRefresh
         )
         async let variantsResult: [StreamVariantOption] = (try? fetchPlayVariants(
             fid: item.id,
-            headers: headers,
+            headers: apiHeaders,
             session: session,
-            onCookieRefresh: onCookieRefresh
+            onCookieRefresh: combinedRefresh
         )) ?? []
 
         let downloadURL = await downloadResult
-        let cloudVariants = await variantsResult
+        let rawVariants = await variantsResult
+        let freshMediaHeaders = mediaHeaders(cookie: cookieBox.snapshot())
+        let cloudVariants = rawVariants.map { variant in
+            StreamVariantOption(
+                id: variant.id,
+                label: variant.label,
+                url: variant.url,
+                headers: freshMediaHeaders,
+                isHLS: variant.isHLS
+            )
+        }
 
         return try selectBestStream(
             item: item,
             downloadURL: downloadURL,
             cloudVariants: cloudVariants,
-            headers: headers,
+            headers: freshMediaHeaders,
             preferTranscode: preferTranscode
         )
     }

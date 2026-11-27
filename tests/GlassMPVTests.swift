@@ -2165,4 +2165,50 @@ final class GlassMPVTests: XCTestCase {
         let clampedMin = PlayerGestureMath.adjustedLevel(start: 0.1, translationY: 300, viewHeight: 400)
         XCTAssertEqual(clampedMin, 0.0, accuracy: 0.001)
     }
+
+    func testLocalHTTPStreamProxyErrorStatusAndMediaHeaders() async throws {
+        let mediaHdrs = QuarkDriveClient.mediaHeaders(cookie: " __puus=fresh_cookie ")
+        XCTAssertEqual(mediaHdrs["Cookie"], "__puus=fresh_cookie")
+        XCTAssertEqual(mediaHdrs["Accept"], "*/*")
+        XCTAssertEqual(mediaHdrs["Referer"], "https://pan.quark.cn/")
+        XCTAssertNil(mediaHdrs["Origin"])
+
+        let timedOutErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut, userInfo: nil)
+        XCTAssertEqual(LocalHTTPStreamProxy.httpErrorStatus(for: timedOutErr), "504 Gateway Timeout")
+
+        let cannotConnectErr = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: nil)
+        XCTAssertEqual(LocalHTTPStreamProxy.httpErrorStatus(for: cannotConnectErr), "502 Bad Gateway")
+
+        final class LogBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var logs: [String] = []
+            func append(_ line: String) {
+                lock.lock()
+                logs.append(line)
+                lock.unlock()
+            }
+            func snapshot() -> [String] {
+                lock.lock()
+                let copy = logs
+                lock.unlock()
+                return copy
+            }
+        }
+        let logBox = LogBox()
+        let deadPortURL = try XCTUnwrap(URL(string: "http://127.0.0.1:1/unreachable.mp4"))
+        let proxyURL = LocalHTTPStreamProxy.shared.registerStream(
+            url: deadPortURL,
+            headers: mediaHdrs,
+            isHLS: false,
+            onLog: { msg in
+                logBox.append(msg)
+            }
+        )
+        defer { LocalHTTPStreamProxy.shared.resetRoutes() }
+
+        let (_, response) = try await URLSession.shared.data(from: proxyURL)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 502)
+        XCTAssertTrue(logBox.snapshot().contains(where: { $0.contains("[proxy][error]") }))
+    }
 }

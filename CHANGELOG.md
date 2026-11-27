@@ -2,6 +2,15 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.6] - 2026-11-27
+
+### 修复与增强 (Fixed & Improved)
+- **根治夸克原画直链 `-1001` 请求超时与无感知失败 (`LocalHTTPStreamProxy` + `MediaSourceClients`)**：
+  - `LocalHTTPStreamProxy` 将逐 Range 新建 `URLSession(.ephemeral)` 重构为复用底层连接与 TLS 会话的共享持久连接池 `ProxyUpstreamSessionPool`（`timeoutIntervalForRequest = 12s`、`httpMaximumConnectionsPerHost = 6`、`httpShouldSetCookies = false`），上游建连或首包失败立即返回标准 `504 Gateway Timeout` / `502 Bad Gateway` 并向诊断黑匣子输出首包耗时与 `[proxy][error]` 状态码日志。
+  - `QuarkDriveClient.resolvePlaybackStream` 修复 API 响应中 `Set-Cookie: __puus` 滚动续期未回写到下载头的问题，并拆分 `mediaHeaders(cookie:)` 剔除多余 `Origin` / `application/json` 头部。
+- **主流失败自动降级与弹窗一键恢复 (`VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - `OpticalFlowPlayerController` 在 `AVPlayerItem.status == .failed` 时触发 `onRemoteStreamFailed` 回调，存在备选流时自动保留续播起点无感切换至「夸克 4K / 2K / 1080P」HLS 流并弹出顶部切换提示；异常横幅同步提供「切换画质流」与「刷新直链重试」一键自救。
+
 ## [v0.1.0-beta.5] - 2026-11-27
 
 ### 新增与优化 (Added & Improved)

@@ -44,6 +44,7 @@ final class PlayerCoordinator: ObservableObject {
     @Published var activeMediaRequest: PlaybackMediaRequest?
     @Published var currentStreamVariants: [StreamVariantOption] = []
     @Published var resumeToastText: String?
+    @Published var streamNoticeText: String?
     @Published var isResolvingHistoryResume: Bool = false
     @Published private(set) var activeHistoryEntryID: String?
     @Published var activePlaylist: [CloudMediaItem] = []
@@ -60,6 +61,8 @@ final class PlayerCoordinator: ObservableObject {
     private let telemetryLoopToken = TelemetryLoopToken()
     private var autoFallbackAttemptedURLs: Set<URL> = []
     private var resumeToastTask: Task<Void, Never>?
+    private var streamNoticeTask: Task<Void, Never>?
+    private var pendingSeekSeconds: Double = 0
     private var thumbnailCapturedEntryIDs: Set<String> = []
     private var speedBeforeHold: Double = 1.0
 
@@ -480,7 +483,7 @@ final class PlayerCoordinator: ObservableObject {
 
     func switchStreamVariant(_ variant: StreamVariantOption) {
         guard let currentReq = activeMediaRequest, variant.url != currentURL else { return }
-        let resumeTime = activeCurrentTime
+        let resumeTime = activeCurrentTime > 0 ? activeCurrentTime : pendingSeekSeconds
         let updated = PlaybackMediaRequest(
             url: variant.url,
             headers: variant.headers,
@@ -509,6 +512,86 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
+    func showStreamNotice(_ text: String) {
+        streamNoticeTask?.cancel()
+        streamNoticeText = text
+        streamNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4.5))
+            guard !Task.isCancelled else { return }
+            self?.streamNoticeText = nil
+        }
+    }
+
+    func reResolveCurrentCloudStream(preferTranscode: Bool = false) {
+        guard let req = activeMediaRequest,
+              let accountID = req.accountID,
+              let account = mediaSourceStore.accounts.first(where: { $0.id == accountID }),
+              let item = req.cloudItem else {
+            return
+        }
+        let resumeTime = activeCurrentTime > 0 ? activeCurrentTime : pendingSeekSeconds
+        let secret = mediaSourceStore.secret(for: account.id)
+        let storeRef = mediaSourceStore
+        opticalFlowController.clearError()
+        isResolvingHistoryResume = true
+        recordUISwitch("reResolveCurrentCloudStream(\(item.name), preferTranscode=\(preferTranscode))")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isResolvingHistoryResume = false }
+            do {
+                let resolved: ResolvedPlaybackStream
+                switch account.kind {
+                case .quark:
+                    resolved = try await QuarkDriveClient.resolvePlaybackStream(
+                        item: item,
+                        cookie: secret,
+                        preferTranscode: preferTranscode,
+                        onCookieRefresh: { refreshed in
+                            Task { @MainActor in
+                                storeRef.addOrUpdate(account: account, secret: refreshed)
+                            }
+                        }
+                    )
+                case .emby:
+                    guard let baseURL = EmbyClient.normalizedBaseURL(account.baseURL) else {
+                        throw MediaSourceClientError.invalidURL("Emby 地址无效")
+                    }
+                    resolved = try EmbyClient.buildPlaybackStream(
+                        item: item,
+                        baseURL: baseURL,
+                        token: secret,
+                        preferHLS: preferTranscode
+                    )
+                case .webdav:
+                    resolved = try WebDAVClient.buildPlaybackStream(
+                        item: item,
+                        username: account.username,
+                        password: secret
+                    )
+                }
+
+                let updated = PlaybackMediaRequest(
+                    url: resolved.url,
+                    headers: resolved.headers,
+                    displayTitle: resolved.title,
+                    sourceLabel: "\(account.kind.shortBadge) · \(resolved.qualityLabel)",
+                    isHLS: resolved.isHLS,
+                    alternatives: resolved.alternatives,
+                    accountID: account.id,
+                    cloudItem: item,
+                    subtitleCandidates: req.subtitleCandidates,
+                    playlist: req.playlist,
+                    playlistIndex: req.playlistIndex,
+                    directorySubtitles: req.directorySubtitles
+                )
+                self.openCloudStream(updated, seekTo: resumeTime)
+            } catch {
+                self.opticalFlowController.recordExternalError("刷新片源直链失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
     func closeToHome() {
         if currentURL != nil {
             saveWatchProgressNow(forceThumbnail: true)
@@ -520,6 +603,9 @@ final class PlayerCoordinator: ObservableObject {
         stopRuntimeTelemetrySampling()
         resumeToastTask?.cancel()
         resumeToastText = nil
+        streamNoticeTask?.cancel()
+        streamNoticeText = nil
+        pendingSeekSeconds = 0
         isHoldFastForwarding = false
         subtitleManager.resetForNewMedia()
         opticalFlowController.stop()
@@ -539,6 +625,7 @@ final class PlayerCoordinator: ObservableObject {
     private func beginPlayback(url: URL, seekTo: Double = 0) {
         let enteringFromHome = (currentURL == nil)
         currentURL = url
+        pendingSeekSeconds = max(0, seekTo)
         runtimeTimeline.removeAll()
         subtitleManager.resetForNewMedia()
         activeHistoryEntryID = resolveActiveHistoryEntryID(for: url)
@@ -908,12 +995,13 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func retryWithoutInterpolation() {
+        let resumeTime = opticalFlowController.currentTime > 0 ? opticalFlowController.currentTime : pendingSeekSeconds
         interpolationMode = .off
         vtSpatial2x = false
         opticalFlowController.clearError()
         recordUISwitch("retryWithoutInterpolation -> 原帧率直通")
         if currentURL != nil {
-            startPlayback(seekTo: opticalFlowController.currentTime, autoPlay: true)
+            startPlayback(seekTo: resumeTime, autoPlay: true)
         }
     }
 
@@ -1160,10 +1248,27 @@ final class PlayerCoordinator: ObservableObject {
             }
             if let fallback = candidates.first(where: \.isHLS) ?? candidates.first {
                 self.opticalFlowController.appendLog("[remote][fallback] \(reason)，自动切流 -> \(fallback.label)")
+                self.showStreamNotice("已自动切换至 \(fallback.label)")
                 self.switchStreamVariant(fallback)
             } else {
-                self.opticalFlowController.recordExternalError("\(reason)。请点击底部「切换画质流」选择「夸克 4K / 1080P」，或长按列表中的「缓存到本地离线精播」。")
+                self.opticalFlowController.recordExternalError("\(reason)。请点击底部「画质流」切换为「夸克 4K / 1080P」，或长按列表中的「缓存到本地离线精播」。")
             }
+        }
+        opticalFlowController.onRemoteStreamFailed = { [weak self] detail in
+            guard let self else { return false }
+            if let current = self.currentURL {
+                self.autoFallbackAttemptedURLs.insert(current)
+            }
+            let candidates = self.currentStreamVariants.filter {
+                $0.url != self.currentURL && !self.autoFallbackAttemptedURLs.contains($0.url)
+            }
+            if let fallback = candidates.first(where: \.isHLS) ?? candidates.first {
+                self.opticalFlowController.appendLog("[remote][fallback] 主流加载失败（\(detail)），自动切流 -> \(fallback.label)")
+                self.showStreamNotice("原画直链超时，已自动切换至 \(fallback.label)")
+                self.switchStreamVariant(fallback)
+                return true
+            }
+            return false
         }
         let enableInterp = (interpolationMode == .vtOpticalFlow)
         opticalFlowController.load(
@@ -1568,6 +1673,26 @@ struct LiquidGlassPlayerView: View {
                     feedback: gestureFeedback,
                     isHoldFastForwarding: coordinator.isHoldFastForwarding
                 )
+
+                if let notice = coordinator.streamNoticeText, coordinator.resumeToastText == nil {
+                    VStack {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.cyan)
+                            Text(notice)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.black.opacity(0.78)))
+                        .overlay(Capsule().strokeBorder(Color.cyan.opacity(0.35), lineWidth: 0.8))
+                        .padding(.top, showHUD ? 60 : 18)
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
                 if let toast = coordinator.resumeToastText {
                     VStack {
@@ -2912,7 +3037,10 @@ struct LiquidGlassPlayerView: View {
     }
 
     private func playbackErrorBanner(_ message: String) -> some View {
-        VStack(spacing: 12) {
+        let alternateVariant = coordinator.currentStreamVariants.first { $0.url != coordinator.currentURL }
+        let hasCloudRefresh = coordinator.activeMediaRequest?.cloudItem != nil
+
+        return VStack(spacing: 12) {
             Label("播放遇到异常", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline)
                 .foregroundStyle(.yellow)
@@ -2920,6 +3048,37 @@ struct LiquidGlassPlayerView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+
+            if alternateVariant != nil || hasCloudRefresh {
+                HStack(spacing: 10) {
+                    if let alt = alternateVariant {
+                        Button {
+                            coordinator.switchStreamVariant(alt)
+                        } label: {
+                            Text("切换 \(alt.label)")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+                    }
+
+                    if hasCloudRefresh {
+                        Button {
+                            coordinator.reResolveCurrentCloudStream(preferTranscode: false)
+                        } label: {
+                            Text("刷新直链重试")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                    }
+                }
+            }
+
             HStack(spacing: 10) {
                 if coordinator.interpolationMode != .off {
                     Button {
@@ -2931,7 +3090,12 @@ struct LiquidGlassPlayerView: View {
                             .padding(.vertical, 9)
                     }
                     .buttonStyle(.plain)
-                    .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+                    .glassEffect(
+                        alternateVariant == nil
+                            ? .regular.tint(.cyan).interactive()
+                            : .regular.interactive(),
+                        in: .capsule
+                    )
                 }
 
                 Button {
