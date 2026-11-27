@@ -964,10 +964,11 @@ final class GlassMPVTests: XCTestCase {
 
         XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .nominal))
         XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .fair))
-        XCTAssertEqual(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .serious), .fps60)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .serious), .x2)
         XCTAssertEqual(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .critical), .x2)
-        XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps120, thermalState: .serious), .fps60)
-        XCTAssertNil(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps60, thermalState: .serious))
+        XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps120, thermalState: .serious), .x2)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps60, thermalState: .serious), .x2)
+        XCTAssertNil(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .x2, thermalState: .serious))
         XCTAssertEqual(OpticalFlowResolutionPlanner.exceedsThermalCap(active: .fps60, thermalState: .critical), .x2)
     }
 
@@ -1279,7 +1280,24 @@ final class GlassMPVTests: XCTestCase {
         let strongOld = VideoEnhancementPlanner.parameters(for: .old4KRestore, strength: .strong)
         XCTAssertLessThan(subtleOld.casStrength, stdOld.casStrength)
         XCTAssertLessThan(stdOld.casStrength, strongOld.casStrength)
+        XCTAssertGreaterThan(stdOld.deblurStrength, 0)
+        XCTAssertLessThan(subtleOld.deblurStrength, stdOld.deblurStrength)
         XCTAssertFalse(stdOld.wantsSpatialUpscale)
+
+        let budget24 = VideoEnhancementPlanner.effectiveUpscaleBudget(outputFPS: 24.0, thermalState: .nominal)
+        XCTAssertTrue(budget24.allowSpatialUpscale)
+        XCTAssertEqual(budget24.maxLongSide, 2560)
+
+        let budget60 = VideoEnhancementPlanner.effectiveUpscaleBudget(outputFPS: 60.0, thermalState: .nominal)
+        XCTAssertTrue(budget60.allowSpatialUpscale)
+        XCTAssertEqual(budget60.maxLongSide, 1920)
+        XCTAssertEqual(budget60.maxShortSide, 1080)
+
+        let budget120 = VideoEnhancementPlanner.effectiveUpscaleBudget(outputFPS: 120.0, thermalState: .nominal)
+        XCTAssertFalse(budget120.allowSpatialUpscale)
+
+        let budgetSerious = VideoEnhancementPlanner.effectiveUpscaleBudget(outputFPS: 24.0, thermalState: .serious)
+        XCTAssertFalse(budgetSerious.allowSpatialUpscale)
 
         let superParams = VideoEnhancementPlanner.parameters(for: .lowResSuperRes, strength: .standard)
         XCTAssertTrue(superParams.wantsSpatialUpscale)
@@ -1311,6 +1329,10 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(coordinator.opticalFlowController.videoEnhancementStrength, .strong)
         coordinator.setComparingOriginalQuality(true)
         XCTAssertTrue(coordinator.opticalFlowController.isComparingOriginalQuality)
+        XCTAssertEqual(coordinator.qualityCompareMode, .original)
+        coordinator.setQualityCompareMode(.split)
+        XCTAssertEqual(coordinator.opticalFlowController.qualityCompareMode, .split)
+        XCTAssertFalse(coordinator.opticalFlowController.isComparingOriginalQuality)
         XCTAssertTrue(coordinator.uiAuditLogs.contains(where: { $0.contains("setVideoEnhancementPreset") }))
 
         let enhancer = MetalVideoEnhancer()
@@ -1406,5 +1428,182 @@ final class GlassMPVTests: XCTestCase {
         )
         XCTAssertEqual(CVPixelBufferGetWidth(animeBGRA), 128)
         XCTAssertEqual(CVPixelBufferGetHeight(animeBGRA), 72)
+
+        let splitYUV = enhancer.process(
+            yuvBuffer,
+            preset: .old4KRestore,
+            strength: .standard,
+            isHDRContent: false,
+            isDolbyVision: false,
+            compareMode: .split
+        )
+        XCTAssertEqual(CVPixelBufferGetWidth(splitYUV), 128)
+        XCTAssertEqual(CVPixelBufferGetHeight(splitYUV), 72)
+
+        let highFPSDowngraded = enhancer.process(
+            yuvBuffer,
+            preset: .lowResSuperRes,
+            strength: .standard,
+            isHDRContent: false,
+            isDolbyVision: false,
+            outputFPS: 120.0,
+            thermalState: .nominal
+        )
+        XCTAssertEqual(CVPixelBufferGetWidth(highFPSDowngraded), 128)
+        XCTAssertEqual(CVPixelBufferGetHeight(highFPSDowngraded), 72)
+    }
+
+    func testQuarkDriveClientParsersAndStreamSelection() throws {
+        let listJSON = Data((
+            "{\"code\":0,\"message\":\"ok\",\"data\":{\"list\":["
+            + "{\"fid\":\"dir1\",\"file_name\":\"动画番剧\",\"dir\":true,\"file_type\":0},"
+            + "{\"fid\":\"f1\",\"file_name\":\"TomAndJerry_4K.mp4\",\"dir\":false,\"size\":419430400,\"video_max_resolution\":\"4k\"},"
+            + "{\"fid\":\"f2\",\"file_name\":\"Movie.mkv\",\"dir\":false,\"size\":2147483648},"
+            + "{\"fid\":\"f3\",\"file_name\":\"readme.txt\",\"dir\":false,\"size\":120}"
+            + "]}}"
+        ).utf8)
+
+        let parsed = try QuarkDriveClient.parseFileListJSON(listJSON)
+        XCTAssertEqual(parsed.count, 3)
+        XCTAssertTrue(parsed[0].isDirectory)
+        XCTAssertEqual(parsed[0].name, "动画番剧")
+        XCTAssertEqual(parsed[1].name, "Movie.mkv")
+        XCTAssertEqual(parsed[2].name, "TomAndJerry_4K.mp4")
+
+        let dlJSON = Data("{\"code\":0,\"data\":[{\"download_url\":\"https://cdn.example.com/file.mp4\"}]}".utf8)
+        let dlURL = try QuarkDriveClient.parseDownloadURLJSON(dlJSON)
+        XCTAssertEqual(dlURL.absoluteString, "https://cdn.example.com/file.mp4")
+
+        let playJSON = Data((
+            "{\"code\":0,\"data\":{\"video_list\":["
+            + "{\"resolution\":\"normal\",\"video_info\":{\"url\":\"https://cdn.example.com/720p.m3u8\"}},"
+            + "{\"resolution\":\"4k\",\"video_info\":{\"url\":\"https://cdn.example.com/4k.m3u8\"}},"
+            + "{\"resolution\":\"high\",\"video_info\":{\"url\":\"https://cdn.example.com/1080p.m3u8\"}}"
+            + "]}}"
+        ).utf8)
+        let headers = QuarkDriveClient.requestHeaders(cookie: "__pus=abc")
+        XCTAssertEqual(headers["Referer"], "https://pan.quark.cn/")
+        let variants = QuarkDriveClient.parsePlayVariantsJSON(playJSON, headers: headers)
+        XCTAssertEqual(variants.map(\.label), ["夸克 4K", "夸克 1080P", "夸克 720P"])
+
+        let mp4Stream = try QuarkDriveClient.selectBestStream(
+            item: parsed[2],
+            downloadURL: dlURL,
+            cloudVariants: variants,
+            headers: headers,
+            preferTranscode: false
+        )
+        XCTAssertEqual(mp4Stream.url, dlURL)
+        XCTAssertEqual(mp4Stream.qualityLabel, "原画直链")
+        XCTAssertFalse(mp4Stream.isHLS)
+        XCTAssertEqual(mp4Stream.alternatives.count, 4)
+
+        let mkvStream = try QuarkDriveClient.selectBestStream(
+            item: parsed[1],
+            downloadURL: dlURL,
+            cloudVariants: variants,
+            headers: headers,
+            preferTranscode: false
+        )
+        XCTAssertEqual(mkvStream.qualityLabel, "夸克 4K")
+        XCTAssertTrue(mkvStream.isHLS)
+    }
+
+    func testEmbyClientParsersAndStreamBuilders() throws {
+        let baseURL = try XCTUnwrap(EmbyClient.normalizedBaseURL("http://192.168.1.20:8096/emby/"))
+        XCTAssertEqual(baseURL.absoluteString, "http://192.168.1.20:8096")
+
+        let authJSON = Data("{\"AccessToken\":\"tok123\",\"User\":{\"Id\":\"u456\",\"Name\":\"LivingRoom\"}}".utf8)
+        let auth = try EmbyClient.parseAuthJSON(authJSON)
+        XCTAssertEqual(auth.userId, "u456")
+        XCTAssertEqual(auth.accessToken, "tok123")
+
+        let itemsJSON = Data((
+            "{\"Items\":["
+            + "{\"Id\":\"dir1\",\"Name\":\"电影库\",\"Type\":\"CollectionFolder\",\"IsFolder\":true},"
+            + "{\"Id\":\"mov1\",\"Name\":\"测试电影\",\"Type\":\"Movie\",\"IsFolder\":false,\"MediaType\":\"Video\",\"Container\":\"mkv\",\"RunTimeTicks\":1200000000,\"MediaSources\":[{\"Id\":\"ms99\",\"Container\":\"mkv\",\"Size\":1073741824}]},"
+            + "{\"Id\":\"mov2\",\"Name\":\"原生MP4\",\"Type\":\"Movie\",\"IsFolder\":false,\"MediaType\":\"Video\",\"Container\":\"mp4\",\"RunTimeTicks\":600000000,\"MediaSources\":[{\"Id\":\"ms100\",\"Container\":\"mp4\"}]}"
+            + "]}"
+        ).utf8)
+
+        let items = try EmbyClient.parseItemsJSON(itemsJSON, baseURL: baseURL, token: auth.accessToken)
+        XCTAssertEqual(items.count, 3)
+        XCTAssertTrue(items[0].isDirectory)
+        XCTAssertEqual(items[1].mediaSourceId, "ms99")
+        XCTAssertEqual(items[1].durationSeconds ?? 0, 120.0, accuracy: 0.1)
+
+        let mkvStream = try EmbyClient.buildPlaybackStream(item: items[1], baseURL: baseURL, token: auth.accessToken)
+        XCTAssertTrue(mkvStream.isHLS)
+        XCTAssertTrue(mkvStream.url.absoluteString.contains("master.m3u8"))
+        XCTAssertEqual(mkvStream.alternatives.count, 2)
+
+        let mp4Stream = try EmbyClient.buildPlaybackStream(item: items[2], baseURL: baseURL, token: auth.accessToken)
+        XCTAssertFalse(mp4Stream.isHLS)
+        XCTAssertTrue(mp4Stream.url.absoluteString.contains("Static=true"))
+    }
+
+    func testWebDAVPropfindXMLParser() throws {
+        let baseURL = try XCTUnwrap(URL(string: "http://192.168.1.10:5244/dav/"))
+        let xml = Data((
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            + "<D:multistatus xmlns:D=\"DAV:\">"
+            + "<D:response><D:href>/dav/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>"
+            + "<D:response><D:href>/dav/%E7%94%B5%E5%BD%B1/</D:href><D:propstat><D:prop><D:displayname>电影</D:displayname><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>"
+            + "<D:response><D:href>/dav/Sample_2160p.mp4</D:href><D:propstat><D:prop><D:displayname>Sample_2160p.mp4</D:displayname><D:getcontentlength>52428800</D:getcontentlength><D:resourcetype/></D:prop></D:propstat></D:response>"
+            + "<D:response><D:href>/dav/poster.jpg</D:href><D:propstat><D:prop><D:displayname>poster.jpg</D:displayname><D:resourcetype/></D:prop></D:propstat></D:response>"
+            + "</D:multistatus>"
+        ).utf8)
+
+        let parsed = WebDAVClient.parsePropfindXML(xml, baseURL: baseURL)
+        XCTAssertEqual(parsed.count, 2)
+        XCTAssertTrue(parsed[0].isDirectory)
+        XCTAssertEqual(parsed[0].name, "电影")
+        XCTAssertFalse(parsed[1].isDirectory)
+        XCTAssertEqual(parsed[1].name, "Sample_2160p.mp4")
+
+        let stream = try WebDAVClient.buildPlaybackStream(item: parsed[1], username: "admin", password: "secret")
+        XCTAssertEqual(stream.url.absoluteString, "http://192.168.1.10:5244/dav/Sample_2160p.mp4")
+        XCTAssertTrue(stream.headers["Authorization"]?.hasPrefix("Basic ") == true)
+    }
+
+    @MainActor
+    func testMediaSourceStoreAndCloudPlaybackRequest() throws {
+        let suiteName = "glassmpv.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = MediaSourceStore(defaults: defaults, storageKey: "testAccounts", useKeychain: false)
+        let quark = MediaSourceAccount(kind: .quark, name: "我的夸克")
+        store.addOrUpdate(account: quark, secret: "cookie=xyz")
+        XCTAssertEqual(store.accounts.count, 1)
+        XCTAssertEqual(store.secret(for: quark.id), "cookie=xyz")
+
+        let storeReloaded = MediaSourceStore(defaults: defaults, storageKey: "testAccounts", useKeychain: false)
+        XCTAssertEqual(storeReloaded.accounts.first?.name, "我的夸克")
+
+        let coordinator = PlayerCoordinator()
+        defer { coordinator.closeToHome() }
+        let u1 = try XCTUnwrap(URL(string: "https://cdn.example.com/a.mp4"))
+        let u2 = try XCTUnwrap(URL(string: "https://cdn.example.com/a_4k.m3u8"))
+        let alt1 = StreamVariantOption(id: "orig", label: "原画直链", url: u1, headers: [:], isHLS: false)
+        let alt2 = StreamVariantOption(id: "4k", label: "夸克 4K", url: u2, headers: [:], isHLS: true)
+        let req = PlaybackMediaRequest(
+            url: u1,
+            headers: ["Referer": "https://pan.quark.cn/"],
+            displayTitle: "Test.mp4",
+            sourceLabel: "夸克 · 原画直链",
+            alternatives: [alt1, alt2]
+        )
+        coordinator.openCloudStream(req)
+        XCTAssertEqual(coordinator.currentURL, u1)
+        XCTAssertEqual(coordinator.currentStreamVariants.count, 2)
+        XCTAssertTrue(coordinator.opticalFlowController.isRemoteStream)
+
+        coordinator.switchStreamVariant(alt2)
+        XCTAssertEqual(coordinator.currentURL, u2)
+        XCTAssertEqual(coordinator.activeMediaRequest?.sourceLabel, "夸克 4K")
+
+        store.delete(accountID: quark.id)
+        XCTAssertTrue(store.accounts.isEmpty)
     }
 }

@@ -8,17 +8,19 @@ import QuartzCore
 import VideoToolbox
 
 private struct MetalEnhanceUniforms {
-    var denoiseStrength: Float
-    var denoiseThreshold: Float
+    var deblurStrength: Float
     var casStrength: Float
     var lineDarken: Float
     var clarityStrength: Float
+    var noiseDeadzone: Float
     var isVideoRange: UInt32
     var isBT601: UInt32
+    var compareMode: UInt32
+    var splitX: Float
     var padding: UInt32
 }
 
-/// 零第三方依赖的实时 Metal + MetalFX GPU 画质增强引擎（假 4K 亮度去糊 + 动漫线条增强 + 低清空间超分）
+/// 零第三方依赖的实时 Metal + MetalFX GPU 画质增强引擎（单遍多尺度亮度去糊 + 防光晕 CAS + 低清超分 + 分屏对比）
 @MainActor
 final class MetalVideoEnhancer {
     private(set) var activePipelineLabel: String = "关闭"
@@ -51,13 +53,15 @@ final class MetalVideoEnhancer {
     using namespace metal;
 
     struct EnhanceUniforms {
-        float denoiseStrength;
-        float denoiseThreshold;
+        float deblurStrength;
         float casStrength;
         float lineDarken;
         float clarityStrength;
+        float noiseDeadzone;
         uint isVideoRange;
         uint isBT601;
+        uint compareMode;
+        float splitX;
         uint padding;
     };
 
@@ -101,7 +105,17 @@ final class MetalVideoEnhancer {
         return clamp(rgb, 0.0f, 1.0f);
     }
 
-    inline float evalEnhancedCenterLuma(
+    inline float sampleUnitLuma(texture2d<float, access::read> tex, int x, int y, int maxX, int maxY, uint isVideoRange) {
+        uint2 pos = uint2(clamp(x, 0, maxX), clamp(y, 0, maxY));
+        return toUnitLuma(tex.read(pos).r, isVideoRange);
+    }
+
+    inline float sampleRGBLuma(texture2d<float, access::read> tex, int x, int y, int maxX, int maxY) {
+        uint2 pos = uint2(clamp(x, 0, maxX), clamp(y, 0, maxY));
+        return rgbLuma(tex.read(pos).rgb);
+    }
+
+    inline float computeEnhancedLuma(
         float c,
         float n,
         float s,
@@ -111,82 +125,107 @@ final class MetalVideoEnhancer {
         float ne,
         float sw,
         float se,
+        float n2,
+        float s2,
+        float w2,
+        float e2,
         constant EnhanceUniforms& u
     ) {
+        float mn1 = min(min(c, n), min(s, min(w, e)));
+        float mx1 = max(max(c, n), max(s, max(w, e)));
+        float mnAll = min(mn1, min(min(nw, ne), min(sw, se)));
+        float mxAll = max(mx1, max(max(nw, ne), max(sw, se)));
         float working = c;
 
-        // 1. 保边双边去噪：压低压缩块/蚊噪但不糊掉真实轮廓
-        if (u.denoiseStrength > 0.001f) {
-            float thresh = max(0.01f, u.denoiseThreshold);
-            float inv2Sigma = -0.5f / (thresh * thresh);
-            float sum = working;
-            float wsum = 1.0f;
-            float neighbors[8] = { n, s, w, e, nw, ne, sw, se };
-            float spatialW[8] = { 0.85f, 0.85f, 0.85f, 0.85f, 0.55f, 0.55f, 0.55f, 0.55f };
-            for (int i = 0; i < 8; i++) {
-                float d = neighbors[i] - working;
-                float rw = exp((d * d) * inv2Sigma) * spatialW[i];
-                sum += neighbors[i] * rw;
-                wsum += rw;
-            }
-            float denoised = sum / wsum;
-            working = mix(working, denoised, clamp(u.denoiseStrength, 0.0f, 0.9f));
+        // 1. 多尺度假 4K 去糊 (1px + 2px USM) + 死区门控与邻域极值限幅（零光晕、零 exp 高能耗运算）
+        if (u.deblurStrength > 0.001f) {
+            float blurFine = 0.25f * (n + s + w + e);
+            float blurWide = 0.125f * (n + s + w + e + n2 + s2 + w2 + e2);
+            float detailFine = c - blurFine;
+            float detailWide = c - blurWide;
+            float signF = detailFine >= 0.0f ? 1.0f : -1.0f;
+            float signW = detailWide >= 0.0f ? 1.0f : -1.0f;
+            float gatedFine = signF * max(0.0f, abs(detailFine) - u.noiseDeadzone * 0.65f);
+            float gatedWide = signW * max(0.0f, abs(detailWide) - u.noiseDeadzone);
+            float rawUnsharp = working + u.deblurStrength * (0.55f * gatedFine + 0.70f * gatedWide);
+            float haloMargin = 0.025f;
+            working = clamp(rawUnsharp, mnAll - haloMargin, mxAll + haloMargin);
         }
 
-        // 2. 对比度自适应锐化 (Luma CAS)：仅针对局部微对比重建边缘，无生硬白边
+        // 2. Contrast Adaptive Sharpening (CAS) 微反差与局部边缘重建
         if (u.casStrength > 0.001f) {
-            float minSoft = min(min(working, n), min(s, min(w, e)));
-            float maxSoft = max(max(working, n), max(s, max(w, e)));
-            float minCorner = min(minSoft, min(min(nw, ne), min(sw, se)));
-            float maxCorner = max(maxSoft, max(max(nw, ne), max(sw, se)));
-            float mn = 0.5f * (minSoft + minCorner);
-            float mx = 0.5f * (maxSoft + maxCorner);
+            float mn = 0.5f * (mn1 + mnAll);
+            float mx = 0.5f * (mx1 + mxAll);
             float peakAmp = sqrt(clamp(min(mn, 1.0f - mx) / max(mx, 0.001f), 0.0f, 1.0f));
             float sharpenWeight = peakAmp * (-0.125f - 0.075f * clamp(u.casStrength, 0.0f, 1.0f));
             float sharpened = (working + (n + s + w + e) * sharpenWeight) / (1.0f + 4.0f * sharpenWeight);
-            working = clamp(sharpened, 0.0f, 1.0f);
+            working = clamp(sharpened, max(0.0f, mnAll - 0.02f), min(1.0f, mxAll + 0.02f));
         }
 
-        // 3. 动漫深色描边压实：仅增强比周围平均更暗的细线
+        // 3. 深色描边线条压实（动漫/漫画/字幕边缘黑位收紧）
         if (u.lineDarken > 0.001f) {
             float avgLocal = 0.25f * (n + s + w + e);
             float darkDelta = max(0.0f, avgLocal - working);
-            working = max(0.0f, working - darkDelta * (u.lineDarken * 1.4f));
+            float gatedDark = max(0.0f, darkDelta - u.noiseDeadzone * 0.5f);
+            working = max(0.0f, working - gatedDark * (u.lineDarken * 1.55f));
         }
 
-        // 4. 老片轻微去灰 S 曲线 + 局部微反差
+        // 4. 老片去灰 S 曲线微反差
         if (u.clarityStrength > 0.001f) {
-            float midBoost = working - 0.5f;
-            float sCurve = working + u.clarityStrength * (working * (1.0f - working) * (midBoost * 1.6f));
-            working = clamp(sCurve, 0.0f, 1.0f);
+            float midOffset = working - 0.5f;
+            working = clamp(working + u.clarityStrength * (working * (1.0f - working) * (midOffset * 1.85f)), 0.0f, 1.0f);
         }
 
         return clamp(working, 0.0f, 1.0f);
     }
 
     kernel void enhanceLuma(
-        texture2d<float, access::sample> inY [[texture(0)]],
+        texture2d<float, access::read> inY [[texture(0)]],
         texture2d<float, access::write> outY [[texture(1)]],
         constant EnhanceUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
-        if (gid.x >= outY.get_width() || gid.y >= outY.get_height()) {
+        uint width = outY.get_width();
+        uint height = outY.get_height();
+        if (gid.x >= width || gid.y >= height) {
             return;
         }
+        float rawCenter = inY.read(gid).r;
+        if (u.compareMode == 2u) {
+            outY.write(float4(rawCenter, 0.0f, 0.0f, 1.0f), gid);
+            return;
+        }
+        if (u.compareMode == 1u) {
+            int splitPixelX = int(float(width) * clamp(u.splitX, 0.1f, 0.9f));
+            if (abs(int(gid.x) - splitPixelX) <= 1) {
+                outY.write(float4(fromUnitLuma(0.96f, u.isVideoRange), 0.0f, 0.0f, 1.0f), gid);
+                return;
+            }
+            if (int(gid.x) < splitPixelX) {
+                outY.write(float4(rawCenter, 0.0f, 0.0f, 1.0f), gid);
+                return;
+            }
+        }
+
         int maxX = int(inY.get_width()) - 1;
         int maxY = int(inY.get_height()) - 1;
         int x = int(gid.x);
         int y = int(gid.y);
 
-        auto fetch = [&](int dx, int dy) -> float {
-            uint2 pos = uint2(clamp(x + dx, 0, maxX), clamp(y + dy, 0, maxY));
-            return toUnitLuma(inY.read(pos).r, u.isVideoRange);
-        };
-
-        float enhanced = evalEnhancedCenterLuma(
-            fetch(0, 0),
-            fetch(0, -1), fetch(0, 1), fetch(-1, 0), fetch(1, 0),
-            fetch(-1, -1), fetch(1, -1), fetch(-1, 1), fetch(1, 1),
+        float enhanced = computeEnhancedLuma(
+            toUnitLuma(rawCenter, u.isVideoRange),
+            sampleUnitLuma(inY, x, y - 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x, y + 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x - 1, y, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x + 1, y, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x - 1, y - 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x + 1, y - 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x - 1, y + 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x + 1, y + 1, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x, y - 2, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x, y + 2, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x - 2, y, maxX, maxY, u.isVideoRange),
+            sampleUnitLuma(inY, x + 2, y, maxX, maxY, u.isVideoRange),
             u
         );
         outY.write(float4(fromUnitLuma(enhanced, u.isVideoRange), 0.0f, 0.0f, 1.0f), gid);
@@ -209,29 +248,51 @@ final class MetalVideoEnhancer {
         constant EnhanceUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
-        if (gid.x >= outColor.get_width() || gid.y >= outColor.get_height()) {
+        uint width = outColor.get_width();
+        uint height = outColor.get_height();
+        if (gid.x >= width || gid.y >= height) {
             return;
         }
+        float4 centerRGBA = inColor.read(gid);
+        if (u.compareMode == 2u) {
+            outColor.write(centerRGBA, gid);
+            return;
+        }
+        if (u.compareMode == 1u) {
+            int splitPixelX = int(float(width) * clamp(u.splitX, 0.1f, 0.9f));
+            if (abs(int(gid.x) - splitPixelX) <= 1) {
+                outColor.write(float4(0.95f, 0.96f, 0.25f, 1.0f), gid);
+                return;
+            }
+            if (int(gid.x) < splitPixelX) {
+                outColor.write(centerRGBA, gid);
+                return;
+            }
+        }
+
         int maxX = int(inColor.get_width()) - 1;
         int maxY = int(inColor.get_height()) - 1;
         int x = int(gid.x);
         int y = int(gid.y);
 
-        float4 centerRGBA = inColor.read(gid);
-        auto fetchY = [&](int dx, int dy) -> float {
-            uint2 pos = uint2(clamp(x + dx, 0, maxX), clamp(y + dy, 0, maxY));
-            return rgbLuma(inColor.read(pos).rgb);
-        };
-
         float yCenter = rgbLuma(centerRGBA.rgb);
-        float yOut = evalEnhancedCenterLuma(
+        float yOut = computeEnhancedLuma(
             yCenter,
-            fetchY(0, -1), fetchY(0, 1), fetchY(-1, 0), fetchY(1, 0),
-            fetchY(-1, -1), fetchY(1, -1), fetchY(-1, 1), fetchY(1, 1),
+            sampleRGBLuma(inColor, x, y - 1, maxX, maxY),
+            sampleRGBLuma(inColor, x, y + 1, maxX, maxY),
+            sampleRGBLuma(inColor, x - 1, y, maxX, maxY),
+            sampleRGBLuma(inColor, x + 1, y, maxX, maxY),
+            sampleRGBLuma(inColor, x - 1, y - 1, maxX, maxY),
+            sampleRGBLuma(inColor, x + 1, y - 1, maxX, maxY),
+            sampleRGBLuma(inColor, x - 1, y + 1, maxX, maxY),
+            sampleRGBLuma(inColor, x + 1, y + 1, maxX, maxY),
+            sampleRGBLuma(inColor, x, y - 2, maxX, maxY),
+            sampleRGBLuma(inColor, x, y + 2, maxX, maxY),
+            sampleRGBLuma(inColor, x - 2, y, maxX, maxY),
+            sampleRGBLuma(inColor, x + 2, y, maxX, maxY),
             u
         );
-        float3 delta = float3(yOut - yCenter);
-        float3 finalRGB = clamp(centerRGBA.rgb + delta, 0.0f, 1.0f);
+        float3 finalRGB = clamp(centerRGBA.rgb + float3(yOut - yCenter), 0.0f, 1.0f);
         outColor.write(float4(finalRGB, centerRGBA.a), gid);
     }
 
@@ -246,31 +307,7 @@ final class MetalVideoEnhancer {
             return;
         }
         constexpr sampler chromaSampler(address::clamp_to_edge, filter::linear);
-        int maxX = int(inY.get_width()) - 1;
-        int maxY = int(inY.get_height()) - 1;
-        int x = int(gid.x);
-        int y = int(gid.y);
-
         float yRaw = inY.read(gid).r;
-        if (u.denoiseStrength > 0.001f) {
-            float yUnit = toUnitLuma(yRaw, u.isVideoRange);
-            float thresh = max(0.015f, u.denoiseThreshold);
-            float inv2Sigma = -0.5f / (thresh * thresh);
-            float sum = yUnit;
-            float wsum = 1.0f;
-            int2 offsets[4] = { int2(0, -1), int2(0, 1), int2(-1, 0), int2(1, 0) };
-            for (int i = 0; i < 4; i++) {
-                uint2 p = uint2(clamp(x + offsets[i].x, 0, maxX), clamp(y + offsets[i].y, 0, maxY));
-                float ny = toUnitLuma(inY.read(p).r, u.isVideoRange);
-                float d = ny - yUnit;
-                float rw = exp((d * d) * inv2Sigma) * 0.75f;
-                sum += ny * rw;
-                wsum += rw;
-            }
-            float cleanUnit = mix(yUnit, sum / wsum, clamp(u.denoiseStrength, 0.0f, 0.75f));
-            yRaw = fromUnitLuma(cleanUnit, u.isVideoRange);
-        }
-
         float2 normCoord = (float2(gid) + 0.5f) / float2(float(outColor.get_width()), float(outColor.get_height()));
         float2 uvRaw = inUV.sample(chromaSampler, normCoord).rg;
         float3 rgb = yuvSampleToRGB(yRaw, uvRaw, u.isVideoRange, u.isBT601);
@@ -384,9 +421,12 @@ final class MetalVideoEnhancer {
         strength: VideoEnhancementStrength,
         isHDRContent: Bool,
         isDolbyVision: Bool,
-        bypassForComparison: Bool = false
+        bypassForComparison: Bool = false,
+        compareMode: VideoEnhancementCompareMode = .off,
+        outputFPS: Double = 24.0,
+        thermalState: ProcessInfo.ThermalState = .nominal
     ) -> CVPixelBuffer {
-        if bypassForComparison {
+        if bypassForComparison || compareMode == .original {
             activePipelineLabel = "原画对比"
             return sourceBuffer
         }
@@ -425,11 +465,23 @@ final class MetalVideoEnhancer {
         let isVideoRange: UInt32 = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             || pixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: sourceBuffer) ? 1 : 0
+        let compareUniform = compareMode.uniformValue
+
+        let upscaleBudget = VideoEnhancementPlanner.effectiveUpscaleBudget(
+            outputFPS: outputFPS,
+            thermalState: thermalState
+        )
 
         if params.wantsSpatialUpscale,
+           upscaleBudget.allowSpatialUpscale,
            !isHDRContent,
            (is8BitBiPlanar || isBGRA),
-           let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: srcW, inputHeight: srcH),
+           let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
+               inputWidth: srcW,
+               inputHeight: srcH,
+               maxLongSide: upscaleBudget.maxLongSide,
+               maxShortSide: upscaleBudget.maxShortSide
+           ),
            let result = runSpatialUpscalePass(
                sourceBuffer: sourceBuffer,
                srcW: srcW,
@@ -439,6 +491,7 @@ final class MetalVideoEnhancer {
                isYUV: is8BitBiPlanar,
                isVideoRange: isVideoRange,
                isBT601: isBT601,
+               compareUniform: compareUniform,
                params: params,
                device: device,
                commandQueue: commandQueue,
@@ -461,13 +514,19 @@ final class MetalVideoEnhancer {
                is10Bit: is10BitBiPlanar,
                isVideoRange: isVideoRange,
                isBT601: isBT601,
+               compareUniform: compareUniform,
                params: params,
                commandQueue: commandQueue,
                textureCache: textureCache,
                enhanceLumaPipeline: enhanceLumaPipeline,
                copyChromaPipeline: copyChromaPipeline
            ) {
-            activePipelineLabel = "\(preset.rawValue) \(srcW)×\(srcH)"
+            if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
+                let tag = (thermalState == .serious || thermalState == .critical) ? "温控直锐" : "超分·省电直锐"
+                activePipelineLabel = "\(tag) \(srcW)×\(srcH)"
+            } else {
+                activePipelineLabel = "\(preset.rawValue) \(srcW)×\(srcH)"
+            }
             recordTiming(startHost: startHost)
             return result
         }
@@ -477,12 +536,18 @@ final class MetalVideoEnhancer {
                sourceBuffer: sourceBuffer,
                srcW: srcW,
                srcH: srcH,
+               compareUniform: compareUniform,
                params: params,
                commandQueue: commandQueue,
                textureCache: textureCache,
                enhanceBGRAPipeline: enhanceBGRAPipeline
            ) {
-            activePipelineLabel = "\(preset.rawValue) \(srcW)×\(srcH)"
+            if params.wantsSpatialUpscale && !upscaleBudget.allowSpatialUpscale {
+                let tag = (thermalState == .serious || thermalState == .critical) ? "温控直锐" : "超分·省电直锐"
+                activePipelineLabel = "\(tag) \(srcW)×\(srcH)"
+            } else {
+                activePipelineLabel = "\(preset.rawValue) \(srcW)×\(srcH)"
+            }
             recordTiming(startHost: startHost)
             return result
         }
@@ -498,9 +563,29 @@ final class MetalVideoEnhancer {
         } else {
             averageProcessMs = averageProcessMs * 0.85 + elapsedMs * 0.15
         }
-        if enhancedFrameCount % 120 == 0, let textureCache {
+        if enhancedFrameCount % 60 == 0, let textureCache {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
+    }
+
+    private func makeUniforms(
+        params: VideoEnhancementParameters,
+        isVideoRange: UInt32,
+        isBT601: UInt32,
+        compareUniform: UInt32
+    ) -> MetalEnhanceUniforms {
+        MetalEnhanceUniforms(
+            deblurStrength: params.deblurStrength,
+            casStrength: params.casStrength,
+            lineDarken: params.lineDarken,
+            clarityStrength: params.clarityStrength,
+            noiseDeadzone: params.noiseDeadzone,
+            isVideoRange: isVideoRange,
+            isBT601: isBT601,
+            compareMode: compareUniform,
+            splitX: 0.5,
+            padding: 0
+        )
     }
 
     private func runSpatialUpscalePass(
@@ -512,6 +597,7 @@ final class MetalVideoEnhancer {
         isYUV: Bool,
         isVideoRange: UInt32,
         isBT601: UInt32,
+        compareUniform: UInt32,
         params: VideoEnhancementParameters,
         device: MTLDevice,
         commandQueue: MTLCommandQueue,
@@ -535,15 +621,11 @@ final class MetalVideoEnhancer {
                   let preEncoder = commandBuffer.makeComputeCommandEncoder() else {
                 return nil
             }
-            var preUniforms = MetalEnhanceUniforms(
-                denoiseStrength: params.denoiseStrength,
-                denoiseThreshold: params.denoiseThreshold,
-                casStrength: 0,
-                lineDarken: 0,
-                clarityStrength: 0,
+            var preUniforms = makeUniforms(
+                params: params,
                 isVideoRange: isVideoRange,
                 isBT601: isBT601,
-                padding: 0
+                compareUniform: 0
             )
             preEncoder.setComputePipelineState(yuvToBGRAPipeline)
             preEncoder.setTexture(yTex, index: 0)
@@ -591,15 +673,11 @@ final class MetalVideoEnhancer {
         guard let finishEncoder = commandBuffer.makeComputeCommandEncoder() else {
             return nil
         }
-        var finishUniforms = MetalEnhanceUniforms(
-            denoiseStrength: 0,
-            denoiseThreshold: params.denoiseThreshold,
-            casStrength: params.casStrength,
-            lineDarken: params.lineDarken,
-            clarityStrength: params.clarityStrength,
+        var finishUniforms = makeUniforms(
+            params: params,
             isVideoRange: 0,
             isBT601: isBT601,
-            padding: 0
+            compareUniform: compareUniform
         )
         finishEncoder.setComputePipelineState(enhanceBGRAPipeline)
         finishEncoder.setTexture(upscaledTex, index: 0)
@@ -630,6 +708,7 @@ final class MetalVideoEnhancer {
         is10Bit: Bool,
         isVideoRange: UInt32,
         isBT601: UInt32,
+        compareUniform: UInt32,
         params: VideoEnhancementParameters,
         commandQueue: MTLCommandQueue,
         textureCache: CVMetalTextureCache,
@@ -648,15 +727,11 @@ final class MetalVideoEnhancer {
         }
 
         if let yEncoder = commandBuffer.makeComputeCommandEncoder() {
-            var uniforms = MetalEnhanceUniforms(
-                denoiseStrength: params.denoiseStrength,
-                denoiseThreshold: params.denoiseThreshold,
-                casStrength: params.casStrength,
-                lineDarken: params.lineDarken,
-                clarityStrength: params.clarityStrength,
+            var uniforms = makeUniforms(
+                params: params,
                 isVideoRange: isVideoRange,
                 isBT601: isBT601,
-                padding: 0
+                compareUniform: compareUniform
             )
             yEncoder.setComputePipelineState(enhanceLumaPipeline)
             yEncoder.setTexture(srcY, index: 0)
@@ -686,6 +761,7 @@ final class MetalVideoEnhancer {
         sourceBuffer: CVPixelBuffer,
         srcW: Int,
         srcH: Int,
+        compareUniform: UInt32,
         params: VideoEnhancementParameters,
         commandQueue: MTLCommandQueue,
         textureCache: CVMetalTextureCache,
@@ -699,15 +775,11 @@ final class MetalVideoEnhancer {
             return nil
         }
 
-        var uniforms = MetalEnhanceUniforms(
-            denoiseStrength: params.denoiseStrength,
-            denoiseThreshold: params.denoiseThreshold,
-            casStrength: params.casStrength,
-            lineDarken: params.lineDarken,
-            clarityStrength: params.clarityStrength,
+        var uniforms = makeUniforms(
+            params: params,
             isVideoRange: 0,
             isBT601: 0,
-            padding: 0
+            compareUniform: compareUniform
         )
         encoder.setComputePipelineState(enhanceBGRAPipeline)
         encoder.setTexture(srcTex, index: 0)
@@ -772,7 +844,7 @@ final class MetalVideoEnhancer {
         let sig = "\(width)x\(height):\(pixelFormat)"
         if sig != outputPoolSignature || outputPool == nil {
             let poolAttrs: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 3
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 2
             ]
             let bufferAttrs: [String: Any] = [
                 kCVPixelBufferWidthKey as String: width,

@@ -40,8 +40,12 @@ final class PlayerCoordinator: ObservableObject {
     @Published var isLowPowerModeEnabled: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
     @Published var videoEnhancementPreset: VideoEnhancementPreset = .off
     @Published var videoEnhancementStrength: VideoEnhancementStrength = .standard
+    @Published var qualityCompareMode: VideoEnhancementCompareMode = .off
+    @Published var activeMediaRequest: PlaybackMediaRequest?
+    @Published var currentStreamVariants: [StreamVariantOption] = []
 
     let opticalFlowController = OpticalFlowPlayerController()
+    let mediaSourceStore = MediaSourceStore()
     private let thermalToken = ThermalObserverToken()
     private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
@@ -177,6 +181,8 @@ final class PlayerCoordinator: ObservableObject {
 
     func open(url: URL, isSecurityScoped: Bool = false) {
         opticalFlowController.clearError()
+        activeMediaRequest = nil
+        currentStreamVariants = []
 
         if !url.isFileURL {
             beginPlayback(url: url)
@@ -231,6 +237,29 @@ final class PlayerCoordinator: ObservableObject {
         FileManager.default.temporaryDirectory.appendingPathComponent("glassmpv_last_session_report.txt")
     }
 
+    func openCloudStream(_ request: PlaybackMediaRequest, seekTo: Double = 0) {
+        opticalFlowController.clearError()
+        activeMediaRequest = request
+        currentStreamVariants = request.alternatives
+        recordUISwitch("openCloudStream(\(request.sourceLabel)) -> \(request.displayTitle)")
+        beginPlayback(url: request.url, seekTo: seekTo)
+    }
+
+    func switchStreamVariant(_ variant: StreamVariantOption) {
+        guard let currentReq = activeMediaRequest, variant.url != currentURL else { return }
+        let resumeTime = activeCurrentTime
+        let updated = PlaybackMediaRequest(
+            url: variant.url,
+            headers: variant.headers,
+            displayTitle: currentReq.displayTitle,
+            sourceLabel: variant.label,
+            alternatives: currentReq.alternatives
+        )
+        recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
+        activeMediaRequest = updated
+        beginPlayback(url: updated.url, seekTo: resumeTime)
+    }
+
     func closeToHome() {
         if currentURL != nil {
             captureRuntimeTelemetrySample()
@@ -241,18 +270,21 @@ final class PlayerCoordinator: ObservableObject {
         stopRuntimeTelemetrySampling()
         opticalFlowController.stop()
         currentURL = nil
+        activeMediaRequest = nil
+        currentStreamVariants = []
+        qualityCompareMode = .off
         isImportingFile = false
         OrientationController.shared.returnToHomeOrientation()
     }
 
-    private func beginPlayback(url: URL) {
+    private func beginPlayback(url: URL, seekTo: Double = 0) {
         let enteringFromHome = (currentURL == nil)
         currentURL = url
         runtimeTimeline.removeAll()
         if enteringFromHome {
             OrientationController.shared.enterVideoLandscape()
         }
-        startPlayback()
+        startPlayback(seekTo: seekTo)
         startRuntimeTelemetrySampling()
     }
 
@@ -558,8 +590,11 @@ final class PlayerCoordinator: ObservableObject {
         videoEnhancementPreset = preset
         opticalFlowController.videoEnhancementPreset = preset
         if preset == .off {
+            qualityCompareMode = .off
+            opticalFlowController.qualityCompareMode = .off
             opticalFlowController.isComparingOriginalQuality = false
         }
+        opticalFlowController.refreshDisplayedFrameForQualityChange()
         recordUISwitch("setVideoEnhancementPreset \(prev.rawValue) -> \(preset.rawValue)")
     }
 
@@ -568,12 +603,22 @@ final class PlayerCoordinator: ObservableObject {
         let prev = videoEnhancementStrength
         videoEnhancementStrength = strength
         opticalFlowController.videoEnhancementStrength = strength
+        opticalFlowController.refreshDisplayedFrameForQualityChange()
         recordUISwitch("setVideoEnhancementStrength \(prev.rawValue) -> \(strength.rawValue)")
     }
 
+    func setQualityCompareMode(_ mode: VideoEnhancementCompareMode) {
+        guard mode != qualityCompareMode else { return }
+        let prev = qualityCompareMode
+        qualityCompareMode = mode
+        opticalFlowController.qualityCompareMode = mode
+        opticalFlowController.isComparingOriginalQuality = (mode == .original)
+        opticalFlowController.refreshDisplayedFrameForQualityChange()
+        recordUISwitch("setQualityCompareMode \(prev.rawValue) -> \(mode.rawValue)")
+    }
+
     func setComparingOriginalQuality(_ comparing: Bool) {
-        guard opticalFlowController.isComparingOriginalQuality != comparing else { return }
-        opticalFlowController.isComparingOriginalQuality = comparing
+        setQualityCompareMode(comparing ? .original : .off)
     }
 
     func togglePlayPause() {
@@ -614,7 +659,10 @@ final class PlayerCoordinator: ObservableObject {
             targetFPS: opticalFlowTargetFPS,
             startAt: seekTo,
             autoPlay: autoPlay,
-            enableInterpolation: enableInterp
+            enableInterpolation: enableInterp,
+            httpHeaders: activeMediaRequest?.headers ?? [:],
+            displayTitle: activeMediaRequest?.displayTitle,
+            streamLabel: activeMediaRequest?.sourceLabel ?? ""
         )
         opticalFlowController.setSpeed(speed)
     }
@@ -782,27 +830,45 @@ private struct QualityPresetStrip: View {
                     Spacer(minLength: 4)
 
                     if coordinator.currentURL != nil {
-                        HStack(spacing: 4) {
-                            Image(systemName: "eye")
-                                .font(.caption2.weight(.semibold))
-                            Text(optical.isComparingOriginalQuality ? "原画对比中" : "按住对比原画")
-                                .font(.caption2.weight(.semibold))
+                        HStack(spacing: 6) {
+                            let isSplit = (coordinator.qualityCompareMode == .split)
+                            Button {
+                                coordinator.setQualityCompareMode(isSplit ? .off : .split)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "rectangle.split.2x1")
+                                        .font(.caption2.weight(.semibold))
+                                    Text(isSplit ? "分屏中" : "分屏对比")
+                                        .font(.caption2.weight(.semibold))
+                                }
+                                .foregroundStyle(isSplit ? .black : .white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule().fill(isSplit ? Color.cyan : Color.white.opacity(0.16))
+                                )
+                            }
+                            .buttonStyle(.plain)
+
+                            let isOriginal = (coordinator.qualityCompareMode == .original)
+                            Button {
+                                coordinator.setQualityCompareMode(isOriginal ? .off : .original)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "eye")
+                                        .font(.caption2.weight(.semibold))
+                                    Text(isOriginal ? "原画中" : "对比原画")
+                                        .font(.caption2.weight(.semibold))
+                                }
+                                .foregroundStyle(isOriginal ? .black : .white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule().fill(isOriginal ? Color.yellow : Color.white.opacity(0.16))
+                                )
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .foregroundStyle(optical.isComparingOriginalQuality ? .black : .white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(
-                            Capsule().fill(optical.isComparingOriginalQuality ? Color.yellow : Color.white.opacity(0.16))
-                        )
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { _ in
-                                    coordinator.setComparingOriginalQuality(true)
-                                }
-                                .onEnded { _ in
-                                    coordinator.setComparingOriginalQuality(false)
-                                }
-                        )
                     }
                 }
             }
@@ -813,6 +879,7 @@ private struct QualityPresetStrip: View {
 struct LiquidGlassPlayerView: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject private var optical: OpticalFlowPlayerController
+    @ObservedObject private var mediaSourceStore: MediaSourceStore
 
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = false
@@ -824,6 +891,8 @@ struct LiquidGlassPlayerView: View {
     @State private var showEnhancementSheet: Bool = false
     @State private var showChangelogSheet: Bool = false
     @State private var showDiagnosticSheet: Bool = false
+    @State private var showAddMediaSourceSheet: Bool = false
+    @State private var activeBrowseAccount: MediaSourceAccount?
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
     @State private var hudAutoHideTask: Task<Void, Never>?
@@ -832,6 +901,7 @@ struct LiquidGlassPlayerView: View {
     init(coordinator: PlayerCoordinator) {
         self.coordinator = coordinator
         self._optical = ObservedObject(wrappedValue: coordinator.opticalFlowController)
+        self._mediaSourceStore = ObservedObject(wrappedValue: coordinator.mediaSourceStore)
     }
 
     var body: some View {
@@ -866,18 +936,25 @@ struct LiquidGlassPlayerView: View {
             if coordinator.currentURL == nil {
                 welcomeOverlay
             } else {
-                if optical.isComparingOriginalQuality {
+                if optical.qualityCompareMode != .off {
                     VStack {
-                        Text("按住对比中 · 原画")
+                        Button {
+                            coordinator.setQualityCompareMode(.off)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: optical.qualityCompareMode == .split ? "rectangle.split.2x1" : "eye")
+                                Text(optical.qualityCompareMode == .split ? "左 原画 ｜ 右 增强 · 点击退出分屏" : "全屏原画对比中 · 点击恢复增强")
+                            }
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.black)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Capsule().fill(Color.yellow))
-                            .padding(.top, 14)
+                            .background(Capsule().fill(optical.qualityCompareMode == .split ? Color.cyan : Color.yellow))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 14)
                         Spacer()
                     }
-                    .allowsHitTesting(false)
                 }
                 if optical.errorMessage == nil,
                    (optical.isLoadingPipeline || optical.presentedFrameCount == 0) {
@@ -974,6 +1051,25 @@ struct LiquidGlassPlayerView: View {
             DiagnosticLogSheet(coordinator: coordinator)
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showAddMediaSourceSheet) {
+            AddMediaSourceSheet(store: mediaSourceStore)
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(item: $activeBrowseAccount) { account in
+            CloudSourceBrowserSheet(
+                account: account,
+                store: mediaSourceStore,
+                onPlay: { request in
+                    coordinator.openCloudStream(request)
+                },
+                onDownloadLocal: { localURL in
+                    coordinator.open(url: localURL, isSecurityScoped: false)
+                }
+            )
+            .presentationDetents([.large])
+            .presentationBackground(.ultraThinMaterial)
         }
     }
 
@@ -1111,6 +1207,81 @@ struct LiquidGlassPlayerView: View {
                         .contentShape(Capsule())
                         .glassEffect(.regular.tint(.indigo).interactive(), in: .capsule)
                     }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("云端片源 · 夸克 / Emby / WebDAV", systemImage: "icloud.and.arrow.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.cyan)
+                            Spacer()
+                            Button {
+                                showAddMediaSourceSheet = true
+                            } label: {
+                                Label("添加", systemImage: "plus")
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+                        }
+
+                        if mediaSourceStore.accounts.isEmpty {
+                            Button {
+                                showAddMediaSourceSheet = true
+                            } label: {
+                                HStack {
+                                    Image(systemName: "plus.circle.fill")
+                                        .foregroundStyle(.cyan)
+                                    Text("挂载夸克网盘（内置扫码提取）或 Emby / WebDAV")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                .padding(.vertical, 8)
+                                .padding(.horizontal, 12)
+                                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(mediaSourceStore.accounts) { account in
+                                        Button {
+                                            activeBrowseAccount = account
+                                        } label: {
+                                            HStack(spacing: 6) {
+                                                Image(systemName: account.kind.iconName)
+                                                    .font(.caption.weight(.semibold))
+                                                    .foregroundStyle(account.kind == .emby ? Color.green : (account.kind == .quark ? Color.cyan : Color.indigo))
+                                                VStack(alignment: .leading, spacing: 1) {
+                                                    Text(account.name)
+                                                        .font(.caption.weight(.semibold))
+                                                        .lineLimit(1)
+                                                    Text(account.kind.displayName)
+                                                        .font(.system(size: 9.5))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                            }
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 8)
+                                            .glassEffect(.regular.interactive(), in: .capsule)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .contextMenu {
+                                            Button(role: .destructive) {
+                                                mediaSourceStore.delete(accountID: account.id)
+                                            } label: {
+                                                Label("删除片源", systemImage: "trash")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(14)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 22))
 
                     Button {
                         showURLPrompt = true
@@ -1407,6 +1578,30 @@ struct LiquidGlassPlayerView: View {
                             coordinator.videoEnhancementPreset != .off ? .regular.tint(.purple).interactive() : .regular.interactive(),
                             in: .capsule
                         )
+
+                        if coordinator.currentStreamVariants.count > 1 {
+                            Menu {
+                                ForEach(coordinator.currentStreamVariants) { variant in
+                                    Button {
+                                        coordinator.switchStreamVariant(variant)
+                                        scheduleHUDAutoHide()
+                                    } label: {
+                                        if variant.url == coordinator.currentURL {
+                                            Label(variant.label, systemImage: "checkmark")
+                                        } else {
+                                            Text(variant.label)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Text(coordinator.activeMediaRequest?.sourceLabel ?? "切换画质流")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.green)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 8)
+                            }
+                            .glassEffect(.regular.tint(.green).interactive(), in: .capsule)
+                        }
 
                         if optical.isHDRContent {
                             Button {

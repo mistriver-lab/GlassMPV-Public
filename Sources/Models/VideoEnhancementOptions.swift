@@ -41,11 +41,11 @@ enum VideoEnhancementPreset: String, CaseIterable, Identifiable, Hashable, Senda
         case .off:
             return "不额外修改像素，原片直通输出。"
         case .old4KRestore:
-            return "专治标称 4K 但高压缩发糊老片：纯亮度保边去噪 + CAS 自适应锐化 + 去灰提透。"
+            return "专治标称 4K 但高压缩发糊老片：多尺度纯亮度去糊 + 防光晕 CAS 锐化 + 去灰提透。"
         case .animeLineArt:
-            return "针对动画/老番：抑制蚊噪色块并强化深色描边线条，保持纯净色彩无彩边。"
+            return "针对动画/老番：抑制蚊噪浮尘并压实深色描边线条，保持纯净色彩无彩边。"
         case .lowResSuperRes:
-            return "针对 480p/720p/1080p 低清视频与高帧率 720p 光流帧：MetalFX 感知重建 + 锐度收尾。"
+            return "针对 480p/720p/1080p 低清视频与光流帧：MetalFX 感知重建 + 多尺度锐度收尾（高刷/高温自动切省电直锐）。"
         }
     }
 }
@@ -60,9 +60,26 @@ enum VideoEnhancementStrength: String, CaseIterable, Identifiable, Hashable, Sen
 
     var multiplier: Float {
         switch self {
-        case .subtle: return 0.65
+        case .subtle: return 0.70
         case .standard: return 1.0
         case .strong: return 1.35
+        }
+    }
+}
+
+/// 画质对比模式（兼容播放中与暂停状态即时刷新）
+enum VideoEnhancementCompareMode: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case off = "增强效果"
+    case split = "分屏对比"
+    case original = "全屏原画"
+
+    var id: Self { self }
+
+    var uniformValue: UInt32 {
+        switch self {
+        case .off: return 0
+        case .split: return 1
+        case .original: return 2
         }
     }
 }
@@ -75,9 +92,31 @@ struct VideoEnhancementParameters: Equatable, Sendable {
     let lineDarken: Float
     let clarityStrength: Float
     let wantsSpatialUpscale: Bool
+    let deblurStrength: Float
+    let noiseDeadzone: Float
+
+    init(
+        denoiseStrength: Float,
+        denoiseThreshold: Float,
+        casStrength: Float,
+        lineDarken: Float,
+        clarityStrength: Float,
+        wantsSpatialUpscale: Bool,
+        deblurStrength: Float = 0,
+        noiseDeadzone: Float = 0.012
+    ) {
+        self.denoiseStrength = denoiseStrength
+        self.denoiseThreshold = denoiseThreshold
+        self.casStrength = casStrength
+        self.lineDarken = lineDarken
+        self.clarityStrength = clarityStrength
+        self.wantsSpatialUpscale = wantsSpatialUpscale
+        self.deblurStrength = deblurStrength
+        self.noiseDeadzone = noiseDeadzone
+    }
 }
 
-/// 跨平台画质增强参数与超分尺寸规划器
+/// 跨平台画质增强参数与超分热功耗预算规划器
 enum VideoEnhancementPlanner: Sendable {
     static func parameters(
         for preset: VideoEnhancementPreset,
@@ -92,36 +131,58 @@ enum VideoEnhancementPlanner: Sendable {
                 casStrength: 0,
                 lineDarken: 0,
                 clarityStrength: 0,
-                wantsSpatialUpscale: false
+                wantsSpatialUpscale: false,
+                deblurStrength: 0,
+                noiseDeadzone: 0
             )
         case .old4KRestore:
             return VideoEnhancementParameters(
-                denoiseStrength: min(0.85, max(0, 0.42 * m)),
-                denoiseThreshold: 0.038,
-                casStrength: min(1.0, max(0, 0.72 * m)),
-                lineDarken: 0.0,
-                clarityStrength: min(0.32, max(0, 0.14 * m)),
-                wantsSpatialUpscale: false
+                denoiseStrength: 0,
+                denoiseThreshold: 0.032,
+                casStrength: min(1.0, max(0, 0.88 * m)),
+                lineDarken: min(0.18, max(0, 0.08 * m)),
+                clarityStrength: min(0.45, max(0, 0.24 * m)),
+                wantsSpatialUpscale: false,
+                deblurStrength: min(1.35, max(0, 0.72 * m)),
+                noiseDeadzone: 0.012
             )
         case .animeLineArt:
             return VideoEnhancementParameters(
-                denoiseStrength: min(0.90, max(0, 0.60 * m)),
-                denoiseThreshold: 0.055,
-                casStrength: min(1.0, max(0, 0.85 * m)),
-                lineDarken: min(0.30, max(0, 0.16 * m)),
-                clarityStrength: min(0.25, max(0, 0.10 * m)),
-                wantsSpatialUpscale: false
+                denoiseStrength: 0,
+                denoiseThreshold: 0.045,
+                casStrength: min(1.0, max(0, 0.92 * m)),
+                lineDarken: min(0.75, max(0, 0.45 * m)),
+                clarityStrength: min(0.38, max(0, 0.18 * m)),
+                wantsSpatialUpscale: false,
+                deblurStrength: min(1.15, max(0, 0.58 * m)),
+                noiseDeadzone: 0.020
             )
         case .lowResSuperRes:
             return VideoEnhancementParameters(
-                denoiseStrength: min(0.75, max(0, 0.35 * m)),
-                denoiseThreshold: 0.042,
-                casStrength: min(0.95, max(0, 0.55 * m)),
-                lineDarken: 0.0,
-                clarityStrength: min(0.24, max(0, 0.10 * m)),
-                wantsSpatialUpscale: true
+                denoiseStrength: 0,
+                denoiseThreshold: 0.036,
+                casStrength: min(1.0, max(0, 0.85 * m)),
+                lineDarken: min(0.22, max(0, 0.10 * m)),
+                clarityStrength: min(0.35, max(0, 0.18 * m)),
+                wantsSpatialUpscale: true,
+                deblurStrength: min(1.15, max(0, 0.60 * m)),
+                noiseDeadzone: 0.014
             )
         }
+    }
+
+    /// 按输出帧率与热状态限制 MetalFX 空间超分输出规模，避免 96/120fps 或高温下过热掉帧
+    static func effectiveUpscaleBudget(
+        outputFPS: Double,
+        thermalState: ProcessInfo.ThermalState
+    ) -> (allowSpatialUpscale: Bool, maxLongSide: Int, maxShortSide: Int) {
+        if thermalState == .serious || thermalState == .critical || outputFPS > 65.0 {
+            return (allowSpatialUpscale: false, maxLongSide: 0, maxShortSide: 0)
+        }
+        if thermalState == .fair || outputFPS > 35.0 {
+            return (allowSpatialUpscale: true, maxLongSide: 1920, maxShortSide: 1080)
+        }
+        return (allowSpatialUpscale: true, maxLongSide: 2560, maxShortSide: 1440)
     }
 
     static func recommendedUpscaleDimensions(

@@ -5,6 +5,13 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
+- **新增原生云端片源体系：夸克网盘 / Emby / WebDAV・Alist (`MediaSourceModels` + `MediaSourceClients` + `RemoteStreamOpticalFlowWorker` + `CloudMediaLibraryView` + `VTOpticalFlowEngine`)**：
+  - **夸克网盘**：内置 `WKWebView` 网页一键登录提取 Cookie（存系统 Keychain），调用 `drive-pc.quark.cn` 浏览目录与 `file/download` + `file/v2/play`，`MP4/MOV` 优先原画直链，播放底栏支持一键切换「原画直链 / 夸克 4K / 1080P」，非原生封装自动切云端流，亦支持离线高速缓存至本地以解锁完整 `AVAssetReader` 120fps。
+  - **Emby & WebDAV / Alist**：支持 LAN/HTTP（配置 `NSAppTransportSecurity`）与 HTTPS 登录、海报墙、剧集季集浏览、`原画直链 / 无损 HLS` 智能切换与 `PROPFIND` 目录解析。
+  - **云端流媒体 ANE + Metal 管线**：通过 `AVPlayerItemVideoOutput` + 独立并发 `RemoteStreamOpticalFlowWorker` 接入，确保远程 HTTP/HLS 视频流同样支持实时 Metal 画质增强与 ANE 光流补帧。
+- **彻底修复 `153158` 实机日志反馈的过热、超分去糊微弱与对比原画不生效 (`VideoEnhancementOptions` + `MetalVideoEnhancer` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 移除高耗时 8 邻域双边 `exp()`，重构为**单遍多尺度（1px+2px 半径）邻域限幅 Luma 去糊 + 死区抑制 + 防光晕 CAS + 深色描边**；`MetalFX` 新增热功耗预算守卫（`outputFPS > 65` 或过热自动降为省电直锐，日常 60fps 封顶 1080p）。
+  - 修复过热保护档位：`ThermalState.serious` 由 `60fps [×4]` 下调至 `2×(48fps)` 以快速降温并保持高清晰度；`presentFrame` 缓存最近原始帧，无论**暂停或播放中**切换预设、强度、「**分屏对比（左原画|右增强）**」或「**原画对比**」均可零延迟即时刷新屏幕。
 - **新增实时 Metal + MetalFX GPU 画质增强引擎 (`VideoEnhancementOptions` + `MetalVideoEnhancer` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
   - 针对「假 4K 高压缩发糊老片」：上线纯亮度通道（Y-Plane）保边双边去噪 + 对比度自适应锐化（Luma CAS）+ 去灰微反差管线，直通 `420v/420f/x420/xf20`（零彩边光晕且完整保留 10-bit HDR10/HLG 亮度空间）。
   - 针对「480p/720p/1080p 低清视频」及「60/96/120fps 高帧率 720p 光流帧」：在 `MTLCommandBuffer` 单次提交链中串联 `YUV→BGRA 预降噪` → `MTLFXSpatialScaler` 感知重建（最高 2560×1440，模拟器自动回退双三次超分）→ `CAS` 收尾锐化。

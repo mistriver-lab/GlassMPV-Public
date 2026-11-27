@@ -87,6 +87,8 @@ def test_info_plist_valid_and_120hz_enabled():
     assert plist["UIFileSharingEnabled"] is True
     assert plist["LSSupportsOpeningDocumentsInPlace"] is True
     assert plist["CFBundleDisplayName"] == "GlassMPV"
+    ats = plist.get("NSAppTransportSecurity")
+    assert isinstance(ats, dict) and ats.get("NSAllowsArbitraryLoads") is True, "Missing NSAppTransportSecurity"
     photo_desc = plist.get("NSPhotoLibraryUsageDescription")
     assert isinstance(photo_desc, str) and photo_desc.strip(), "Missing NSPhotoLibraryUsageDescription"
 
@@ -217,6 +219,14 @@ def test_swift_sources_non_empty_and_balanced():
     assert "final class MetalVideoEnhancer" in metal_enhancer_src
     assert "MTLFXSpatialScaler" in metal_enhancer_src
 
+    for required_cloud_file in (
+        ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
+        ROOT / "Sources" / "Engine" / "MediaSourceClients.swift",
+        ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift",
+        ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
+    ):
+        assert required_cloud_file.is_file(), f"Missing {required_cloud_file}"
+
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "MPVUI" not in vt_engine
     assert "MPV 超分核" not in vt_engine
@@ -338,6 +348,11 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testCoordinatorIdempotencyAndPassthroughMode" in swift_test_src
     assert "testDiagnosticLogUpgradeSessionSummaryAndMemorySampler" in swift_test_src
     assert "testIdentifiableSelectionTagsDolbyVisionAndDisplaySwitches" in swift_test_src
+    assert "testVideoEnhancementPlannerAndMetalEnhancer" in swift_test_src
+    assert "testQuarkDriveClientParsersAndStreamSelection" in swift_test_src
+    assert "testEmbyClientParsersAndStreamBuilders" in swift_test_src
+    assert "testWebDAVPropfindXMLParser" in swift_test_src
+    assert "testMediaSourceStoreAndCloudPlaybackRequest" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

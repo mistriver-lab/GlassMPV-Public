@@ -1154,9 +1154,7 @@ enum OpticalFlowResolutionPlanner: Sendable {
         switch state {
         case .nominal, .fair:
             return nil
-        case .serious:
-            return .fps60
-        case .critical:
+        case .serious, .critical:
             return .x2
         @unknown default:
             return nil
@@ -1188,11 +1186,11 @@ enum OpticalFlowResolutionPlanner: Sendable {
         if thermalState == .critical, targetTierRank(active) > targetTierRank(.x2) {
             return (.x2, "严重过热")
         }
+        if thermalState == .serious, targetTierRank(active) > targetTierRank(.x2) {
+            return (.x2, "过热保护")
+        }
         if isLowPowerMode, targetTierRank(active) > targetTierRank(.fps60) {
             return (.fps60, "低电量60Hz上限")
-        }
-        if thermalState == .serious, targetTierRank(active) > targetTierRank(.fps60) {
-            return (.fps60, "过热保护")
         }
         return nil
     }
@@ -1679,10 +1677,21 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var videoEnhancementPreset: VideoEnhancementPreset = .off
     @Published @MainActor var videoEnhancementStrength: VideoEnhancementStrength = .standard
     @Published @MainActor var isComparingOriginalQuality: Bool = false
+    @Published @MainActor var qualityCompareMode: VideoEnhancementCompareMode = .off
     @Published @MainActor var activeQualityPipelineLabel: String = "关闭"
     @Published @MainActor var averageQualityEnhanceMs: Double = 0
+    @Published @MainActor var displayTitle: String = ""
+    @Published @MainActor var activeStreamLabel: String = ""
+    @Published @MainActor var isRemoteStream: Bool = false
     @MainActor private var rawHDRTransferName: String? = nil
     @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
+    @MainActor private var lastRawPresentedBuffer: CVPixelBuffer? = nil
+    @MainActor private var lastRawPresentedPTS: Double = 0
+    @MainActor private var currentHTTPHeaders: [String: String] = [:]
+    @MainActor private var remoteVideoOutput: AVPlayerItemVideoOutput? = nil
+    @MainActor private var remoteFlowWorker: RemoteStreamOpticalFlowWorker? = nil
+    @MainActor private var lastRemoteSamplePTS: Double = -1
+    @MainActor private var remoteStatusObserver: NSKeyValueObservation? = nil
 
     @MainActor
     private var metalEnhancer: MetalVideoEnhancer {
@@ -1855,6 +1864,197 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    func refreshDisplayedFrameForQualityChange() {
+        guard let raw = lastRawPresentedBuffer, let layer = displayLayer else { return }
+        presentFrame(raw, ptsSeconds: lastRawPresentedPTS, on: layer, isRefresh: true)
+    }
+
+    @MainActor
+    private func startRemoteStreamSession(
+        url: URL,
+        httpHeaders: [String: String],
+        targetFPS: OpticalFlowTargetFPS,
+        startAt: Double,
+        autoPlay: Bool,
+        enableInterpolation: Bool,
+        token: UUID
+    ) {
+        let options: [String: Any]? = httpHeaders.isEmpty
+            ? nil
+            : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
+        let asset = AVURLAsset(url: url, options: options)
+        let item = AVPlayerItem(asset: asset)
+        let pixelAttrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: pixelAttrs)
+        videoOutput.suppressesPlayerRendering = true
+        item.add(videoOutput)
+        self.remoteVideoOutput = videoOutput
+
+        let player = AVPlayer(playerItem: item)
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.rate = 0
+        self.audioPlayer = player
+
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        self.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            let seconds = time.seconds.isFinite ? time.seconds : 0
+            Task { @MainActor [weak self] in
+                guard let self, self.isTokenValid(token) else { return }
+                self.currentTime = seconds
+                if let dur = self.audioPlayer?.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
+                    self.duration = dur
+                }
+            }
+        }
+
+        if enableInterpolation {
+            let queueLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(
+                targetFPS: targetFPS.effectiveTargetFPS(sourceFPS: 24.0)
+            )
+            updateQueueLimits(maxQueued: queueLimits.maxQueued, prebuffer: queueLimits.prebuffer)
+            let worker = RemoteStreamOpticalFlowWorker(targetFPS: targetFPS, sourceFPS: 24.0) { [weak self] frames, delta, avgMs, label in
+                guard let self else { return }
+                self.enqueueRemoteInterpolatedFrames(
+                    frames,
+                    interpolatedDelta: delta,
+                    avgMs: avgMs,
+                    backendLabel: label,
+                    token: token
+                )
+            }
+            self.remoteFlowWorker = worker
+        } else {
+            self.remoteFlowWorker = nil
+        }
+
+        self.remoteStatusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
+            let status = observedItem.status
+            let errText = observedItem.error.map { Self.formatDetailedError($0) }
+            let presSize = observedItem.presentationSize
+            let itemDuration = observedItem.duration.seconds
+            Task { @MainActor [weak self] in
+                guard let self, self.isTokenValid(token) else { return }
+                switch status {
+                case .readyToPlay:
+                    if itemDuration.isFinite && itemDuration > 0 {
+                        self.duration = itemDuration
+                    }
+                    if presSize.width > 0 && presSize.height > 0 && self.videoWidth == 0 {
+                        self.videoWidth = Int(presSize.width.rounded())
+                        self.videoHeight = Int(presSize.height.rounded())
+                    }
+                    if let videoTrack = (try? await observedItem.asset.loadTracks(withMediaType: .video))?.first {
+                        let nominal = (try? await videoTrack.load(.nominalFrameRate)) ?? 0
+                        let fmts = (try? await videoTrack.load(.formatDescriptions)) ?? []
+                        guard self.isTokenValid(token) else { return }
+                        if nominal > 1 {
+                            self.sourceFPS = Double(nominal)
+                            self.interpolatedFPS = self.isInterpolationEnabled
+                                ? self.effectiveTargetFPS.effectiveTargetFPS(sourceFPS: Double(nominal))
+                                : Double(nominal)
+                        } else if self.sourceFPS <= 0 {
+                            self.sourceFPS = 24.0
+                            self.interpolatedFPS = self.isInterpolationEnabled
+                                ? self.effectiveTargetFPS.effectiveTargetFPS(sourceFPS: 24.0)
+                                : 24.0
+                        }
+                        if let firstDesc = fmts.first {
+                            let metrics = Self.extractTrackMetrics(from: firstDesc, naturalSize: presSize)
+                            self.setColorFallbackMetadata(from: firstDesc, trackMetrics: metrics)
+                            self.videoCodec = metrics.codec
+                            self.bitDepthLabel = metrics.bitDepth
+                            self.isHDRContent = metrics.isHDR
+                            self.isDolbyVisionContent = metrics.isDolbyVision
+                            self.rawHDRTransferName = metrics.transferName
+                            self.isHDRActive = metrics.isHDR && self.isEDREnabled
+                            self.hdrLabel = PlaybackHUDMetrics.formatHDRTag(
+                                isHDRContent: metrics.isHDR,
+                                transferName: metrics.transferName,
+                                isHDRActive: self.isHDRActive,
+                                isDolbyVision: metrics.isDolbyVision
+                            )
+                        }
+                    } else if self.sourceFPS <= 0 {
+                        self.sourceFPS = 24.0
+                        self.interpolatedFPS = self.isInterpolationEnabled
+                            ? self.effectiveTargetFPS.effectiveTargetFPS(sourceFPS: 24.0)
+                            : 24.0
+                    }
+
+                    if startAt > 0.25 {
+                        let targetCM = CMTime(seconds: startAt, preferredTimescale: 600)
+                        player.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                    }
+                    if let worker = self.remoteFlowWorker {
+                        let srcRate = self.sourceFPS > 1 ? self.sourceFPS : 24.0
+                        let tier = self.effectiveTargetFPS
+                        Task {
+                            await worker.reconfigure(targetFPS: tier, sourceFPS: srcRate)
+                        }
+                    }
+                    self.isLoadingPipeline = false
+                    self.pipelineStatusText = ""
+                    self.isPipelineReadyToPlay = true
+                    self.syncDisplayLinkState()
+                    if autoPlay {
+                        self.startActiveClockIfNeeded()
+                    }
+                    self.appendLog("[remote] 云端视频流已就绪 (\(self.videoWidth)×\(self.videoHeight), srcFPS=\(String(format: "%.2f", self.sourceFPS)))")
+
+                case .failed:
+                    self.isLoadingPipeline = false
+                    self.pipelineStatusText = ""
+                    self.isPaused = true
+                    self.syncDisplayLinkState()
+                    let detail = errText ?? "未知网络或解码错误"
+                    self.appendLog("[remote][error] 流媒体加载失败: \(detail)")
+                    self.errorMessage = "云端流媒体打开失败（\(detail)）。如使用夸克原画直链，可尝试切回「夸克 4K / 1080P」或重新登录刷新 Cookie。"
+
+                case .unknown:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func enqueueRemoteInterpolatedFrames(
+        _ frames: [RemoteOpticalFlowOutputFrame],
+        interpolatedDelta: Int,
+        avgMs: Double,
+        backendLabel: String,
+        token: UUID
+    ) {
+        guard isTokenValid(token) else { return }
+        bufferLock.lock()
+        for item in frames {
+            if frameQueue.count >= maxQueuedFrames {
+                frameQueue.removeFirst()
+            }
+            frameQueue.append((pts: item.pts, buffer: item.buffer))
+            if item.pts > lastEnqueuedPTS {
+                lastEnqueuedPTS = item.pts
+            }
+        }
+        bufferLock.unlock()
+
+        Task { @MainActor [weak self] in
+            guard let self, self.isTokenValid(token) else { return }
+            if interpolatedDelta > 0 {
+                self.interpolatedFrameCount += interpolatedDelta
+                self.averageInterpolationMs = avgMs
+            }
+            if !backendLabel.isEmpty && self.activeBackendLabel != backendLabel {
+                self.activeBackendLabel = backendLabel
+            }
+        }
+    }
+
+    @MainActor
     func clearError() {
         errorMessage = nil
     }
@@ -1872,34 +2072,33 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         targetFPS: OpticalFlowTargetFPS = .x2,
         startAt: Double = 0,
         autoPlay: Bool = true,
-        enableInterpolation: Bool = true
+        enableInterpolation: Bool = true,
+        httpHeaders: [String: String] = [:],
+        displayTitle: String? = nil,
+        streamLabel: String = ""
     ) {
         stopInternal()
         currentURL = url
-        isInterpolationEnabled = enableInterpolation
+        let remoteStream = !url.isFileURL
+        isRemoteStream = remoteStream
+        currentHTTPHeaders = httpHeaders
+        self.displayTitle = displayTitle ?? url.lastPathComponent
+        self.activeStreamLabel = streamLabel
         requestedTargetFPS = targetFPS
         effectiveTargetFPS = targetFPS
-        let allowedSpatial = enableInterpolation && spatial2x && targetFPS.allowsSpatial2x
-        enableSpatial2xUpscale = allowedSpatial
-        errorMessage = nil
-        interpolatedFrameCount = 0
-        failedInterpolationCount = 0
-        presentedFrameCount = 0
-        skippedInterpolationCount = 0
-        averageInterpolationMs = 0
-        latestAVDeltaMs = nil
-        activeBackendLabel = enableInterpolation ? "--" : "原帧率直通"
-        lastInterpolationError = nil
-        isLoadingPipeline = true
-        pipelineStatusText = enableInterpolation ? "正在初始化 ANE 光流核..." : "正在初始化原生硬解直通..."
-        updateLatestAudioTime(max(0, startAt))
-        appendLog("[ane] 请求加载: \(url.lastPathComponent) (补帧=\(enableInterpolation), 目标=\(targetFPS.shortBadge), 请求空间2×=\(spatial2x), startAt=\(String(format: "%.2f", startAt))s, autoPlay=\(autoPlay))")
-        if enableInterpolation && spatial2x && !targetFPS.allowsSpatial2x {
-            appendLog("[ane] 目标档位 \(targetFPS.shortBadge) 需多相补帧，已自动禁用 ANE 2× 空间超分")
-        }
 
-        if enableInterpolation {
+        var effectiveInterpolation = enableInterpolation
+        if remoteStream {
 #if targetEnvironment(simulator)
+            if enableInterpolation {
+                effectiveInterpolation = false
+                appendLog("[remote] iOS Simulator 不支持硬件光流，远程流自动以原帧率硬解 + Metal 画质增强播放")
+            }
+#endif
+        } else if enableInterpolation {
+#if targetEnvironment(simulator)
+            isInterpolationEnabled = true
+            enableSpatial2xUpscale = spatial2x && targetFPS.allowsSpatial2x
             isHardwareSupported = false
             isLoadingPipeline = false
             pipelineStatusText = ""
@@ -1920,13 +2119,37 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 #endif
         }
 
+        isInterpolationEnabled = effectiveInterpolation
+        let allowedSpatial = effectiveInterpolation && spatial2x && targetFPS.allowsSpatial2x
+        enableSpatial2xUpscale = allowedSpatial
+        errorMessage = nil
+        interpolatedFrameCount = 0
+        failedInterpolationCount = 0
+        presentedFrameCount = 0
+        skippedInterpolationCount = 0
+        averageInterpolationMs = 0
+        latestAVDeltaMs = nil
+        activeBackendLabel = remoteStream
+            ? (effectiveInterpolation ? "远程·ANE准备中" : "远程硬解直通")
+            : (effectiveInterpolation ? "--" : "原帧率直通")
+        lastInterpolationError = nil
+        isLoadingPipeline = true
+        pipelineStatusText = remoteStream
+            ? "正在连接云端视频流..."
+            : (effectiveInterpolation ? "正在初始化 ANE 光流核..." : "正在初始化原生硬解直通...")
+        updateLatestAudioTime(max(0, startAt))
+        appendLog("[ane] 请求加载: \(self.displayTitle) (remote=\(remoteStream), 补帧=\(effectiveInterpolation), 目标=\(targetFPS.shortBadge), 请求空间2×=\(spatial2x), startAt=\(String(format: "%.2f", startAt))s, autoPlay=\(autoPlay))")
+        if effectiveInterpolation && spatial2x && !targetFPS.allowsSpatial2x {
+            appendLog("[ane] 目标档位 \(targetFPS.shortBadge) 需多相补帧，已自动禁用 ANE 2× 空间超分")
+        }
+
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
 
         self.isPaused = !autoPlay
 
         let link = CADisplayLink(target: self, selector: #selector(onDisplayTick))
-        let initialTargetRate = enableInterpolation
+        let initialTargetRate = effectiveInterpolation
             ? targetFPS.effectiveTargetFPS(sourceFPS: 24.0)
             : 24.0
         let maxScreenFPS = UIApplication.shared.connectedScenes
@@ -1934,7 +2157,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             .first?.screen.maximumFramesPerSecond ?? 120
         let initialRange = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
             targetFPS: initialTargetRate,
-            isInterpolationEnabled: enableInterpolation,
+            isInterpolationEnabled: effectiveInterpolation,
             maxScreenFPS: maxScreenFPS,
             isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled
         )
@@ -1948,11 +2171,23 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         link.add(to: .main, forMode: .common)
         self.displayLink = link
         displayContainer?.updateProMotionLink(
-            isActive: autoPlay && enableInterpolation,
+            isActive: autoPlay && effectiveInterpolation,
             range: initialCARange
         )
 
         let token = rotateToken()
+        if remoteStream {
+            startRemoteStreamSession(
+                url: url,
+                httpHeaders: httpHeaders,
+                targetFPS: targetFPS,
+                startAt: startAt,
+                autoPlay: autoPlay,
+                enableInterpolation: effectiveInterpolation,
+                token: token
+            )
+            return
+        }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2213,6 +2448,20 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         clearBufferedFrames()
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
 
+        if isRemoteStream {
+            lastRemoteSamplePTS = -1
+            if let worker = remoteFlowWorker {
+                Task {
+                    await worker.reset()
+                }
+            }
+            isLoadingPipeline = false
+            pipelineStatusText = ""
+            isPipelineReadyToPlay = true
+            startActiveClockIfNeeded()
+            return
+        }
+
         let token = rotateToken()
         let interpEnabled = self.isInterpolationEnabled
         let targetFPS = self.requestedTargetFPS
@@ -2342,8 +2591,25 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         lastDisplayTickHostTime = 0
         displayContainer?.updateProMotionLink(isActive: false, range: .default)
         updatePlaybackActivity(isActive: false)
+        remoteStatusObserver?.invalidate()
+        remoteStatusObserver = nil
+        remoteVideoOutput = nil
+        if let worker = remoteFlowWorker {
+            remoteFlowWorker = nil
+            Task {
+                await worker.reset()
+            }
+        }
+        lastRemoteSamplePTS = -1
+        currentHTTPHeaders = [:]
+        isRemoteStream = false
+        displayTitle = ""
+        activeStreamLabel = ""
+        lastRawPresentedBuffer = nil
+        lastRawPresentedPTS = 0
         metalEnhancerStorage?.reset()
         isComparingOriginalQuality = false
+        qualityCompareMode = .off
         activeQualityPipelineLabel = "关闭"
         averageQualityEnhanceMs = 0
         UIApplication.shared.isIdleTimerDisabled = false
@@ -3494,6 +3760,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             displayContainer?.pulseProMotionCommit()
         }
 
+        if isRemoteStream {
+            handleRemoteDisplayTick(on: layer)
+            return
+        }
+
         let now: Double
         if usesSyntheticClock {
             now = syntheticClock.currentTime()
@@ -3563,22 +3834,97 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func presentFrame(_ buffer: CVPixelBuffer, ptsSeconds: Double, on layer: AVSampleBufferDisplayLayer) {
+    private func handleRemoteDisplayTick(on layer: AVSampleBufferDisplayLayer) {
+        guard !isPaused, let output = remoteVideoOutput, let player = audioPlayer else { return }
+        let hostTime = CACurrentMediaTime()
+        let itemTime = output.itemTime(forHostTime: hostTime)
+        var pulledBuffer: CVPixelBuffer?
+        var samplePTS = player.currentTime().seconds
+        if itemTime.isValid && output.hasNewPixelBuffer(forItemTime: itemTime) {
+            var displayItemTime = CMTime.invalid
+            if let pb = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayItemTime) {
+                pulledBuffer = pb
+                let resolved = displayItemTime.isValid ? displayItemTime.seconds : itemTime.seconds
+                if resolved.isFinite {
+                    samplePTS = resolved
+                }
+                if videoWidth == 0 || videoHeight == 0 {
+                    videoWidth = CVPixelBufferGetWidth(pb)
+                    videoHeight = CVPixelBufferGetHeight(pb)
+                }
+                inspectDecodedBufferColorOnceIfNeeded(pb, token: sessionToken)
+            }
+        }
+
+        guard samplePTS.isFinite else { return }
+
+        if !isInterpolationEnabled || remoteFlowWorker == nil {
+            if let pb = pulledBuffer {
+                presentFrame(pb, ptsSeconds: samplePTS, on: layer)
+            }
+            return
+        }
+
+        if let pb = pulledBuffer, samplePTS > lastRemoteSamplePTS + 0.002, let worker = remoteFlowWorker {
+            lastRemoteSamplePTS = samplePTS
+            let box = SendablePixelBuffer(buffer: pb)
+            Task {
+                await worker.submitFrame(pts: samplePTS, box: box)
+            }
+        }
+
+        let pacerNow = max(0, samplePTS - 0.055)
+        bufferLock.lock()
+        let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
+            from: &frameQueue,
+            now: pacerNow,
+            isInterpolationEnabled: true
+        )
+        bufferLock.unlock()
+
+        if paceResult.droppedCount > 0 {
+            droppedFrames += Int64(paceResult.droppedCount)
+        }
+        if let buffer = paceResult.frame {
+            presentFrame(buffer, ptsSeconds: hostTime, on: layer)
+        } else if let pb = pulledBuffer, interpolatedFrameCount == 0 {
+            presentFrame(pb, ptsSeconds: hostTime, on: layer)
+        }
+    }
+
+    @MainActor
+    private func presentFrame(_ buffer: CVPixelBuffer, ptsSeconds: Double, on layer: AVSampleBufferDisplayLayer, isRefresh: Bool = false) {
+        lastRawPresentedBuffer = buffer
+        lastRawPresentedPTS = ptsSeconds
+
         let displayBuffer: CVPixelBuffer
+        let activeCompareMode: VideoEnhancementCompareMode
+        if isComparingOriginalQuality || qualityCompareMode == .original {
+            activeCompareMode = .original
+        } else {
+            activeCompareMode = qualityCompareMode
+        }
+
         if videoEnhancementPreset != .off {
             let enhancer = metalEnhancer
+            let liveOutputFPS = isInterpolationEnabled
+                ? max(actualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 48.0)
+                : max(sourceFPS, 24.0)
             displayBuffer = enhancer.process(
                 buffer,
                 preset: videoEnhancementPreset,
                 strength: videoEnhancementStrength,
                 isHDRContent: isHDRContent,
                 isDolbyVision: isDolbyVisionContent,
-                bypassForComparison: isComparingOriginalQuality
+                bypassForComparison: activeCompareMode == .original,
+                compareMode: activeCompareMode,
+                outputFPS: liveOutputFPS,
+                thermalState: ProcessInfo.processInfo.thermalState
             )
             if activeQualityPipelineLabel != enhancer.activePipelineLabel {
                 activeQualityPipelineLabel = enhancer.activePipelineLabel
             }
-            if presentedFrameCount % 15 == 0 {
+            if isRefresh || presentedFrameCount % 15 == 0 {
                 averageQualityEnhanceMs = enhancer.averageProcessMs
             }
         } else {
@@ -3601,6 +3947,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         if renderer.isReadyForMoreMediaData {
             renderer.enqueue(sampleBuffer)
+            guard !isRefresh else { return }
             presentedFrameCount += 1
             if isLoadingPipeline {
                 isLoadingPipeline = false
@@ -3860,6 +4207,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             ? targetFPS.effectiveTargetFPS(sourceFPS: safeSrc)
             : safeSrc
         syncDisplayLinkState()
+
+        if isRemoteStream {
+            clearBufferedFrames()
+            if let worker = remoteFlowWorker {
+                let srcRate = safeSrc
+                Task {
+                    await worker.reconfigure(targetFPS: targetFPS, sourceFPS: srcRate)
+                }
+            }
+            appendLog("[remote][switch] 云端流在线切换目标档位: \(targetFPS.shortBadge)")
+            return
+        }
 
 #if !targetEnvironment(simulator)
         if isInterpolationEnabled,
