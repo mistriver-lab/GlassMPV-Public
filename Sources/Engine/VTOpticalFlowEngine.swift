@@ -9,7 +9,7 @@ import VideoToolbox
 
 final class SampleBufferDisplayContainerView: UIView {
     let displayLayer = AVSampleBufferDisplayLayer()
-    private let proMotionPulseLayer = CALayer()
+    let proMotionPulseLayer = CALayer()
     @MainActor private var proMotionToggle: Bool = false
     @MainActor private var updateLink: UIUpdateLink?
     @MainActor private var desiredProMotionActive: Bool = false
@@ -26,10 +26,11 @@ final class SampleBufferDisplayContainerView: UIView {
         displayLayer.preventsDisplaySleepDuringVideoPlayback = true
         layer.addSublayer(displayLayer)
 
-        // 1×1 透明微扰层与 UIUpdateLink 联动：HUD 隐藏时仍向 CoreAnimation 渲染服务宣告持续 120Hz 帧率需求
-        proMotionPulseLayer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
-        proMotionPulseLayer.backgroundColor = UIColor.black.cgColor
-        proMotionPulseLayer.opacity = 0.01
+        // 2×2 活跃视口内微扰层：每 VSync 仅提交一次微幅位姿+透明度变化，避免被 OLED 圆角裁切或同帧双向翻转抵消
+        proMotionPulseLayer.frame = CGRect(x: 64, y: 12, width: 2, height: 2)
+        proMotionPulseLayer.backgroundColor = UIColor.white.cgColor
+        proMotionPulseLayer.opacity = 0
+        proMotionPulseLayer.zPosition = 10
         layer.addSublayer(proMotionPulseLayer)
 
         layoutDisplayLayer()
@@ -45,9 +46,13 @@ final class SampleBufferDisplayContainerView: UIView {
         }
     }
 
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        layoutDisplayLayer()
+    }
+
     @MainActor
     private func handleUpdateLinkTick() {
-        pulseProMotionCommit()
         onProMotionTick?()
     }
 
@@ -55,6 +60,12 @@ final class SampleBufferDisplayContainerView: UIView {
     func updateProMotionLink(isActive: Bool, range: CAFrameRateRange) {
         desiredProMotionActive = isActive
         desiredProMotionRange = range
+        if !isActive {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            proMotionPulseLayer.opacity = 0
+            CATransaction.commit()
+        }
         guard window?.windowScene != nil else {
             updateLink?.isEnabled = false
             return
@@ -78,9 +89,13 @@ final class SampleBufferDisplayContainerView: UIView {
     @MainActor
     func pulseProMotionCommit() {
         proMotionToggle.toggle()
+        let safeX = max(64.0, bounds.midX)
+        let safeY = max(12.0, safeAreaInsets.top + 4.0)
+        let jitterX = proMotionToggle ? 0.5 : 0.0
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        proMotionPulseLayer.opacity = proMotionToggle ? 0.02 : 0.01
+        proMotionPulseLayer.frame = CGRect(x: safeX + jitterX, y: safeY, width: 2, height: 2)
+        proMotionPulseLayer.opacity = proMotionToggle ? 0.012 : 0.005
         CATransaction.commit()
     }
 
@@ -150,6 +165,12 @@ final class SampleBufferDisplayContainerView: UIView {
         displayLayer.bounds = CGRect(origin: .zero, size: layerSize)
         displayLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         displayLayer.setAffineTransform(Self.normalizedRotationTransform(from: videoTransform))
+
+        let safeX = max(64.0, bounds.midX)
+        let safeY = max(12.0, safeAreaInsets.top + 4.0)
+        let jitterX = proMotionToggle ? 0.5 : 0.0
+        proMotionPulseLayer.frame = CGRect(x: safeX + jitterX, y: safeY, width: 2, height: 2)
+        proMotionPulseLayer.zPosition = 10
     }
 }
 
@@ -228,6 +249,201 @@ struct OpticalFlowPTSReorderBuffer<Frame> {
         let all = entries
         entries.removeAll(keepingCapacity: false)
         return all
+    }
+}
+
+/// 跨平台送显帧步进调度器：开启光流时每 VSync 至多弹出 1 帧并保留 55ms 容错窗口，防止轻微抖动整批丢帧坍缩至 24fps
+enum OpticalFlowFramePacer {
+    static func dequeueNextFrame<Frame>(
+        from queue: inout [(pts: Double, buffer: Frame)],
+        now: Double,
+        isInterpolationEnabled: Bool,
+        maxLateGraceSeconds: Double = 0.055,
+        earlySnapSeconds: Double = 0.004
+    ) -> (frame: Frame?, presentedPTS: Double?, droppedCount: Int) {
+        guard !queue.isEmpty else {
+            return (nil, nil, 0)
+        }
+        if !isInterpolationEnabled {
+            var dropped = 0
+            var frameToPresent: Frame?
+            var presentedPTS: Double?
+            while let head = queue.first, head.pts <= now + earlySnapSeconds {
+                if frameToPresent != nil {
+                    dropped += 1
+                }
+                frameToPresent = head.buffer
+                presentedPTS = head.pts
+                queue.removeFirst()
+            }
+            return (frameToPresent, presentedPTS, dropped)
+        }
+
+        var dropped = 0
+        let staleCutoff = now - maxLateGraceSeconds
+        while queue.count > 1, queue[0].pts < staleCutoff {
+            queue.removeFirst()
+            dropped += 1
+        }
+
+        if let head = queue.first, head.pts <= now + earlySnapSeconds {
+            queue.removeFirst()
+            return (head.buffer, head.pts, dropped)
+        }
+        return (nil, nil, dropped)
+    }
+}
+
+struct OpticalFlowSendableFrame: @unchecked Sendable {
+    let pts: CMTime
+    let buffer: CVPixelBuffer
+}
+
+/// 有界异步解码管道：将硬件解码 (VDEC) 与 ANE 光流推理彻底并行流水线化
+final class OpticalFlowDecodedFramePipe: @unchecked Sendable {
+    enum ReceiveResult: @unchecked Sendable {
+        case frame(OpticalFlowSendableFrame)
+        case finished(Error?)
+    }
+
+    let capacity: Int
+    private let lock = NSLock()
+    private var queue: [OpticalFlowSendableFrame] = []
+    private var isClosed: Bool = false
+    private var terminalError: Error?
+    private var waitingProducer: CheckedContinuation<Bool, Never>?
+    private var waitingConsumer: CheckedContinuation<ReceiveResult, Never>?
+
+    init(capacity: Int = 8) {
+        self.capacity = max(1, capacity)
+    }
+
+    func send(_ frame: OpticalFlowSendableFrame) async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                enum Action {
+                    case resumeNow(Bool)
+                    case resumeConsumer(CheckedContinuation<ReceiveResult, Never>, OpticalFlowSendableFrame)
+                    case wait
+                }
+                let action: Action
+                lock.lock()
+                if isClosed || Task.isCancelled {
+                    action = .resumeNow(false)
+                } else if let consumer = waitingConsumer {
+                    waitingConsumer = nil
+                    action = .resumeConsumer(consumer, frame)
+                } else {
+                    queue.append(frame)
+                    if queue.count <= capacity {
+                        action = .resumeNow(true)
+                    } else {
+                        waitingProducer = continuation
+                        action = .wait
+                    }
+                }
+                lock.unlock()
+
+                switch action {
+                case .resumeNow(let ok):
+                    continuation.resume(returning: ok)
+                case .resumeConsumer(let consumer, let item):
+                    consumer.resume(returning: .frame(item))
+                    continuation.resume(returning: true)
+                case .wait:
+                    break
+                }
+            }
+        } onCancel: {
+            discardAllAndClose()
+        }
+    }
+
+    func receive() async -> ReceiveResult {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                enum Action {
+                    case resumeFrame(OpticalFlowSendableFrame, CheckedContinuation<Bool, Never>?, Bool)
+                    case resumeFinished(Error?)
+                    case wait
+                }
+                let action: Action
+                lock.lock()
+                if Task.isCancelled {
+                    action = .resumeFinished(nil)
+                } else if !queue.isEmpty {
+                    let next = queue.removeFirst()
+                    var producerToResume: CheckedContinuation<Bool, Never>?
+                    var producerResult = false
+                    if let producer = waitingProducer {
+                        if !isClosed && queue.count <= capacity {
+                            waitingProducer = nil
+                            producerToResume = producer
+                            producerResult = true
+                        } else if isClosed && queue.isEmpty {
+                            waitingProducer = nil
+                            producerToResume = producer
+                            producerResult = false
+                        }
+                    }
+                    action = .resumeFrame(next, producerToResume, producerResult)
+                } else if isClosed {
+                    action = .resumeFinished(terminalError)
+                } else {
+                    waitingConsumer = continuation
+                    action = .wait
+                }
+                lock.unlock()
+
+                switch action {
+                case .resumeFrame(let item, let producer, let ok):
+                    producer?.resume(returning: ok)
+                    continuation.resume(returning: .frame(item))
+                case .resumeFinished(let err):
+                    continuation.resume(returning: .finished(err))
+                case .wait:
+                    break
+                }
+            }
+        } onCancel: {
+            discardAllAndClose()
+        }
+    }
+
+    func finishProducer(error: Error? = nil) {
+        lock.lock()
+        isClosed = true
+        if terminalError == nil {
+            terminalError = error
+        }
+        let producer = waitingProducer
+        waitingProducer = nil
+        var consumer: CheckedContinuation<ReceiveResult, Never>?
+        var errForConsumer: Error?
+        if queue.isEmpty {
+            consumer = waitingConsumer
+            waitingConsumer = nil
+            errForConsumer = terminalError
+        }
+        lock.unlock()
+
+        producer?.resume(returning: false)
+        consumer?.resume(returning: .finished(errForConsumer))
+    }
+
+    func discardAllAndClose() {
+        lock.lock()
+        isClosed = true
+        queue.removeAll(keepingCapacity: false)
+        let producer = waitingProducer
+        waitingProducer = nil
+        let consumer = waitingConsumer
+        waitingConsumer = nil
+        let err = terminalError
+        lock.unlock()
+
+        producer?.resume(returning: false)
+        consumer?.resume(returning: .finished(err))
     }
 }
 
@@ -911,6 +1127,23 @@ enum OpticalFlowResolutionPlanner: Sendable {
         return (60, 60, 60)
     }
 
+    static func recommendedDecodeDimensions(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        forOpticalFlow: Bool
+    ) -> (width: Int, height: Int)? {
+        guard forOpticalFlow, sourceWidth >= 2, sourceHeight >= 2 else { return nil }
+        if max(sourceWidth, sourceHeight) <= 1920 && min(sourceWidth, sourceHeight) <= 1080 {
+            return nil
+        }
+        return fitProportionally(
+            width: sourceWidth,
+            height: sourceHeight,
+            maxLongSide: 1920,
+            maxShortSide: 1080
+        )
+    }
+
     static func thermalMaxTargetTier(for state: ProcessInfo.ThermalState) -> OpticalFlowTargetFPS? {
         switch state {
         case .nominal, .fair:
@@ -1327,12 +1560,19 @@ private final class VTDecompressionSessionHolder: @unchecked Sendable {
     private(set) var session: VTDecompressionSession?
     let formatDescription: CMVideoFormatDescription
     let strategy: String
+    let isHardwareScaled: Bool
     let collector = VTDecodedFrameCollector()
 
-    init(session: VTDecompressionSession, formatDescription: CMVideoFormatDescription, strategy: String) {
+    init(
+        session: VTDecompressionSession,
+        formatDescription: CMVideoFormatDescription,
+        strategy: String,
+        isHardwareScaled: Bool = false
+    ) {
         self.session = session
         self.formatDescription = formatDescription
         self.strategy = strategy
+        self.isHardwareScaled = isHardwareScaled
     }
 
     func decode(sampleBuffer: CMSampleBuffer) -> (decodeStatus: OSStatus, drained: (frames: [(pts: CMTime, buffer: CVPixelBuffer)], lastStatus: OSStatus)) {
@@ -1497,6 +1737,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var presentedTimestamps: [CFTimeInterval] = []
     private var lastFPSPublishTimestamp: CFTimeInterval = 0
     @MainActor private var lastDisplayTickHostTime: CFTimeInterval = 0
+    @MainActor private var playbackActivityToken: NSObjectProtocol?
 
     @MainActor
     func attach(to container: SampleBufferDisplayContainerView) {
@@ -2058,9 +2299,25 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         isPaused = true
         lastDisplayTickHostTime = 0
         displayContainer?.updateProMotionLink(isActive: false, range: .default)
+        updatePlaybackActivity(isActive: false)
         UIApplication.shared.isIdleTimerDisabled = false
         if hadActiveSession {
             appendLog("[ane] 光流核已停止")
+        }
+    }
+
+    @MainActor
+    private func updatePlaybackActivity(isActive: Bool) {
+        if isActive {
+            if playbackActivityToken == nil {
+                playbackActivityToken = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiated, .latencyCritical, .idleDisplaySleepDisabled],
+                    reason: "GlassMPV Real-Time ANE Optical Flow"
+                )
+            }
+        } else if let token = playbackActivityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            playbackActivityToken = nil
         }
     }
 
@@ -2079,7 +2336,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func syncDisplayLinkState() {
+        let shouldBoostPlayback = (!isPaused && currentURL != nil && isInterpolationEnabled)
         UIApplication.shared.isIdleTimerDisabled = (!isPaused && currentURL != nil)
+        updatePlaybackActivity(isActive: shouldBoostPlayback)
         let targetRate: Double
         if !isInterpolationEnabled {
             targetRate = sourceFPS > 1.0 ? sourceFPS : 24.0
@@ -2106,7 +2365,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             displayLink.preferredFrameRateRange = caRange
         }
         displayContainer?.updateProMotionLink(
-            isActive: (!isPaused && currentURL != nil && isInterpolationEnabled),
+            isActive: shouldBoostPlayback,
             range: caRange
         )
     }
@@ -2410,9 +2669,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         videoTrack: AVAssetTrack,
         startSeconds: Double,
         preferredPixelFormat: OSType,
-        prefer10Bit: Bool
+        prefer10Bit: Bool,
+        targetDimensions: (width: Int, height: Int)? = nil
     ) throws -> (reader: AVAssetReader, output: AVAssetReaderTrackOutput, tierLabel: String, pixelFormat: OSType) {
-        let tiers = Self.buildReaderSettingsTiers(preferredFormat: preferredPixelFormat, prefer10Bit: prefer10Bit)
+        let tiers = Self.buildReaderSettingsTiers(
+            preferredFormat: preferredPixelFormat,
+            prefer10Bit: prefer10Bit,
+            targetDimensions: targetDimensions
+        )
         var failures: [String] = []
         for tier in tiers {
             let reader = try AVAssetReader(asset: asset)
@@ -2483,7 +2747,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         rawDesc: CMVideoFormatDescription,
         fallbackSampleData: Data?,
         preferredPixelFormat: OSType,
-        prefer10Bit: Bool
+        prefer10Bit: Bool,
+        targetDimensions: (width: Int, height: Int)? = nil
     ) -> VTDecompressionSessionHolder? {
         let candidates = HEVCFormatNormalizer.makeNormalizedFormatDescriptionCandidates(
             from: rawDesc,
@@ -2493,43 +2758,58 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             prefer10Bit: prefer10Bit,
             preferredPixelFormat: preferredPixelFormat
         )
+        let dimensionOptions: [(dims: (width: Int, height: Int)?, scaled: Bool)]
+        if let targetDimensions, targetDimensions.width >= 2, targetDimensions.height >= 2 {
+            dimensionOptions = [(targetDimensions, true), (nil, false)]
+        } else {
+            dimensionOptions = [(nil, false)]
+        }
 
         var failures: [String] = []
         for candidate in candidates {
-            for fmt in pixelFormats {
-                let attrs: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: fmt),
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                    kCVPixelBufferMetalCompatibilityKey as String: true
-                ]
-                var session: VTDecompressionSession?
-                let status = VTDecompressionSessionCreate(
-                    allocator: kCFAllocatorDefault,
-                    formatDescription: candidate.description,
-                    decoderSpecification: nil,
-                    imageBufferAttributes: attrs as CFDictionary,
-                    outputCallback: nil,
-                    decompressionSessionOut: &session
-                )
-                if status == noErr, let session {
-                    _ = VTSessionSetProperty(
-                        session,
-                        key: kVTDecompressionPropertyKey_RealTime,
-                        value: kCFBooleanTrue
-                    )
-                    _ = VTSessionSetProperty(
-                        session,
-                        key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-                        value: kCFBooleanTrue
-                    )
-                    logAsync("[ane] VTDecompressionSession 硬解兜底已启动 (strategy=\(candidate.strategy), pixFmt=\(Self.fourCCString(fmt)))")
-                    return VTDecompressionSessionHolder(
-                        session: session,
+            for dimOption in dimensionOptions {
+                for fmt in pixelFormats {
+                    var attrs: [String: Any] = [
+                        kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: fmt),
+                        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                        kCVPixelBufferMetalCompatibilityKey as String: true
+                    ]
+                    if let dims = dimOption.dims {
+                        attrs[kCVPixelBufferWidthKey as String] = NSNumber(value: dims.width)
+                        attrs[kCVPixelBufferHeightKey as String] = NSNumber(value: dims.height)
+                    }
+                    var session: VTDecompressionSession?
+                    let status = VTDecompressionSessionCreate(
+                        allocator: kCFAllocatorDefault,
                         formatDescription: candidate.description,
-                        strategy: candidate.strategy
+                        decoderSpecification: nil,
+                        imageBufferAttributes: attrs as CFDictionary,
+                        outputCallback: nil,
+                        decompressionSessionOut: &session
                     )
+                    if status == noErr, let session {
+                        _ = VTSessionSetProperty(
+                            session,
+                            key: kVTDecompressionPropertyKey_RealTime,
+                            value: kCFBooleanTrue
+                        )
+                        _ = VTSessionSetProperty(
+                            session,
+                            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                            value: kCFBooleanTrue
+                        )
+                        let scaleTag = dimOption.dims.map { ", hwScale=\($0.width)x\($0.height)" } ?? ""
+                        logAsync("[ane] VTDecompressionSession 硬解兜底已启动 (strategy=\(candidate.strategy), pixFmt=\(Self.fourCCString(fmt))\(scaleTag))")
+                        return VTDecompressionSessionHolder(
+                            session: session,
+                            formatDescription: candidate.description,
+                            strategy: candidate.strategy,
+                            isHardwareScaled: dimOption.scaled
+                        )
+                    }
+                    let scaleTag = dimOption.dims.map { ":\($0.width)x\($0.height)" } ?? ""
+                    failures.append("\(candidate.strategy)/\(Self.fourCCString(fmt))\(scaleTag)=\(status)")
                 }
-                failures.append("\(candidate.strategy)/\(Self.fourCCString(fmt))=\(status)")
             }
         }
         logAsync("[ane][error] VTDecompressionSession 硬解兜底全部创建失败: \(failures.joined(separator: ", "))")
@@ -2550,7 +2830,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 #if !targetEnvironment(simulator)
         let safeW = max(width, 2)
         let safeH = max(height, 2)
-        Task.detached(priority: .userInitiated) { [weak self] in
+        Task.detached(priority: .high) { [weak self] in
             guard let self else { return }
             await self.runOpticalFlowTask(
                 url: url,
@@ -2650,6 +2930,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         var interpolationExhausted: Bool = false
         var didRetryWithNormalizationOnCurrentCandidate: Bool = false
         var awaitingClockCatchUpAfterSwitch: Bool = false
+        var expectedDecodeDimensions: (width: Int, height: Int)? = nil
+        var isCatchingUpToClock: Bool = false
+        var lastPairReadyHostTime: CFTimeInterval = 0
         var lastObservedThermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
         init(
@@ -2725,19 +3008,6 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         token: UUID
     ) async {
         do {
-            let asset = AVURLAsset(url: url)
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            guard let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else {
-                Task { @MainActor [weak self] in
-                    self?.isLoadingPipeline = false
-                    self?.pipelineStatusText = ""
-                    self?.errorMessage = "未找到视频轨道，请检查视频格式。"
-                }
-                return
-            }
-            let trackFormatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
-            let fallbackTrackDesc = trackFormatDescriptions.first
-
             let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 1.0) ? sourceFPS : 24.0
             let initialThermal = ProcessInfo.processInfo.thermalState
             var startingTier = targetFPS
@@ -2801,9 +3071,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             }
 
+            let targetDecodeDims = OpticalFlowResolutionPlanner.recommendedDecodeDimensions(
+                sourceWidth: width,
+                sourceHeight: height,
+                forOpticalFlow: true
+            )
             let resolvedPixFmtString = Self.fourCCString(activated.pixelFormat)
             let initialForceNorm = (width != activated.candidate.width || height != activated.candidate.height)
-            logAsync("[ane] 光流会话启动: 源 \(width)×\(height) -> 后端 \(activated.candidate.displayLabel), target=\(resolvedTier.shortBadge), pixFmt=\(resolvedPixFmtString), forceNorm=\(initialForceNorm), prefer10Bit=\(prefer10Bit)")
+            let decodeHint = targetDecodeDims.map { "\($0.width)×\($0.height)" } ?? "源尺寸"
+            logAsync("[ane] 光流会话启动: 源 \(width)×\(height) (解码目标 \(decodeHint)) -> 后端 \(activated.candidate.displayLabel), target=\(resolvedTier.shortBadge), pixFmt=\(resolvedPixFmtString), forceNorm=\(initialForceNorm), prefer10Bit=\(prefer10Bit)")
 
             Task { @MainActor [weak self] in
                 guard let self, self.isTokenValid(token) else { return }
@@ -2841,194 +3117,279 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 destPool: activated.destPool,
                 transferSession: activated.transferSession
             )
+            state.expectedDecodeDimensions = targetDecodeDims
             defer { state.cleanup() }
 
-            var primaryError: Error?
-            var openedReader: (reader: AVAssetReader, output: AVAssetReaderTrackOutput, tierLabel: String, pixelFormat: OSType)?
+            let decodePipe = OpticalFlowDecodedFramePipe(capacity: 8)
+            let initialStatePixelFormat = state.pixelFormat
             let forcedPassthrough = isPassthroughForced(for: url)
-            if forcedPassthrough {
-                logAsync("[ane] 命中片源透传缓存，跳过常规 AVAssetReader 直走压缩透传硬解")
-            } else {
-                do {
-                    openedReader = try openAssetReaderWithFallback(
-                        asset: asset,
-                        videoTrack: videoTrack,
-                        startSeconds: startSeconds,
-                        preferredPixelFormat: state.pixelFormat,
-                        prefer10Bit: prefer10Bit
-                    )
-                } catch {
-                    primaryError = error
-                    markPassthroughRequired(for: url)
+
+            let producerTask = Task.detached(priority: .high) { [weak self] in
+                guard let self else {
+                    decodePipe.finishProducer(error: nil)
+                    return
                 }
-            }
-
-            var activeReader: AVAssetReader?
-            var decodedAnyPrimaryFrame = false
-
-            if let openedReader {
-                let reader = openedReader.reader
-                let trackOutput = openedReader.output
-                activeReader = reader
-                state.forceNormalizeSource = state.forceNormalizeSource || (openedReader.pixelFormat != state.pixelFormat)
-
-                while reader.status == .reading {
-                    if !isTokenValid(token) {
-                        reader.cancelReading()
-                        return
-                    }
-
-                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
-                        if !isTokenValid(token) {
-                            reader.cancelReading()
-                            return
-                        }
-                        try? await Task.sleep(for: .milliseconds(8))
-                    }
-
-                    guard let sample = trackOutput.copyNextSampleBuffer(),
-                          let currentBuffer = CMSampleBufferGetImageBuffer(sample) else {
-                        break
-                    }
-                    decodedAnyPrimaryFrame = true
-                    let currentPTS = CMSampleBufferGetPresentationTimeStamp(sample)
-                    try await processDecodedFrame(
-                        SendablePixelBuffer(buffer: currentBuffer),
-                        currentPTS: currentPTS,
-                        state: state,
-                        token: token
-                    )
-                }
-
-                if !decodedAnyPrimaryFrame && reader.status == .failed && isTokenValid(token) {
-                    primaryError = reader.error ?? primaryError
-                    markPassthroughRequired(for: url)
-                }
-            }
-
-            let shouldUsePassthroughFallback = forcedPassthrough
-                || (openedReader == nil)
-                || (!decodedAnyPrimaryFrame && activeReader?.status == .failed && isTokenValid(token))
-
-            if shouldUsePassthroughFallback {
-                if !forcedPassthrough {
-                    let reasonText = Self.formatDetailedError(primaryError)
-                    logAsync("[ane][warn] 常规 AVAssetReader 全档位失败，切换压缩透传 + VTDecompressionSession 硬解兜底: \(reasonText)")
-                }
-
-                let passthrough = try openCompressedPassthroughReader(
-                    asset: asset,
-                    videoTrack: videoTrack,
-                    startSeconds: startSeconds
-                )
-                let passthroughReader = passthrough.reader
-                let passthroughOutput = passthrough.output
-                activeReader = passthroughReader
-
+                var activeReader: AVAssetReader?
                 var holder: VTDecompressionSessionHolder?
-                defer { holder?.invalidate() }
-                var reorderBuffer = OpticalFlowPTSReorderBuffer<CVPixelBuffer>(maxDepth: 6)
-                var decodedSuccessFrames = 0
-                var loggedDecodeFailure = false
-
-                while passthroughReader.status == .reading {
-                    if !isTokenValid(token) {
-                        passthroughReader.cancelReading()
+                defer {
+                    holder?.invalidate()
+                    activeReader?.cancelReading()
+                }
+                do {
+                    let asset = AVURLAsset(url: url)
+                    let tracks = try await asset.loadTracks(withMediaType: .video)
+                    guard let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else {
+                        decodePipe.finishProducer(error: NSError(domain: "GlassMPV.OpticalFlow", code: -102, userInfo: [
+                            NSLocalizedDescriptionKey: "未找到视频轨道，请检查视频格式。"
+                        ]))
                         return
                     }
+                    let trackFormatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
+                    let fallbackTrackDesc = trackFormatDescriptions.first
 
-                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
-                        if !isTokenValid(token) {
-                            passthroughReader.cancelReading()
-                            return
+                    var primaryError: Error?
+                    var openedReader: (reader: AVAssetReader, output: AVAssetReaderTrackOutput, tierLabel: String, pixelFormat: OSType)?
+                    if forcedPassthrough {
+                        self.logAsync("[ane] 命中片源透传缓存，跳过常规 AVAssetReader 直走压缩透传硬解")
+                    } else {
+                        do {
+                            openedReader = try self.openAssetReaderWithFallback(
+                                asset: asset,
+                                videoTrack: videoTrack,
+                                startSeconds: startSeconds,
+                                preferredPixelFormat: initialStatePixelFormat,
+                                prefer10Bit: prefer10Bit,
+                                targetDimensions: targetDecodeDims
+                            )
+                        } catch {
+                            primaryError = error
+                            self.markPassthroughRequired(for: url)
                         }
-                        try? await Task.sleep(for: .milliseconds(8))
                     }
 
-                    guard let sample = passthroughOutput.copyNextSampleBuffer() else {
-                        break
-                    }
-                    guard CMSampleBufferGetDataBuffer(sample) != nil else {
-                        continue
-                    }
+                    var decodedAnyPrimaryFrame = false
+                    if let openedReader {
+                        let reader = openedReader.reader
+                        let trackOutput = openedReader.output
+                        activeReader = reader
 
-                    if holder == nil {
-                        guard let rawDesc = CMSampleBufferGetFormatDescription(sample) ?? fallbackTrackDesc else {
-                            passthroughReader.cancelReading()
-                            throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -202, userInfo: [
-                                NSLocalizedDescriptionKey: "压缩透传流缺少视频格式描述，无法建立硬解兜底"
-                            ])
+                        while reader.status == .reading {
+                            if !self.isTokenValid(token) || Task.isCancelled {
+                                reader.cancelReading()
+                                decodePipe.discardAllAndClose()
+                                return
+                            }
+                            guard let sample = trackOutput.copyNextSampleBuffer(),
+                                  let currentBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                                break
+                            }
+                            decodedAnyPrimaryFrame = true
+                            let currentPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                            let sent = await decodePipe.send(
+                                OpticalFlowSendableFrame(pts: currentPTS, buffer: currentBuffer)
+                            )
+                            if !sent {
+                                reader.cancelReading()
+                                return
+                            }
                         }
-                        let leadingData = HEVCFormatNormalizer.copyLeadingData(from: sample)
-                        guard let created = createDecompressionSessionWithFallback(
-                            rawDesc: rawDesc,
-                            fallbackSampleData: leadingData,
-                            preferredPixelFormat: state.pixelFormat,
-                            prefer10Bit: prefer10Bit
-                        ) else {
-                            passthroughReader.cancelReading()
-                            throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -203, userInfo: [
-                                NSLocalizedDescriptionKey: "VTDecompressionSession 硬解兜底全部候选均失败 (\(HEVCFormatNormalizer.describeFormat(rawDesc)))"
-                            ])
+
+                        if !decodedAnyPrimaryFrame && reader.status == .failed && self.isTokenValid(token) {
+                            primaryError = reader.error ?? primaryError
+                            self.markPassthroughRequired(for: url)
                         }
-                        holder = created
                     }
 
-                    guard let activeHolder = holder else { continue }
-                    let decodeResult = activeHolder.decode(sampleBuffer: sample)
-                    if (decodeResult.decodeStatus != noErr || decodeResult.drained.lastStatus != noErr),
-                       !loggedDecodeFailure,
-                       decodedSuccessFrames == 0 {
-                        loggedDecodeFailure = true
-                        logAsync("[ane][warn] VTDecompressionSession 解码异常状态 decode=\(decodeResult.decodeStatus), callback=\(decodeResult.drained.lastStatus), strategy=\(activeHolder.strategy)")
-                    }
+                    let shouldUsePassthroughFallback = forcedPassthrough
+                        || (openedReader == nil)
+                        || (!decodedAnyPrimaryFrame && activeReader?.status == .failed && self.isTokenValid(token))
 
-                    for frame in decodeResult.drained.frames {
-                        guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
-                        decodedSuccessFrames += 1
-                        reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
-                        while let ready = reorderBuffer.popNextIfReady() {
-                            if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
+                    if shouldUsePassthroughFallback {
+                        if !forcedPassthrough {
+                            let reasonText = Self.formatDetailedError(primaryError)
+                            self.logAsync("[ane][warn] 常规 AVAssetReader 全档位失败，切换压缩透传 + VTDecompressionSession 硬解兜底: \(reasonText)")
+                        }
+
+                        let passthrough = try self.openCompressedPassthroughReader(
+                            asset: asset,
+                            videoTrack: videoTrack,
+                            startSeconds: startSeconds
+                        )
+                        let passthroughReader = passthrough.reader
+                        let passthroughOutput = passthrough.output
+                        activeReader = passthroughReader
+
+                        var reorderBuffer = OpticalFlowPTSReorderBuffer<CVPixelBuffer>(maxDepth: 6)
+                        var decodedSuccessFrames = 0
+                        var loggedDecodeFailure = false
+
+                        while passthroughReader.status == .reading {
+                            if !self.isTokenValid(token) || Task.isCancelled {
+                                passthroughReader.cancelReading()
+                                decodePipe.discardAllAndClose()
+                                return
+                            }
+                            guard let sample = passthroughOutput.copyNextSampleBuffer() else {
+                                break
+                            }
+                            guard CMSampleBufferGetDataBuffer(sample) != nil else {
                                 continue
                             }
-                            try await processDecodedFrame(
-                                SendablePixelBuffer(buffer: ready.frame),
-                                currentPTS: CMTime(seconds: ready.pts, preferredTimescale: 600),
-                                state: state,
-                                token: token
-                            )
-                        }
-                    }
-                }
 
-                if passthroughReader.status != .failed && isTokenValid(token) {
-                    if let activeHolder = holder {
-                        let tail = activeHolder.waitForAsyncFrames()
-                        for frame in tail.frames {
-                            guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
-                            decodedSuccessFrames += 1
-                            reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
+                            if holder == nil {
+                                guard let rawDesc = CMSampleBufferGetFormatDescription(sample) ?? fallbackTrackDesc else {
+                                    passthroughReader.cancelReading()
+                                    throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -202, userInfo: [
+                                        NSLocalizedDescriptionKey: "压缩透传流缺少视频格式描述，无法建立硬解兜底"
+                                    ])
+                                }
+                                let leadingData = HEVCFormatNormalizer.copyLeadingData(from: sample)
+                                guard let created = self.createDecompressionSessionWithFallback(
+                                    rawDesc: rawDesc,
+                                    fallbackSampleData: leadingData,
+                                    preferredPixelFormat: initialStatePixelFormat,
+                                    prefer10Bit: prefer10Bit,
+                                    targetDimensions: targetDecodeDims
+                                ) else {
+                                    passthroughReader.cancelReading()
+                                    throw NSError(domain: "GlassMPV.OpticalFlow.Decompress", code: -203, userInfo: [
+                                        NSLocalizedDescriptionKey: "VTDecompressionSession 硬解兜底全部候选均失败 (\(HEVCFormatNormalizer.describeFormat(rawDesc)))"
+                                    ])
+                                }
+                                holder = created
+                            }
+
+                            guard let activeHolder = holder else { continue }
+                            var decodeResult = activeHolder.decode(sampleBuffer: sample)
+                            if decodedSuccessFrames == 0 && decodeResult.decodeStatus != noErr && activeHolder.isHardwareScaled {
+                                self.logAsync("[ane][warn] 硬件缩放硬解(\(activeHolder.strategy))首帧返回 \(decodeResult.decodeStatus)，自动回退源分辨率硬解")
+                                let retryDesc = CMSampleBufferGetFormatDescription(sample) ?? activeHolder.formatDescription
+                                let retryLeading = HEVCFormatNormalizer.copyLeadingData(from: sample)
+                                activeHolder.invalidate()
+                                holder = self.createDecompressionSessionWithFallback(
+                                    rawDesc: retryDesc,
+                                    fallbackSampleData: retryLeading,
+                                    preferredPixelFormat: initialStatePixelFormat,
+                                    prefer10Bit: prefer10Bit,
+                                    targetDimensions: nil
+                                )
+                                if let retryHolder = holder {
+                                    decodeResult = retryHolder.decode(sampleBuffer: sample)
+                                }
+                            }
+                            if (decodeResult.decodeStatus != noErr || decodeResult.drained.lastStatus != noErr),
+                               !loggedDecodeFailure,
+                               decodedSuccessFrames == 0 {
+                                loggedDecodeFailure = true
+                                self.logAsync("[ane][warn] VTDecompressionSession 解码异常状态 decode=\(decodeResult.decodeStatus), callback=\(decodeResult.drained.lastStatus), strategy=\(holder?.strategy ?? activeHolder.strategy)")
+                            }
+
+                            for frame in decodeResult.drained.frames {
+                                guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
+                                decodedSuccessFrames += 1
+                                reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
+                                while let ready = reorderBuffer.popNextIfReady() {
+                                    if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
+                                        continue
+                                    }
+                                    let sent = await decodePipe.send(
+                                        OpticalFlowSendableFrame(
+                                            pts: CMTime(seconds: ready.pts, preferredTimescale: 600),
+                                            buffer: ready.frame
+                                        )
+                                    )
+                                    if !sent {
+                                        passthroughReader.cancelReading()
+                                        return
+                                    }
+                                }
+                            }
+                        }
+
+                        if passthroughReader.status != .failed && self.isTokenValid(token) && !Task.isCancelled {
+                            if let activeHolder = holder {
+                                let tail = activeHolder.waitForAsyncFrames()
+                                for frame in tail.frames {
+                                    guard frame.pts.isValid, frame.pts.seconds.isFinite else { continue }
+                                    decodedSuccessFrames += 1
+                                    reorderBuffer.insert(pts: frame.pts.seconds, frame: frame.buffer)
+                                }
+                            }
+                            for ready in reorderBuffer.drainAll() {
+                                if !self.isTokenValid(token) || Task.isCancelled {
+                                    return
+                                }
+                                if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
+                                    continue
+                                }
+                                let sent = await decodePipe.send(
+                                    OpticalFlowSendableFrame(
+                                        pts: CMTime(seconds: ready.pts, preferredTimescale: 600),
+                                        buffer: ready.frame
+                                    )
+                                )
+                                if !sent {
+                                    return
+                                }
+                            }
                         }
                     }
-                    for ready in reorderBuffer.drainAll() {
-                        if !isTokenValid(token) {
-                            return
-                        }
-                        if startSeconds > 0.1 && ready.pts < startSeconds - 0.05 {
-                            continue
-                        }
-                        try await processDecodedFrame(
-                            SendablePixelBuffer(buffer: ready.frame),
-                            currentPTS: CMTime(seconds: ready.pts, preferredTimescale: 600),
-                            state: state,
-                            token: token
-                        )
+
+                    if let activeReader, activeReader.status == .failed && self.isTokenValid(token) {
+                        let readerErr = activeReader.error ?? NSError(domain: "GlassMPV.OpticalFlow.Reader", code: -204, userInfo: [
+                            NSLocalizedDescriptionKey: "AVAssetReader 读取失败"
+                        ])
+                        decodePipe.finishProducer(error: readerErr)
+                    } else {
+                        decodePipe.finishProducer(error: nil)
                     }
+                } catch {
+                    decodePipe.finishProducer(error: error)
+                }
+            }
+            defer {
+                decodePipe.discardAllAndClose()
+                producerTask.cancel()
+            }
+
+            var producerFailureError: Error?
+            consumeLoop: while true {
+                if !isTokenValid(token) {
+                    break consumeLoop
+                }
+                var sleepAccumulatedMs: Double = 0
+                while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
+                    if !isTokenValid(token) {
+                        break consumeLoop
+                    }
+                    let sleepStart = CACurrentMediaTime()
+                    try? await Task.sleep(for: .milliseconds(8))
+                    sleepAccumulatedMs += (CACurrentMediaTime() - sleepStart) * 1000.0
+                }
+                switch await decodePipe.receive() {
+                case .frame(let decoded):
+                    let nowHost = CACurrentMediaTime()
+                    let pairActiveMs = state.lastPairReadyHostTime > 0
+                        ? max(0, (nowHost - state.lastPairReadyHostTime) * 1000.0 - sleepAccumulatedMs)
+                        : 0
+                    try await processDecodedFrame(
+                        SendablePixelBuffer(buffer: decoded.buffer),
+                        currentPTS: decoded.pts,
+                        state: state,
+                        token: token,
+                        pairActiveMs: pairActiveMs
+                    )
+                    state.lastPairReadyHostTime = CACurrentMediaTime()
+                case .finished(let err):
+                    producerFailureError = err
+                    break consumeLoop
                 }
             }
 
-            if let activeReader, activeReader.status == .failed && isTokenValid(token) {
-                let errDesc = Self.formatDetailedError(activeReader.error)
+            guard isTokenValid(token) else { return }
+
+            if let producerFailureError {
+                let errDesc = Self.formatDetailedError(producerFailureError)
                 logAsync("[ane][error] AVAssetReader 读取异常终止: \(errDesc)")
                 if !state.didStartAudioClock {
                     Task { @MainActor [weak self] in
@@ -3037,7 +3398,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         self?.errorMessage = "光流解码异常：\(errDesc)"
                     }
                 }
-            } else if isTokenValid(token) {
+            } else {
                 markReaderEOF()
 
                 if !state.didStartAudioClock && queuedCount() > 0 {
@@ -3106,15 +3467,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         var droppedInTick = 0
         var frameToPresent: CVPixelBuffer?
         var presentedPTS: Double?
+        let interpolationActive = isInterpolationEnabled
         bufferLock.lock()
-        while let head = frameQueue.first, head.pts <= now + 0.004 {
-            if frameToPresent != nil {
-                droppedInTick += 1
-            }
-            frameToPresent = head.buffer
-            presentedPTS = head.pts
-            frameQueue.removeFirst()
-        }
+        let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
+            from: &frameQueue,
+            now: now,
+            isInterpolationEnabled: interpolationActive
+        )
+        frameToPresent = paceResult.frame
+        presentedPTS = paceResult.presentedPTS
+        droppedInTick = paceResult.droppedCount
         let remainingQueueCount = frameQueue.count
         let eofReached = isReaderEOF
         let lastPTS = lastEnqueuedPTS
@@ -3896,7 +4258,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         _ frameBox: SendablePixelBuffer,
         currentPTS: CMTime,
         state: OpticalFlowPipelineState,
-        token: UUID
+        token: UUID,
+        pairActiveMs: Double = 0
     ) async throws {
         guard isTokenValid(token) else { return }
         let currentBuffer = frameBox.buffer
@@ -3915,7 +4278,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             state.didCheckActualDimensions = true
             let actualW = CVPixelBufferGetWidth(currentBuffer)
             let actualH = CVPixelBufferGetHeight(currentBuffer)
-            if actualW >= 2, actualH >= 2, (actualW != state.sourceWidth || actualH != state.sourceHeight) {
+            let actualFmt = CVPixelBufferGetPixelFormatType(currentBuffer)
+            state.forceNormalizeSource = state.forceNormalizeSource
+                || (actualW != state.activeWidth || actualH != state.activeHeight)
+                || (actualFmt != state.pixelFormat)
+            let matchesExpectedScaled = state.expectedDecodeDimensions.map {
+                $0.width == actualW && $0.height == actualH
+            } ?? false
+            if !matchesExpectedScaled,
+               actualW >= 2,
+               actualH >= 2,
+               (actualW != state.sourceWidth || actualH != state.sourceHeight) {
                 logAsync("[ane] 实际解码缓冲尺寸 \(actualW)×\(actualH) 与轨道声明 \(state.sourceWidth)×\(state.sourceHeight) 不一致，重新规划光流候选")
                 state.sourceWidth = actualW
                 state.sourceHeight = actualH
@@ -3983,7 +4356,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         )
 
         var shouldEmitOriginalFrame = true
-        let behindAudioClock = state.didStartAudioClock && (currentPTS.seconds < readLatestAudioTime() - 0.18)
+        let latestAudioNow = readLatestAudioTime()
+        if !state.isCatchingUpToClock
+            && state.didStartAudioClock
+            && !state.awaitingClockCatchUpAfterSwitch
+            && (currentPTS.seconds < latestAudioNow - 0.045) {
+            state.isCatchingUpToClock = true
+        } else if state.isCatchingUpToClock && currentPTS.seconds >= latestAudioNow + 0.085 {
+            state.isCatchingUpToClock = false
+        }
+        let behindAudioClock = state.isCatchingUpToClock
         if behindAudioClock {
             state.frcNeedsRandomSubmission = true
             state.phaseScheduler.reset()
@@ -4122,8 +4504,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         }
                         shouldEmitOriginalFrame = step.shouldEmitOriginalFrame
 
+                        let pairCycleMs = max(elapsedMs, pairActiveMs)
                         let budgetAction = state.budgetGuard.recordPair(
-                            processMs: elapsedMs,
+                            processMs: pairCycleMs,
                             sourceIntervalMs: deltaSeconds * 1000.0,
                             skippedForCatchUp: false,
                             canDowngradeResolution: canDowngradeResolution(in: state),
@@ -4564,7 +4947,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     nonisolated static func buildReaderSettingsTiers(
         preferredFormat: OSType,
-        prefer10Bit: Bool
+        prefer10Bit: Bool,
+        targetDimensions: (width: Int, height: Int)? = nil
     ) -> [(label: String, pixelFormat: OSType, settings: [String: Any])] {
         var tiers: [(label: String, pixelFormat: OSType, settings: [String: Any])] = []
         let ioMetalBase: [String: Any] = [
@@ -4572,10 +4956,19 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             kCVPixelBufferMetalCompatibilityKey as String: true
         ]
 
-        func appendTier(label: String, format: OSType, includeIOMetal: Bool) {
+        func appendTier(
+            label: String,
+            format: OSType,
+            includeIOMetal: Bool,
+            dimensions: (width: Int, height: Int)? = nil
+        ) {
             var settings: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: format
             ]
+            if let dimensions, dimensions.width >= 2, dimensions.height >= 2 {
+                settings[kCVPixelBufferWidthKey as String] = dimensions.width
+                settings[kCVPixelBufferHeightKey as String] = dimensions.height
+            }
             if includeIOMetal {
                 for (k, v) in ioMetalBase {
                     settings[k] = v
@@ -4592,6 +4985,24 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let initialFormat = OpticalFlowResolutionPlanner.isHeavyPixelFormat(preferredFormat)
             ? (prefer10Bit ? format10Bit : format8Bit)
             : preferredFormat
+
+        if let targetDimensions, targetDimensions.width >= 2, targetDimensions.height >= 2 {
+            appendTier(
+                label: "scaled-preferred(\(fourCCString(initialFormat)))",
+                format: initialFormat,
+                includeIOMetal: true,
+                dimensions: targetDimensions
+            )
+            if initialFormat != format8Bit {
+                appendTier(
+                    label: "scaled-420v",
+                    format: format8Bit,
+                    includeIOMetal: true,
+                    dimensions: targetDimensions
+                )
+            }
+        }
+
         appendTier(label: "preferred(\(fourCCString(initialFormat)))", format: initialFormat, includeIOMetal: true)
 
         if initialFormat != format8Bit {

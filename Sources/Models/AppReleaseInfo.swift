@@ -26,10 +26,10 @@ enum AppReleaseInfo {
             version: "v2026.11.27",
             date: "2026-11-27",
             highlights: [
-                "根治播放栏自动隐藏后补帧失效掉回 24fps：新增 UIUpdateLink(requiresContinuousUpdates=true) + 1×1 ProMotion 刷新率保活与 120Hz VSync 锁定（80..120Hz），熄隐控制栏后依然稳定满帧输出且消除 60Hz 拍频丢帧",
+                "彻底修复隐藏控制栏后掉帧及截图短暂恢复再降：消除 proMotionPulseLayer 同帧双次翻转抵消与圆角裁切，接入 .latencyCritical 全程提频、4K 硬件缩放 1080p 解码、VDEC/ANE 异步并行流水线及 OpticalFlowFramePacer（55ms 容错 + 逐 VSync 单帧弹出 + 迟滞追赶）",
+                "根治播放栏自动隐藏后补帧失效掉回 24fps：新增 UIUpdateLink(requiresContinuousUpdates=true) + 120Hz VSync 锁定（80..120Hz），熄隐控制栏后依然稳定满帧输出",
                 "解决 72fps 不生效并重构智能源适配帧率选择：多相 2× 以上（含 72fps/3×）统一从 720p 起跑并支持 540p/480p 阶梯降档；底栏瘦身为两行并升级为折叠式智能帧率弹窗（自动匹配 24p/30p/60p 片源与 120Hz 屏幕整分频档位：48/60/96/120 fps）",
-                "支持重开 App 后保留上一次会话完整黑匣子诊断日志（避免重启导出空白报告）",
-                "根治补帧档位切换仅 2× 生效问题：修复 OpticalFlowTargetFPS / InterpolationMode 的 Identifiable id，播放中原地热切换 VTFrameProcessor 且不中断音轨；完整支持杜比视界（Dolby Vision dvh1/dvhe）及 HDR10/HLG 峰值亮度输出"
+                "支持重开 App 后保留上一次会话完整黑匣子诊断日志（避免重启导出空白报告）；完整支持杜比视界（Dolby Vision dvh1/dvhe）及 HDR10/HLG 峰值亮度输出"
             ]
         ),
         ReleaseNoteEntry(

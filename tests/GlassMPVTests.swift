@@ -1107,4 +1107,111 @@ final class GlassMPVTests: XCTestCase {
         ] as? [String: Any]
         XCTAssertNotNil(cleanAtoms?["dvcC"])
     }
+
+    @MainActor
+    func testProMotionPulseLayerFramePacerAndDecodeScalePlanner() async throws {
+        // 1. OpticalFlowFramePacer：轻微迟到批次在 55ms 容错内逐帧送显而不被同帧丢弃，仅超 55ms 且有新帧时丢弃过期帧
+        var pacerQueue: [(pts: Double, buffer: String)] = [
+            (0.975, "f1"),
+            (0.992, "f2"),
+            (1.000, "f3")
+        ]
+        let tick1 = OpticalFlowFramePacer.dequeueNextFrame(from: &pacerQueue, now: 1.010, isInterpolationEnabled: true)
+        XCTAssertEqual(tick1.frame, "f1")
+        XCTAssertEqual(tick1.droppedCount, 0)
+        XCTAssertEqual(pacerQueue.count, 2)
+
+        let tick2 = OpticalFlowFramePacer.dequeueNextFrame(from: &pacerQueue, now: 1.018, isInterpolationEnabled: true)
+        XCTAssertEqual(tick2.frame, "f2")
+        XCTAssertEqual(tick2.droppedCount, 0)
+        XCTAssertEqual(pacerQueue.count, 1)
+
+        let tick3 = OpticalFlowFramePacer.dequeueNextFrame(from: &pacerQueue, now: 1.026, isInterpolationEnabled: true)
+        XCTAssertEqual(tick3.frame, "f3")
+        XCTAssertEqual(tick3.droppedCount, 0)
+        XCTAssertTrue(pacerQueue.isEmpty)
+
+        var staleQueue: [(pts: Double, buffer: String)] = [
+            (0.940, "stale"),
+            (0.980, "recent"),
+            (1.010, "next")
+        ]
+        let staleStep = OpticalFlowFramePacer.dequeueNextFrame(from: &staleQueue, now: 1.010, isInterpolationEnabled: true)
+        XCTAssertEqual(staleStep.frame, "recent")
+        XCTAssertEqual(staleStep.droppedCount, 1)
+        XCTAssertEqual(staleQueue.count, 1)
+
+        // 2. SampleBufferDisplayContainerView：微扰层位于安全视口内，且连续两次提交产生不同透明度与亚像素偏移
+        let container = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 852, height: 393))
+        container.layoutIfNeeded()
+        XCTAssertGreaterThanOrEqual(container.proMotionPulseLayer.frame.origin.x, 64.0)
+        XCTAssertGreaterThanOrEqual(container.proMotionPulseLayer.frame.origin.y, 12.0)
+
+        container.pulseProMotionCommit()
+        let opacityA = container.proMotionPulseLayer.opacity
+        let xA = container.proMotionPulseLayer.frame.origin.x
+        XCTAssertGreaterThan(opacityA, 0)
+
+        container.pulseProMotionCommit()
+        let opacityB = container.proMotionPulseLayer.opacity
+        let xB = container.proMotionPulseLayer.frame.origin.x
+        XCTAssertGreaterThan(opacityB, 0)
+        XCTAssertNotEqual(opacityA, opacityB)
+        XCTAssertNotEqual(xA, xB)
+
+        // 3. 4K 光流硬件缩放解码尺寸规划
+        let scaled4K = try XCTUnwrap(
+            OpticalFlowResolutionPlanner.recommendedDecodeDimensions(
+                sourceWidth: 2960,
+                sourceHeight: 2160,
+                forOpticalFlow: true
+            )
+        )
+        XCTAssertEqual(scaled4K.width, 1480)
+        XCTAssertEqual(scaled4K.height, 1080)
+        XCTAssertNil(
+            OpticalFlowResolutionPlanner.recommendedDecodeDimensions(
+                sourceWidth: 1920,
+                sourceHeight: 1080,
+                forOpticalFlow: true
+            )
+        )
+        XCTAssertNil(
+            OpticalFlowResolutionPlanner.recommendedDecodeDimensions(
+                sourceWidth: 2960,
+                sourceHeight: 2160,
+                forOpticalFlow: false
+            )
+        )
+
+        // 4. OpticalFlowDecodedFramePipe 有界 FIFO 顺序与背压排空
+        let pipe = OpticalFlowDecodedFramePipe(capacity: 2)
+        var pbOpt: CVPixelBuffer?
+        let pbStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            16,
+            16,
+            kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            &pbOpt
+        )
+        XCTAssertEqual(pbStatus, kCVReturnSuccess)
+        let pb = try XCTUnwrap(pbOpt)
+
+        let producer = Task {
+            for idx in 0..<5 {
+                let pts = CMTime(value: CMTimeValue(idx), timescale: 24)
+                let ok = await pipe.send(OpticalFlowSendableFrame(pts: pts, buffer: pb))
+                XCTAssertTrue(ok)
+            }
+            pipe.finishProducer(error: nil)
+        }
+
+        var receivedValues: [CMTimeValue] = []
+        while case .frame(let item) = await pipe.receive() {
+            receivedValues.append(item.pts.value)
+        }
+        await producer.value
+        XCTAssertEqual(receivedValues, [0, 1, 2, 3, 4])
+    }
 }

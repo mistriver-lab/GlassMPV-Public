@@ -272,6 +272,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "applyUserSwitchInPlace" in vt_engine
     assert "UIUpdateLink" in vt_engine
     assert "pulseProMotionCommit" in vt_engine
+    assert "OpticalFlowFramePacer" in vt_engine
+    assert "OpticalFlowDecodedFramePipe" in vt_engine
+    assert "recommendedDecodeDimensions" in vt_engine
+    assert ".latencyCritical" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]

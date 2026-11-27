@@ -5,6 +5,9 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
+- **彻底解决隐藏操作栏掉帧与「截图后短暂恢复又降回 24fps」问题 (`VTOpticalFlowEngine`)**：
+  - `131253` 实机日志证实：一方面 `handleUpdateLinkTick()` 与 `onDisplayTick()` 在同一 RunLoop 事务内双次调用 `pulseProMotionCommit()` 导致透明度翻转互相抵消且 `(0,0,1,1)` 被 OLED 圆角裁切；另一方面 HID/HUD 隐去后系统 CLPC 降低能效配额，使 4K 串行「硬解→缩放→ANE」单对周期从 `<35ms` 滑向 `>42ms`，队列耗尽后批量到达的帧在 `onDisplayTick` 同帧丢光中间帧导致帧率悬崖坍缩。
+  - 修复：① 将 `proMotionPulseLayer` 移至安全区活跃视口内（`x >= 64, y >= 12, 2×2`）并确保每 VSync 仅提交 1 次位姿+透明度变化；② 开启光流期间激活 `.latencyCritical` Activity、4K 解码期即启用 `1920×1080` 硬件缩放、通过 `OpticalFlowDecodedFramePipe` 将硬解 (VDEC) 与 ANE 推理拆分为高优先级并行生产者-消费者流水线；③ 新增 `OpticalFlowFramePacer`（55ms 容错 + 每 VSync 至多送显 1 帧）与 `-45ms / +85ms` 迟滞追赶，并在预算守卫计入全周期墙钟耗时。
 - **根治隐藏控制栏后掉回 24Hz 与 `72fps` 起步分辨率过高，重构智能源适配帧率菜单 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
   - 实机截图证实隐藏控制栏（`showHUD = false`）后 `AVSampleBufferDisplayLayer` 未产生 CoreAnimation 图层提交，导致 iPhone 15 Pro Max ProMotion 与 `CADisplayLink` 被系统降至 24Hz（`actualOutputFPS` 从 `57.9` 跌至 `23.4` 而 `droppedFrames` 暴涨）。现通过 `UIUpdateLink(requiresContinuousUpdates=true, wantsImmediatePresentation=true)` + `1×1` 微扰层保活，并在开启补帧且 120Hz 屏幕下锁定 `(80, 120, 120)` 刷新率区间，彻底消除 HUD 隐藏退化与 60Hz 拍频丢帧。
   - 修复 `buildCandidatePlan` 中 `maxInterpolatedFrames == 2`（`72fps`/`3×`）误从 `1080p` 起步问题（现与 `60/96/120fps` 一致从 `720p` 起跑），降档链 `120 -> 96 -> 60 -> 2×` 自动避开非 120Hz 整除的 `72fps`。
