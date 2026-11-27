@@ -89,7 +89,7 @@ private struct QuarkLoginWebContainer: UIViewRepresentable {
             if scheme == "http" || scheme == "https" || scheme == "about" || scheme == "blob" || scheme == "data" {
                 return .allow
             }
-            UIApplication.shared.open(targetURL)
+            _ = await UIApplication.shared.open(targetURL)
             return .cancel
         }
 
