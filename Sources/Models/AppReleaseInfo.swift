@@ -23,6 +23,15 @@ enum AppReleaseInfo {
 
     static let changelog: [ReleaseNoteEntry] = [
         ReleaseNoteEntry(
+            version: "v2026.11.27",
+            date: "2026-11-27",
+            highlights: [
+                "彻底移除 MPV 内核、58 个 GLSL 着色器及 MPVUI/MPVKit 依赖，升级为纯原生 VideoToolbox ANE 硬件光流播放器（保留「原帧率硬解直通」模式，显著减小包体积与内存占用）",
+                "根治 120fps 误跳 FRC(RGhA 591MB) 卡顿：全档位优先使用 LowLatency (420v, 215MB) 管线，120fps/96fps 自动从 720p 起跑并支持 720p→540p→480p 阶梯平滑降档",
+                "修复目标帧率 Picker 重复触发重载竞态，并在降档后允许用户再次点选恢复 120fps"
+            ]
+        ),
+        ReleaseNoteEntry(
             version: "v2026.11.26",
             date: "2026-11-26",
             highlights: [

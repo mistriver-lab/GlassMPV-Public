@@ -3,24 +3,25 @@ trigger: always_on
 ---
 # ipa开发 (GlassMPV) - iOS / Swift 6 工程开发守则
 
-本工作区（`ipa开发`，对应 iOS App Target `GlassMPV`、GitHub 仓库 `mistriver-lab/GlassMPV`）专用于 iOS 媒体播放器与无签 IPA 云端持续交付。
+本工作区（`ipa开发`，对应 iOS App Target `GlassMPV`、私有主线 `mistriver-lab/GlassMPV` 与公开 CI 镜像 `mistriver-lab/GlassMPV-Public`）专用于纯原生 VideoToolbox ANE 硬件光流播放器与无签 IPA 云端持续交付。
 
 ## 1. 工程身份与环境边界
-- **目标平台与编译约束**：`iOS 26.0+`、`SWIFT_VERSION: "6.0"`、依赖 `MPVKit` (`1.0.0+`)，工程文件由 `XcodeGen` (`project.yml`) 动态生成，云端构建与模拟器 `XCTest` 在 GitHub Actions (`macos-latest`) 执行。
-- **不改核心 Target 标识**：除非用户明确要求全量改包名，保持 `project.yml` Target `GlassMPV`、Bundle ID 与 GitHub 仓库关联不变。
+- **目标平台与编译约束**：`iOS 26.0+`、`SWIFT_VERSION: "6.0"`、纯系统原生框架（`AVFoundation` / `VideoToolbox` / `CoreMedia` / `CoreVideo` / `SwiftUI`，无第三方 Swift Package / MPVKit 依赖），工程文件由 `XcodeGen` (`project.yml`) 动态生成，云端构建与模拟器 `XCTest` 在 GitHub Actions (`macos-latest`) 执行。
+- **不改核心 Target 标识**：保持 `project.yml` Target `GlassMPV`、Bundle ID `com.glassmpv.player` 与 GitHub 仓库关联不变，确保无缝覆盖安装。
 
 ## 2. 硬性防复发门禁（源自 `docs/LESSONS_LEARNED.md`）
 0. **日期时间版本号铁律（CalVer）**：
    - 以后所有构建与交付必须使用东八区（`Asia/Shanghai`）日期时间作为版本号：`YYYY.MM.DD` 作为 `MARKETING_VERSION` / `CFBundleShortVersionString`（以及主仓 `VERSION` / `project.yml`），`YYYYMMDDHHMM` 作为 `CURRENT_PROJECT_VERSION` / `CFBundleVersion`，IPA 产物统一命名为 `GlassMPV-YYYY.MM.DD-YYYYMMDDHHMM-unsigned.ipa`。
-1. **Swift 6 并发与 C 回调隔离铁律**：
-   - 严禁在 `@MainActor` 方法内向 C 函数（如 `mpv_set_wakeup_callback`）传入内联闭包；C 回调必须定义为文件顶层非隔离函数（如 `mpvWakeupCallback(_:)`），否则会触发 `_dispatch_assert_queue_fail` 闪退。
-   - 严禁在 `@Sendable` 闭包内直接捕获 `super`；跨线程写入 `CAMetalLayer` 属性须经由 `@unchecked Sendable` 包装并异步派发，严禁使用 `DispatchQueue.main.sync`。
+1. **Swift 6 并发与锁隔离铁律**：
+   - 严禁在 `@Sendable` 闭包内直接捕获 `super`；严禁使用 `DispatchQueue.main.sync`。
+   - `VTOpticalFlowEngine.swift` 的 `runOpticalFlowTask..#endif` 区间内严禁直接调用 `.lock()` / `.unlock()`，同步操作须封装于独立的同步 helper。
+   - 内存采样须使用 `task_self_trap()`（严禁引用全局可变 `mach_task_self_`）及 `MemoryLayout.size(ofValue: sysinfo.machine)`。
 2. **XcodeGen 与资源打包铁律**：
    - 严禁在 `project.yml` 的 `targets.GlassMPV` 下添加 `info:` 或 `resources:` 键；保持 `GENERATE_INFOPLIST_FILE: "NO"` 与 `INFOPLIST_FILE: Sources/Info.plist`。
-   - 58 个 GLSL 着色器必须保持在 `Sources` 下的 `Resources/Shaders`（`type: folder` + `buildPhase: resources`）。
-3. **libmpv 生命周期与跨 SDK 铁律**：
-   - 必须保留 `setlocale(LC_NUMERIC, "C")`、`layer.addSublayer(metalLayer)`、`mpv_command_async`、以及 `shutdownCore` 中 `eventQueue.sync {}` 排空后再 `mpv_terminate_destroy(handle)`。
-   - 仅 `iphoneos` 真机 SDK 提供的 `VideoToolbox` 光流 API 必须使用 `#if !targetEnvironment(simulator)` 隔离，确保模拟器 `XCTest` 宿主可编可测。
+   - `Assets.xcassets` 须保留在 `Sources` 列表内以正确生成 `Assets.car`。
+3. **跨 SDK 隔离铁律**：
+   - 仅 `iphoneos` 真机 SDK 提供的 `VideoToolbox` 光流 API（`VTLowLatencyFrameInterpolationConfiguration` / `VTFrameRateConversionConfiguration` / `VTFrameProcessor`）必须使用 `#if !targetEnvironment(simulator)` 隔离，确保模拟器 `XCTest` 宿主可编可测。
+   - 原帧率硬解直通模式（`runPassthroughTask`）使用跨平台 `AVAssetReader` / `VTDecompressionSession`，在真机与模拟器均可编译运行。
 4. **本地与云端双重验证铁律**：
    - 每次提交代码前必须在本地执行 `pytest tests/test_project_integrity.py -v` 并全部通过。
-   - 每次代码改动推送 `main` 后须等待 CI `xcodebuild test`（`GlassMPVTests`）绿灯通过并校验 IPA 产物，且默认自动执行 `gh run download <run_id> -n GlassMPV-unsigned-ipa -D dist` 将最新无签 IPA 下载至本地 `dist/` 目录并向用户输出可点击本地文件路径。
+   - 每次代码改动推送后须等待 CI `xcodebuild test`（`GlassMPVTests`）绿灯通过并校验 IPA 产物，且默认自动执行 `gh run download <run_id> -n GlassMPV-unsigned-ipa -D dist` 将最新无签 IPA 下载至本地 `dist/` 目录并向用户输出可点击本地文件路径。

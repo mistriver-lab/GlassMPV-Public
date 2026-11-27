@@ -9,32 +9,6 @@ import XCTest
 @testable import GlassMPV
 
 final class GlassMPVTests: XCTestCase {
-    func testAll58GLSLShadersPresentAndResolvable() throws {
-        let shadersURL = try XCTUnwrap(
-            Bundle.main.resourceURL?.appendingPathComponent("Shaders", isDirectory: true),
-            "Bundle.main 中缺少 Shaders 目录"
-        )
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: shadersURL,
-            includingPropertiesForKeys: nil
-        )
-        let glslFiles = contents.filter { $0.pathExtension.lowercased() == "glsl" }
-        XCTAssertEqual(glslFiles.count, 58, "应打包全部 58 个 GLSL 着色器，实际为 \(glslFiles.count)")
-
-        for preset in ShaderPreset.allPresets {
-            let resolved = SingleShaderOption.resolvedShaderPaths(preset: preset, extras: [])
-            XCTAssertEqual(
-                resolved.count,
-                preset.shaderFiles.count,
-                "预设 \(preset.id) 的着色器解析数量不匹配"
-            )
-        }
-
-        let allExtraIDs = Set(SingleShaderOption.allOptions.map(\.id))
-        let resolvedExtras = SingleShaderOption.resolvedShaderPaths(preset: .off, extras: allExtraIDs)
-        XCTAssertEqual(resolvedExtras.count, SingleShaderOption.allOptions.count)
-    }
-
     func testSampleMP4Generation() async throws {
         let url = try await TestVideoGenerator.generateSampleMP4(
             durationSeconds: 3.0,
@@ -165,71 +139,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(CFBooleanGetValue(unsafeBitCast(valPtr, to: CFBoolean.self)))
     }
 
-    @MainActor
-    func testMPVUIControllerPlaybackWithWindowHost() async throws {
-        let sampleURL = try await TestVideoGenerator.generateSampleMP4(
-            durationSeconds: 3.0,
-            width: 640,
-            height: 360,
-            fps: 30
-        )
-
-        let controller = MPVPlayerController()
-        XCTAssertTrue(controller.isInitialized)
-
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-        window.windowLevel = .normal + 1
-        let hostController = UIHostingController(rootView: MPVVideoSurface(controller: controller))
-        window.rootViewController = hostController
-        window.makeKeyAndVisible()
-        hostController.view.setNeedsLayout()
-        hostController.view.layoutIfNeeded()
-
-        defer {
-            controller.shutdown()
-            window.isHidden = true
-            window.rootViewController = nil
-        }
-
-        try await Task.sleep(nanoseconds: 200_000_000)
-        controller.load(url: sampleURL)
-
-        let deadline = Date().addingTimeInterval(30.0)
-        while Date() < deadline {
-            if controller.lastErrorMessage != nil {
-                break
-            }
-            if controller.duration > 2.0,
-               controller.videoWidth == 640,
-               controller.videoHeight == 360,
-               controller.currentTime > 0.1 {
-                break
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-
-        let logsDump = controller.diagnosticLogs.joined(separator: "\n")
-        XCTAssertNil(controller.lastErrorMessage, "播放过程不应报错，日志:\n\(logsDump)")
-        XCTAssertGreaterThan(controller.duration, 2.0, "应解析出测试视频时长，日志:\n\(logsDump)")
-        XCTAssertEqual(controller.videoWidth, 640, "应解出视频宽度 640，日志:\n\(logsDump)")
-        XCTAssertEqual(controller.videoHeight, 360, "应解出视频高度 360，日志:\n\(logsDump)")
-        XCTAssertGreaterThan(controller.currentTime, 0.1, "播放时间戳应向前推进，日志:\n\(logsDump)")
-
-        controller.applyInterpolation(.mpvSmooth120Hz)
-        controller.applyShaders(preset: .off, extras: [])
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertNil(controller.lastErrorMessage, "运行时切换插帧与着色器不应报错，日志:\n\(logsDump)")
-
-        controller.shutdown()
-        XCTAssertFalse(controller.isInitialized)
-    }
-
     func testPlaybackHUDMetricsFormattingAndParsing() {
         XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("hvc1"), "HEVC")
         XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("avc1"), "H.264")
@@ -258,25 +167,23 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(ThermalLevel(state: .critical).rawValue, "严重过热")
 
         let metrics = PlaybackHUDMetrics(
-            engineBadge: "MPV",
-            interpolationBadge: "原帧率",
+            engineBadge: "ANE",
+            interpolationBadge: "光流96fps",
             codec: "hevc",
             width: 1920,
             height: 1080,
             sourceFPS: 23.976,
-            outputFPS: 24.0,
-            displayFPS: 120,
+            outputFPS: 96.0,
             bitDepth: "10-bit",
             hdrTag: "HDR10",
             isHDRActive: false,
-            decoderBadge: "硬解 VT",
+            decoderBadge: "VT+LowLatency 986×720 [×4]",
             droppedFrames: 0,
-            activeShaderCount: 2,
             thermalLevel: .nominal
         )
         XCTAssertEqual(metrics.videoStreamSummary, "HEVC · 1920×1080 · 10-bit HDR10")
-        XCTAssertEqual(metrics.fpsSummary, "23.98 → 24.0 fps · 120Hz")
-        XCTAssertEqual(metrics.pipelineSummary, "硬解 VT · 原帧率 · 2着色器")
+        XCTAssertEqual(metrics.fpsSummary, "23.98 → 96.0 fps")
+        XCTAssertEqual(metrics.pipelineSummary, "VT+LowLatency 986×720 [×4] · 光流96fps")
     }
 
     @MainActor
@@ -296,6 +203,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 3840, height: 2160))
         XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 2160, height: 3840))
         XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 4096, height: 2160))
+        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 2960, height: 2160))
         XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 1920, height: 1080))
         XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 2560, height: 1440))
         XCTAssertFalse(SuperResolutionPolicy.isAlready4K(width: 0, height: 0))
@@ -306,26 +214,24 @@ final class GlassMPVTests: XCTestCase {
 
     func testDiagnosticLogExporterBuildAndWrite() throws {
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.25",
-            engineName: "MPV 超分核",
+            version: "v2026.11.27",
+            engineName: "ANE 光流核",
             playbackState: "播放中",
             resolution: "1920×1080",
-            fpsSummary: "24.0 → 120.0 fps",
-            decoderSummary: "HEVC / 硬解 VT",
+            fpsSummary: "24.0 → 96.0 fps",
+            decoderSummary: "HEVC / VT+LowLatency",
             is4KGated: false,
-            telemetrySummary: ["MPV Target Sync: 120 Hz", "ANE Clock: 合成单调时钟"],
+            telemetrySummary: ["ANE Clock: 合成单调时钟"],
             selfCheck: "self-check-ok",
-            mpvLogs: ["[mpv] ready"],
             opticalLogs: ["[ane] idle"]
         )
-        XCTAssertTrue(report.contains("GlassMPV v2026.11.25"))
+        XCTAssertTrue(report.contains("GlassMPV v2026.11.27"))
         XCTAssertTrue(report.contains("4K Super-Res Gated: NO"))
         XCTAssertTrue(report.contains("--- Interpolation Telemetry ---"))
         XCTAssertTrue(report.contains("ANE Clock: 合成单调时钟"))
         XCTAssertTrue(report.contains("--- Self Check ---"))
         XCTAssertTrue(report.contains("self-check-ok"))
-        XCTAssertTrue(report.contains("--- MPV Logs (1) ---"))
-        XCTAssertTrue(report.contains("[mpv] ready"))
+        XCTAssertFalse(report.contains("--- MPV Logs"))
         XCTAssertTrue(report.contains("--- Optical Flow Logs (1) ---"))
         XCTAssertTrue(report.contains("[ane] idle"))
 
@@ -440,96 +346,19 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertFalse(OpticalFlowPlayerController.isValidInterpolationDelta(1.5))
     }
 
-    @MainActor
-    func testMPVProMotionKeeperAndHonestDisplaySyncFPS() {
-        let keeper = ProMotionDisplayLinkKeeper()
-        defer { keeper.stop() }
-        for i in 0..<6 {
-            _ = keeper.recordSample(timestamp: 10.0 + Double(i) / 120.0)
-        }
-        XCTAssertEqual(keeper.measuredRefreshHz, 120.0, accuracy: 0.5)
-
-        let controller = MPVPlayerController()
-        defer { controller.shutdown() }
-
-        controller.applyInterpolation(.mpvSmooth120Hz)
-        XCTAssertGreaterThanOrEqual(controller.targetDisplaySyncFPS, 60)
-        XCTAssertEqual(controller.displaySyncFPS, 0, "未从 libmpv 采集到真实显示刷新率前不应伪造 displaySyncFPS")
-        XCTAssertFalse(controller.isProMotionKeeperActive, "暂停状态不应启动 ProMotion 保活链路")
-
-        controller.refreshDiagnosticsSnapshot()
-        XCTAssertEqual(controller.displaySyncFPS, 0)
-
-        controller.applyInterpolation(.off)
-        XCTAssertEqual(controller.targetDisplaySyncFPS, 0)
-    }
-
-    func testMPVProbeSnapshotParsingAndVerdictEvaluation() throws {
-        let validLine = "[14:32:42] [mpv-probe] sync_active=yes video_sync=display-resample interp=yes tscale=mitchell vsync_ratio=5.00 disp_fps=120.0 est_disp=119.9"
-        let probe = try XCTUnwrap(MPVProbeSnapshot.parse(from: validLine))
-        XCTAssertEqual(probe.displaySyncActive, true)
-        XCTAssertEqual(probe.videoSync, "display-resample")
-        XCTAssertEqual(probe.interpolation, true)
-        XCTAssertEqual(probe.tscale, "mitchell")
-        XCTAssertEqual(try XCTUnwrap(probe.vsyncRatio), 5.0, accuracy: 1e-4)
-        XCTAssertEqual(try XCTUnwrap(probe.displayFPS), 120.0, accuracy: 1e-4)
-        XCTAssertEqual(try XCTUnwrap(probe.estimatedDisplayFPS), 119.9, accuracy: 1e-4)
-
-        let partialLine = "[mpv-probe] sync_active=${display-sync-active} video_sync=(unavailable) interp=no tscale= vsync_ratio=0 disp_fps=0 est_disp=-1"
-        let partialProbe = try XCTUnwrap(MPVProbeSnapshot.parse(from: partialLine))
-        XCTAssertNil(partialProbe.displaySyncActive)
-        XCTAssertEqual(partialProbe.videoSync, "")
-        XCTAssertEqual(partialProbe.interpolation, false)
-        XCTAssertEqual(partialProbe.tscale, "")
-        XCTAssertEqual(try XCTUnwrap(partialProbe.vsyncRatio), 0.0, accuracy: 1e-6)
-        XCTAssertNil(partialProbe.displayFPS)
-        XCTAssertNil(partialProbe.estimatedDisplayFPS)
-
-        XCTAssertNil(MPVProbeSnapshot.parse(from: "[vo/gpu-next] frame rendered"))
-
-        XCTAssertEqual(
-            InterpolationVerdict.evaluateMPV(
-                mode: .off,
-                probe: probe,
-                targetDisplaySyncFPS: 120,
-                reportedDisplayFPS: 120,
-                measuredProMotionFPS: 120
-            ),
-            .off
+    func testInterpolationVerdictANE() {
+        let offVerdict = InterpolationVerdict.evaluateANE(
+            isEnabled: false,
+            interpolatedCount: 0,
+            failedCount: 0,
+            presentedCount: 24,
+            actualOutputFPS: 24.0,
+            sourceFPS: 24.0,
+            errorMessage: nil
         )
-
-        let activeMPV = InterpolationVerdict.evaluateMPV(
-            mode: .mpvSmooth120Hz,
-            probe: probe,
-            targetDisplaySyncFPS: 120,
-            reportedDisplayFPS: 120,
-            measuredProMotionFPS: 120
-        )
-        XCTAssertTrue(activeMPV.isEffective)
-        XCTAssertEqual(activeMPV.shortLabel, "MPV平滑生效")
-
-        let inactiveProbe = try XCTUnwrap(
-            MPVProbeSnapshot.parse(from: "[mpv-probe] sync_active=no video_sync=audio interp=yes tscale=mitchell vsync_ratio=1.00 disp_fps=60.0 est_disp=60.0")
-        )
-        let inactiveMPV = InterpolationVerdict.evaluateMPV(
-            mode: .mpvSmooth120Hz,
-            probe: inactiveProbe,
-            targetDisplaySyncFPS: 120,
-            reportedDisplayFPS: 60,
-            measuredProMotionFPS: 120
-        )
-        XCTAssertFalse(inactiveMPV.isEffective)
-        XCTAssertEqual(inactiveMPV.shortLabel, "MPV平滑未生效")
-
-        let pendingMPV = InterpolationVerdict.evaluateMPV(
-            mode: .mpvSmooth120Hz,
-            probe: nil,
-            targetDisplaySyncFPS: 120,
-            reportedDisplayFPS: 0,
-            measuredProMotionFPS: 120
-        )
-        XCTAssertFalse(pendingMPV.isEffective)
-        XCTAssertEqual(pendingMPV.shortLabel, "MPV等待探针")
+        XCTAssertEqual(offVerdict, .off)
+        XCTAssertFalse(offVerdict.isEffective)
+        XCTAssertEqual(offVerdict.shortLabel, "未开启")
 
         let aneActive = InterpolationVerdict.evaluateANE(
             interpolatedCount: 12,
@@ -576,82 +405,69 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(anePending.shortLabel, "ANE预热中")
     }
 
-    func testRuntimeTelemetrySampleFormattingAndReportInclusion() throws {
-        let probe = try XCTUnwrap(
-            MPVProbeSnapshot.parse(from: "[mpv-probe] sync_active=yes video_sync=display-resample interp=yes tscale=mitchell vsync_ratio=5.00 disp_fps=120.0 est_disp=120.0")
-        )
-        let mpvSample = RuntimeTelemetrySample(
-            engine: "MPV 超分核",
+    func testRuntimeTelemetrySampleFormattingAndReportInclusion() {
+        let passSample = RuntimeTelemetrySample(
             playbackState: "播放中",
             mediaTime: 12.5,
             width: 1920,
             height: 1080,
             sourceFPS: 24.0,
             outputFPS: 24.0,
-            displayFPS: 120.0,
-            proMotionFPS: 120.0,
             droppedFrames: 0,
-            mistimedFrames: 1,
-            delayedFrames: 0,
-            mpvProbe: probe,
             aneInterpolated: 0,
             aneSkipped: 0,
             aneFailed: 0,
-            anePresented: 0,
+            anePresented: 300,
             aneAvgMs: 0,
-            verdictLabel: "MPV平滑生效",
+            aneTargetFPS: "原帧率",
+            aneBackend: "原帧率直通",
+            verdictLabel: "未开启",
             thermalLevel: .nominal
         )
         let aneSample = RuntimeTelemetrySample(
-            engine: "ANE 光流核",
             playbackState: "播放中",
             mediaTime: 14.0,
             width: 1920,
             height: 1080,
             sourceFPS: 24.0,
-            outputFPS: 48.0,
-            displayFPS: 0,
-            proMotionFPS: 0,
+            outputFPS: 95.8,
             droppedFrames: 0,
-            mistimedFrames: 0,
-            delayedFrames: 0,
-            mpvProbe: nil,
-            aneInterpolated: 48,
+            aneInterpolated: 72,
             aneSkipped: 0,
             aneFailed: 0,
             anePresented: 96,
-            aneAvgMs: 6.2,
+            aneAvgMs: 12.4,
+            aneTargetFPS: "96fps",
+            aneBackend: "LowLatency 986×720 [×4]",
             verdictLabel: "ANE光流生效",
             thermalLevel: .fair
         )
 
-        let mpvLine = mpvSample.formatLogLine(timeString: "14:32:42")
-        XCTAssertTrue(mpvLine.contains("[14:32:42] [MPV]"))
-        XCTAssertTrue(mpvLine.contains("1920x1080"))
-        XCTAssertTrue(mpvLine.contains("probe(sync=yes,interp=yes,tscale=mitchell,vsync=5.00)"))
-        XCTAssertTrue(mpvLine.contains("verdict=MPV平滑生效"))
+        let passLine = passSample.formatLogLine(timeString: "14:32:42.000")
+        XCTAssertTrue(passLine.contains("[14:32:42.000] [PASS]"))
+        XCTAssertTrue(passLine.contains("backend=原帧率直通"))
+        XCTAssertTrue(passLine.contains("verdict=未开启"))
 
-        let aneLine = aneSample.formatLogLine(timeString: "14:32:44")
-        XCTAssertTrue(aneLine.contains("[14:32:44] [ANE]"))
-        XCTAssertTrue(aneLine.contains("ane(interp=48,skip=0,fail=0,pres=96,avg=6.2ms)"))
+        let aneLine = aneSample.formatLogLine(timeString: "14:32:44.000")
+        XCTAssertTrue(aneLine.contains("[14:32:44.000] [ANE]"))
+        XCTAssertTrue(aneLine.contains("ane(interp=72,skip=0,fail=0,pres=96,avg=12.4ms)"))
         XCTAssertTrue(aneLine.contains("verdict=ANE光流生效"))
 
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.25",
-            engineName: "MPV 超分核",
+            version: "v2026.11.27",
+            engineName: "ANE 光流核",
             playbackState: "播放中",
             resolution: "1920×1080",
-            fpsSummary: "24.0 → 120.0 fps",
-            decoderSummary: "HEVC / 硬解 VT",
+            fpsSummary: "24.0 → 96.0 fps",
+            decoderSummary: "HEVC / VT+LowLatency",
             is4KGated: false,
-            telemetrySummary: ["Interpolation Verdict: MPV平滑生效"],
-            runtimeTimeline: [mpvLine, aneLine],
+            telemetrySummary: ["Interpolation Verdict: ANE光流生效"],
+            runtimeTimeline: [passLine, aneLine],
             selfCheck: "ok",
-            mpvLogs: [],
             opticalLogs: []
         )
         XCTAssertTrue(report.contains("--- Runtime Telemetry Timeline (2) ---"))
-        XCTAssertTrue(report.contains(mpvLine))
+        XCTAssertTrue(report.contains(passLine))
         XCTAssertTrue(report.contains(aneLine))
     }
 
@@ -779,15 +595,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(fittedPortrait.width, 1080)
         XCTAssertEqual(fittedPortrait.height, 1920)
 
-        let fitted1080 = OpticalFlowResolutionPlanner.fitProportionally(
-            width: 1920,
-            height: 1080,
-            maxLongSide: 1920,
-            maxShortSide: 1080
-        )
-        XCTAssertEqual(fitted1080.width, 1920)
-        XCTAssertEqual(fitted1080.height, 1080)
-
         let bounds = OpticalFlowResolutionPlanner.DimensionBounds(
             minWidth: 512,
             minHeight: 512,
@@ -799,6 +606,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(clampedLarge.height, 1080)
         XCTAssertNil(OpticalFlowResolutionPlanner.clampToBounds(width: 480, height: 360, bounds: bounds))
 
+        // 2x 模式：LowLatency 全分辨率档位严格排在 FRC 之前
         let plan4K = OpticalFlowResolutionPlanner.buildCandidatePlan(
             sourceWidth: 2960,
             sourceHeight: 2160,
@@ -807,11 +615,42 @@ final class GlassMPVTests: XCTestCase {
             frcSupported: true
         )
         XCTAssertFalse(plan4K.contains(where: { $0.spatial2x }), "4K 片源应禁止 spatial2x")
-        XCTAssertEqual(plan4K.first, OpticalFlowCandidate(backend: .lowLatency, width: 1480, height: 1080, spatial2x: false))
-        XCTAssertEqual(plan4K.dropFirst().first, OpticalFlowCandidate(backend: .frameRateConversion, width: 1480, height: 1080, spatial2x: false))
-        XCTAssertTrue(plan4K.contains(OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false)))
-        XCTAssertTrue(plan4K.contains(OpticalFlowCandidate(backend: .frameRateConversion, width: 740, height: 540, spatial2x: false)))
+        XCTAssertEqual(Array(plan4K.prefix(3)), [
+            OpticalFlowCandidate(backend: .lowLatency, width: 1480, height: 1080, spatial2x: false),
+            OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false),
+            OpticalFlowCandidate(backend: .lowLatency, width: 740, height: 540, spatial2x: false)
+        ])
+        XCTAssertEqual(plan4K.dropFirst(3).first, OpticalFlowCandidate(backend: .frameRateConversion, width: 1480, height: 1080, spatial2x: false))
         XCTAssertEqual(Set(plan4K).count, plan4K.count)
+
+        // 120fps (maxInterpolatedFrames=4)：跳过 1080p，直接 720p -> 540p -> 480p 且全为 LowLatency 在前
+        let plan120 = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 2960,
+            sourceHeight: 2160,
+            requestedSpatial2x: false,
+            lowLatencySupported: true,
+            frcSupported: true,
+            maxInterpolatedFrames: 4
+        )
+        XCTAssertEqual(Array(plan120.prefix(3)), [
+            OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false, maxInterpolatedFrames: 4),
+            OpticalFlowCandidate(backend: .lowLatency, width: 740, height: 540, spatial2x: false, maxInterpolatedFrames: 4),
+            OpticalFlowCandidate(backend: .lowLatency, width: 656, height: 480, spatial2x: false, maxInterpolatedFrames: 4)
+        ])
+
+        // 96fps (maxInterpolatedFrames=3)：跳过 1080p，直接从 720p -> 540p 起跑
+        let plan96 = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 2960,
+            sourceHeight: 2160,
+            requestedSpatial2x: false,
+            lowLatencySupported: true,
+            frcSupported: true,
+            maxInterpolatedFrames: 3
+        )
+        XCTAssertEqual(Array(plan96.prefix(2)), [
+            OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false, maxInterpolatedFrames: 3),
+            OpticalFlowCandidate(backend: .lowLatency, width: 740, height: 540, spatial2x: false, maxInterpolatedFrames: 3)
+        ])
 
         let plan1080Spatial = OpticalFlowResolutionPlanner.buildCandidatePlan(
             sourceWidth: 1920,
@@ -857,7 +696,6 @@ final class GlassMPVTests: XCTestCase {
     }
 
     func testOpticalFlowPhaseSchedulerAndMultiTierTargets() throws {
-        // 1. OpticalFlowTargetFPS 档位契约
         XCTAssertTrue(OpticalFlowTargetFPS.x2.allowsSpatial2x)
         XCTAssertFalse(OpticalFlowTargetFPS.fps60.allowsSpatial2x)
         XCTAssertFalse(OpticalFlowTargetFPS.fps72.allowsSpatial2x)
@@ -874,15 +712,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.effectiveTargetFPS(sourceFPS: 24.0), 60.0, accuracy: 0.01)
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.effectiveTargetFPS(sourceFPS: 60.0), 60.0, accuracy: 0.01)
 
-        // 24p -> 2x/96fps 属 2 的幂倍率；24p -> 60/72/120fps 非 2 的幂（优先 FRC）
-        XCTAssertTrue(OpticalFlowTargetFPS.x2.isPowerOfTwoMultiplier(sourceFPS: 23.976))
-        XCTAssertTrue(OpticalFlowTargetFPS.fps96.isPowerOfTwoMultiplier(sourceFPS: 23.976))
-        XCTAssertFalse(OpticalFlowTargetFPS.fps60.isPowerOfTwoMultiplier(sourceFPS: 24.0))
-        XCTAssertFalse(OpticalFlowTargetFPS.fps72.isPowerOfTwoMultiplier(sourceFPS: 24.0))
-        XCTAssertFalse(OpticalFlowTargetFPS.fps120.isPowerOfTwoMultiplier(sourceFPS: 24.0))
-        XCTAssertTrue(OpticalFlowTargetFPS.fps60.isPowerOfTwoMultiplier(sourceFPS: 30.0))
-        XCTAssertTrue(OpticalFlowTargetFPS.fps120.isPowerOfTwoMultiplier(sourceFPS: 30.0))
-
         XCTAssertEqual(OpticalFlowTargetFPS.x2.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 1)
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 3)
         XCTAssertEqual(OpticalFlowTargetFPS.fps72.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 2)
@@ -890,7 +719,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(OpticalFlowTargetFPS.fps120.maxInterpolatedFramesPerPair(sourceFPS: 24.0), 4)
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.maxInterpolatedFramesPerPair(sourceFPS: 60.0), 0)
 
-        // 2. 队列上限推荐与双后端排序（preferFRC + [×N] 标签）
         let limits48 = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 48.0)
         let limits120 = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 120.0)
         XCTAssertEqual(limits48.maxQueued, 24)
@@ -912,7 +740,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertFalse(frcPlan.contains(where: { $0.spatial2x }))
         XCTAssertTrue(frcPlan.first?.displayLabel.contains("[×5]") == true)
 
-        // 3. 整倍等分相位调度（24p -> 2x / 72 / 96 / 120）
         var sched72 = OpticalFlowPhaseScheduler(targetTier: .fps72, sourceFPS: 24.0)
         let step72 = sched72.planStep(previousPTS: 0.0, currentPTS: 1.0 / 24.0, maxAllowedSlots: 4)
         XCTAssertTrue(step72.shouldEmitOriginalFrame)
@@ -926,7 +753,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(Double(step120.interpolatedSlots[0].phase), 0.2, accuracy: 0.005)
         XCTAssertEqual(Double(step120.interpolatedSlots[3].phase), 0.8, accuracy: 0.005)
 
-        // 4. 非整倍时间栅格重采样（24p -> 60fps 模拟 1 秒 24 帧）
         var sched60 = OpticalFlowPhaseScheduler(targetTier: .fps60, sourceFPS: 24.0)
         var generatedPTS: [Double] = [0.0]
         for idx in 1...24 {
@@ -950,7 +776,6 @@ final class GlassMPVTests: XCTestCase {
             XCTAssertGreaterThan(generatedPTS[i], generatedPTS[i - 1], "重采样 PTS 必须严格单调递增")
         }
 
-        // 5. 算力预算守卫：连续超预算先降分辨率，冷却期保持，冷却后且无法再降分辨率时降目标帧率
         var guardState = OpticalFlowBudgetGuard(
             windowSize: 2,
             overloadRatioThreshold: 0.85,
@@ -962,14 +787,11 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(guardState.recordPair(processMs: 38, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .keep)
         XCTAssertEqual(guardState.recordPair(processMs: 39, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .keep)
         XCTAssertEqual(guardState.recordPair(processMs: 39, sourceIntervalMs: 41.6, skippedForCatchUp: false, canDowngradeResolution: true, canDowngradeTargetFPS: true), .downgradeResolution)
-        // 冷却期 2 次忽略
         XCTAssertEqual(guardState.recordPair(processMs: 50, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
         XCTAssertEqual(guardState.recordPair(processMs: 50, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
-        // 冷却结束后连续 2 次追帧跳过，且无更低分辨率 -> 降目标帧率
         XCTAssertEqual(guardState.recordPair(processMs: 0, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .keep)
         XCTAssertEqual(guardState.recordPair(processMs: 0, sourceIntervalMs: 41.6, skippedForCatchUp: true, canDowngradeResolution: false, canDowngradeTargetFPS: true), .downgradeTargetFPS)
 
-        // 6. 遥测判定与黑匣子格式含目标帧率标签
         let verdict = InterpolationVerdict.evaluateANE(
             interpolatedCount: 120,
             failedCount: 0,
@@ -982,19 +804,13 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(verdict.detailText.contains("目标 120fps→96fps"))
 
         let sample = RuntimeTelemetrySample(
-            engine: "ANE 光流核",
             playbackState: "播放中",
             mediaTime: 3.5,
             width: 1480,
             height: 1080,
             sourceFPS: 24.0,
             outputFPS: 95.8,
-            displayFPS: 0,
-            proMotionFPS: 0,
             droppedFrames: 0,
-            mistimedFrames: 0,
-            delayedFrames: 0,
-            mpvProbe: nil,
             aneInterpolated: 150,
             aneSkipped: 1,
             aneFailed: 0,
@@ -1008,14 +824,12 @@ final class GlassMPVTests: XCTestCase {
     }
 
     func testOpticalFlowExponentPixelFormatAndThermalPolicy() {
-        // 1. VTLowLatency 2^x - 1 指数映射
         XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 1), 1)
         XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 2), 2)
         XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 3), 2)
         XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 4), 3)
         XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 7), 3)
 
-        // 2. 像素格式优先级与原生硬解列表（绝不把 RGhA/RGfA 放进硬解解码输出）
         let mixed10Supported: [OSType] = [
             kCVPixelFormatType_64RGBAHalf,
             kCVPixelFormatType_128RGBAFloat,
@@ -1042,12 +856,10 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertFalse(decodeFormats.contains(kCVPixelFormatType_128RGBAFloat))
         XCTAssertEqual(decodeFormats.first, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
 
-        // 3. 重像素格式队列上限收敛（<= 30）
         let heavyLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: 120.0, isHeavyPixelFormat: true)
         XCTAssertLessThanOrEqual(heavyLimits.maxQueued, 30)
         XCTAssertLessThanOrEqual(heavyLimits.prebuffer, 10)
 
-        // 4. CADisplayLink 目标帧率区间与热限档
         let range48 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: 48.0)
         XCTAssertEqual(range48.maximum, 60)
         XCTAssertEqual(range48.preferred, 48)
@@ -1065,36 +877,50 @@ final class GlassMPVTests: XCTestCase {
     }
 
     @MainActor
-    func test4KGatingNonUpscalerShadersAndSwitchStatePreservation() {
-        XCTAssertTrue(SuperResolutionPolicy.isAlready4K(width: 2960, height: 2160))
-        XCTAssertTrue(SingleShaderOption.isUpscalerOption(id: "amd_fsr"))
-        XCTAssertFalse(SingleShaderOption.isUpscalerOption(id: "krig_bilateral"))
-        XCTAssertFalse(SingleShaderOption.isUpscalerOption(id: "adaptive_sharpen"))
-
-        let filtered = SingleShaderOption.filteredFor4K(
-            preset: ShaderPreset.allPresets[1],
-            extras: ["amd_fsr", "krig_bilateral", "adaptive_sharpen"]
-        )
-        XCTAssertEqual(filtered.preset.id, ShaderPreset.off.id)
-        XCTAssertEqual(filtered.extras, ["krig_bilateral", "adaptive_sharpen"])
-
+    func testCoordinatorIdempotencyAndPassthroughMode() async throws {
         let coordinator = PlayerCoordinator()
         defer { coordinator.closeToHome() }
 
+        XCTAssertEqual(coordinator.interpolationMode, .vtOpticalFlow)
+        XCTAssertEqual(coordinator.opticalFlowTargetFPS, .x2)
+
+        // 幂等防护：重复设置相同的 2× 不应触发冗余审计日志
+        coordinator.setOpticalFlowTargetFPS(.x2)
+        XCTAssertEqual(coordinator.uiAuditLogs.count, 0)
+
+        // 若自动降档至 96fps，即使 requested 仍为 120fps，再次点选 120fps 应放行重试
+        coordinator.setOpticalFlowTargetFPS(.fps120)
+        XCTAssertEqual(coordinator.uiAuditLogs.count, 1)
+        coordinator.opticalFlowController.effectiveTargetFPS = .fps96
+        coordinator.setOpticalFlowTargetFPS(.fps120)
+        XCTAssertEqual(coordinator.uiAuditLogs.count, 2)
+
+        // 切换至原帧率直通并验证跨平台直通播放可在模拟器完成
         coordinator.setInterpolation(.off)
-        coordinator.switchEngine(to: .opticalFlow)
-        XCTAssertEqual(coordinator.engineMode, .opticalFlow)
-        XCTAssertEqual(coordinator.interpolationMode, .vtOpticalFlow2x)
+        XCTAssertEqual(coordinator.interpolationMode, .off)
+        XCTAssertEqual(coordinator.hudMetrics.engineBadge, "PASS")
 
-        coordinator.switchEngine(to: .mpv)
-        XCTAssertEqual(coordinator.engineMode, .mpv)
-        XCTAssertEqual(coordinator.interpolationMode, .off, "从 ANE 切回 MPV 时不应覆盖原本的关闭补帧状态")
+        let sampleURL = try await TestVideoGenerator.generateSampleMP4(
+            durationSeconds: 1.5,
+            width: 320,
+            height: 180,
+            fps: 24
+        )
+        coordinator.open(url: sampleURL, isSecurityScoped: false)
 
-        coordinator.setInterpolation(.mpvSmooth120Hz)
-        coordinator.switchEngine(to: .opticalFlow)
-        coordinator.switchEngine(to: .mpv)
-        XCTAssertEqual(coordinator.interpolationMode, .mpvSmooth120Hz)
-        XCTAssertTrue(coordinator.uiAuditLogs.contains(where: { $0.contains("[ui-switch]") }))
+        let deadline = Date().addingTimeInterval(15.0)
+        while Date() < deadline {
+            if coordinator.opticalFlowController.errorMessage != nil {
+                break
+            }
+            if coordinator.opticalFlowController.presentedFrameCount > 0 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNil(coordinator.opticalFlowController.errorMessage)
+        XCTAssertGreaterThan(coordinator.opticalFlowController.presentedFrameCount, 0)
+        XCTAssertEqual(coordinator.opticalFlowController.activeBackendLabel, "原帧率直通")
     }
 
     @MainActor
@@ -1106,26 +932,20 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertTrue(deviceLine.contains("AppMem="))
 
         let sample = RuntimeTelemetrySample(
-            engine: "ANE 光流核",
             playbackState: "播放中",
             mediaTime: 8.5,
             width: 1480,
             height: 1080,
             sourceFPS: 24.0,
-            outputFPS: 72.0,
-            displayFPS: 0,
-            proMotionFPS: 0,
+            outputFPS: 96.0,
             droppedFrames: 0,
-            mistimedFrames: 0,
-            delayedFrames: 0,
-            mpvProbe: nil,
             aneInterpolated: 60,
             aneSkipped: 0,
             aneFailed: 0,
             anePresented: 90,
             aneAvgMs: 12.4,
-            aneTargetFPS: "72fps",
-            aneBackend: "FRC 986×720 [×3]",
+            aneTargetFPS: "96fps",
+            aneBackend: "LowLatency 986×720 [×4]",
             aneQueueDepth: 14,
             avDeltaMs: 18.2,
             memoryFootprintMB: memMB,
@@ -1136,25 +956,24 @@ final class GlassMPVTests: XCTestCase {
         let timeRegex = try? NSRegularExpression(pattern: #"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]"#)
         let fullRange = NSRange(location: 0, length: line.utf16.count)
         XCTAssertNotNil(timeRegex?.firstMatch(in: line, range: fullRange), "日志时间戳应精确至毫秒 HH:mm:ss.SSS: \(line)")
-        XCTAssertTrue(line.contains("backend=FRC 986×720 [×3]"))
+        XCTAssertTrue(line.contains("backend=LowLatency 986×720 [×4]"))
         XCTAssertTrue(line.contains("q=14"))
         XCTAssertTrue(line.contains("avDelta=+18.2ms"))
         XCTAssertTrue(line.contains("mem="))
 
         let report = DiagnosticLogExporter.buildReport(
-            version: "v2026.11.26",
+            version: "v2026.11.27",
             deviceInfo: deviceLine,
             engineName: "ANE 光流核",
             playbackState: "播放中",
             resolution: "2960×2160",
-            fpsSummary: "24.0 → 72.0 fps",
-            decoderSummary: "HEVC / VT+FRC",
+            fpsSummary: "24.0 → 96.0 fps",
+            decoderSummary: "HEVC / VT+LowLatency",
             is4KGated: true,
             telemetrySummary: ["Snapshot Source: last-session"],
             runtimeTimeline: [line],
-            uiAuditLogs: ["[10:50:31.123] [ui-switch] switchEngine MPV -> ANE"],
+            uiAuditLogs: ["[09:20:01.123] [ui-switch] setOpticalFlowTargetFPS 2× -> 120fps"],
             selfCheck: "ok",
-            mpvLogs: [],
             opticalLogs: []
         )
         XCTAssertTrue(report.contains("Device: \(deviceLine)"))
@@ -1162,9 +981,9 @@ final class GlassMPVTests: XCTestCase {
 
         let coordinator = PlayerCoordinator()
         coordinator.currentURL = URL(fileURLWithPath: "/tmp/sample.mp4")
-        coordinator.mpvController.videoWidth = 1920
-        coordinator.mpvController.videoHeight = 1080
-        coordinator.mpvController.videoCodec = "hevc"
+        coordinator.opticalFlowController.videoWidth = 1920
+        coordinator.opticalFlowController.videoHeight = 1080
+        coordinator.opticalFlowController.videoCodec = "hevc"
         coordinator.captureRuntimeTelemetrySample()
         coordinator.closeToHome()
         XCTAssertNil(coordinator.currentURL)

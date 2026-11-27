@@ -2,6 +2,15 @@
 
 本项目遵循日期时间版本规范（东八区 `YYYY.MM.DD` + `YYYYMMDDHHMM`）。
 
+## [v2026.11.27] - 2026-11-27
+
+### 变更与修复 (Changed & Fixed)
+- **彻底移除 MPV 引擎并升级为纯 VideoToolbox ANE 光流播放器 (`project.yml` + `OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 移除 `MPVUI` (`MPVKit`) 包依赖、`MPVPlayerCore.swift`、58 个 GLSL 着色器及所有 MPV 探针/超分 UI；新增 `InterpolationMode.off` 原生硬解直通模式（`runPassthroughTask`），跨真机/模拟器支持 `AVAssetReader` + 压缩透传 `VTDecompressionSession` 直通输出，错误横幅支持「以原帧率直通重试」。
+- **根治 `120fps` 误入 `FRC (RGhA)` 导致卡顿丢帧并修复 Picker 重复重载 (`VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 实机日志证实 `FRC (RGhA)` 占用 ~591MB 且耗时 ~70ms/帧对，而 `LowLatency (420v)` 仅占 ~215MB 且支持 4 相 `120fps`/`96fps`；调整 `buildCandidatePlan` 使所有 `LowLatency` 分辨率档位严格排在 `FRC` 之前，并为 `120fps` 提供 `720p → 540p → 480p`、`96fps`/`60fps` 提供 `720p → 540p` 候选梯队。
+  - 修复 `setOpticalFlowTargetFPS` / `setInterpolation` / `setVTSpatial2x` 在 SwiftUI `Picker` 同值重触发时的重复加载，同时支持自动降档（如 `120fps→96fps`）后再次点选 `120fps` 重新尝试。
+
 ## [v2026.11.26] - 2026-11-26
 
 ### 修复与增强 (Fixed & Enhanced)

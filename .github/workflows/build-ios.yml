@@ -23,9 +23,6 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Resolve Swift Package dependencies (MPVUI)
-        run: xcodebuild -resolvePackageDependencies -project GlassMPV.xcodeproj -scheme GlassMPV
-
       - name: Run iOS Simulator XCTest self-test
         run: |
           SIM_ID=$(python3 - <<'PY'
@@ -95,8 +92,6 @@ jobs:
           else
             rm -rf Payload/GlassMPV.app/Frameworks
           fi
-          test -d Payload/GlassMPV.app/Shaders
-          test "$(ls -1 Payload/GlassMPV.app/Shaders/*.glsl | wc -l | tr -d ' ')" -eq 58
           test -f Payload/GlassMPV.app/Assets.car
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q CADisableMinimumFrameDurationOnPhone
           plutil -p Payload/GlassMPV.app/Info.plist | grep -q UILaunchScreen

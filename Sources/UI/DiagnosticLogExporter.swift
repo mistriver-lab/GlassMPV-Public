@@ -16,7 +16,6 @@ enum DiagnosticLogExporter: Sendable {
         runtimeTimeline: [String] = [],
         uiAuditLogs: [String] = [],
         selfCheck: String,
-        mpvLogs: [String],
         opticalLogs: [String]
     ) -> String {
         var sections: [String] = [
@@ -58,15 +57,8 @@ enum DiagnosticLogExporter: Sendable {
             "--- Self Check ---",
             selfCheck.isEmpty ? "(none)" : selfCheck,
             "",
-            "--- MPV Logs (\(mpvLogs.count)) ---"
+            "--- Optical Flow Logs (\(opticalLogs.count)) ---"
         ])
-        if mpvLogs.isEmpty {
-            sections.append("(no mpv logs)")
-        } else {
-            sections.append(contentsOf: mpvLogs)
-        }
-        sections.append("")
-        sections.append("--- Optical Flow Logs (\(opticalLogs.count)) ---")
         if opticalLogs.isEmpty {
             sections.append("(no optical flow logs)")
         } else {
