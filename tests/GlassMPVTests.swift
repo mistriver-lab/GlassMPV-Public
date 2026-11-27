@@ -1795,4 +1795,86 @@ final class GlassMPVTests: XCTestCase {
             XCTAssertTrue(enhancer.activePipelineLabel.contains("直绘"))
         }
     }
+
+    func testQuarkQRLoginParsingAndURLBuilder() throws {
+        let qrURL = QuarkDriveClient.buildQRLoginURL(token: "tok_abc_123")
+        XCTAssertTrue(qrURL.absoluteString.contains("su.quark.cn/4_eMHBJ"))
+        XCTAssertTrue(qrURL.absoluteString.contains("token=tok_abc_123"))
+        XCTAssertTrue(qrURL.absoluteString.contains("client_id=532"))
+
+        let tokenJSON = Data("{\"status\":2000000,\"message\":\"ok\",\"data\":{\"members\":{\"token\":\"sta33633316wsy\"}}}".utf8)
+        XCTAssertEqual(try QuarkDriveClient.parseQRTokenJSON(tokenJSON), "sta33633316wsy")
+
+        let pendingJSON = Data("{\"status\":50004001,\"message\":\"Query result is empty\"}".utf8)
+        XCTAssertEqual(try QuarkDriveClient.parseQRPollJSON(pendingJSON), .pending)
+
+        let expiredJSON = Data("{\"status\":50004002,\"message\":\"qrcode expired\"}".utf8)
+        XCTAssertEqual(try QuarkDriveClient.parseQRPollJSON(expiredJSON), .expired)
+
+        let authJSON = Data("{\"status\":2000000,\"message\":\"ok\",\"data\":{\"members\":{\"service_ticket\":\"st_ticket_999\"}}}".utf8)
+        XCTAssertEqual(try QuarkDriveClient.parseQRPollJSON(authJSON), .authorized(serviceTicket: "st_ticket_999"))
+
+        let mergedCookie = LocalHTTPStreamProxy.mergeSetCookieHeaders(
+            ["__puus=bootstrapped_puus_val; Path=/; HttpOnly"],
+            into: "__pus=keep_pus_val; uid=101"
+        )
+        XCTAssertTrue(mergedCookie.contains("__pus=keep_pus_val"))
+        XCTAssertTrue(mergedCookie.contains("__puus=bootstrapped_puus_val"))
+    }
+
+    @MainActor
+    func testMetalDrawableSizingAndTelemetryThrottling() throws {
+        XCTAssertEqual(SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(outputFPS: 120.0, allowSpatialUpscale: false), 1600.0)
+        XCTAssertEqual(SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(outputFPS: 96.0, allowSpatialUpscale: false), 1600.0)
+        XCTAssertEqual(SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(outputFPS: 60.0, allowSpatialUpscale: false), 2560.0)
+        XCTAssertEqual(SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(outputFPS: 48.0, allowSpatialUpscale: true), 2560.0)
+        XCTAssertEqual(SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(outputFPS: 120.0, allowSpatialUpscale: true), 2560.0)
+
+        let container = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 932, height: 430))
+        container.updateMetalMaxLongSide(1600.0)
+        container.layoutIfNeeded()
+        XCTAssertLessThanOrEqual(container.metalLayer.drawableSize.width, 1601.0)
+        container.applyVideoTransform(.identity)
+
+        let enhancer = MetalVideoEnhancer()
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.drawableSize = CGSize(width: 256, height: 144)
+
+        var yuvOpt: CVPixelBuffer?
+        let st = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            72,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ] as CFDictionary,
+            &yuvOpt
+        )
+        XCTAssertEqual(st, kCVReturnSuccess)
+        let yuv = try XCTUnwrap(yuvOpt)
+
+        let status = enhancer.renderToLayerStatus(
+            yuv,
+            on: metalLayer,
+            preset: .lowResSuperRes,
+            strength: .standard,
+            aspectFill: false,
+            compareMode: .off,
+            outputFPS: 120.0,
+            thermalState: .nominal
+        )
+        if MTLCreateSystemDefaultDevice() != nil {
+            XCTAssertEqual(status, .rendered)
+        } else {
+            XCTAssertEqual(status, .unavailable)
+        }
+
+        let controller = OpticalFlowPlayerController()
+        controller.flushPublishedTelemetryIfNeeded(force: true)
+        XCTAssertEqual(controller.presentedFrameCount, 0)
+    }
 }

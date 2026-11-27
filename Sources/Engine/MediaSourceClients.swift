@@ -135,8 +135,38 @@ final class MediaSourceStore: ObservableObject {
 
 // MARK: - Quark Cloud Drive Client
 
+enum QuarkQRPollState: Equatable, Sendable {
+    case pending
+    case expired
+    case authorized(serviceTicket: String)
+}
+
+private final class QuarkCookieRefreshBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latestCookie: String
+
+    init(_ initial: String) {
+        self.latestCookie = initial
+    }
+
+    func update(_ newCookie: String) {
+        lock.lock()
+        latestCookie = newCookie
+        lock.unlock()
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        let v = latestCookie
+        lock.unlock()
+        return v
+    }
+}
+
 enum QuarkDriveClient: Sendable {
     static let baseAPIHost = "https://drive-pc.quark.cn"
+    static let qrCASHost = "https://uop.quark.cn"
+    static let qrClientID = "532"
     static let defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 
     static func requestHeaders(cookie: String) -> [String: String] {
@@ -206,9 +236,162 @@ enum QuarkDriveClient: Sendable {
         return try parseFileListJSON(data)
     }
 
-    static func verifyAccount(cookie: String, session: URLSession = .shared) async throws -> Int {
-        let items = try await listDirectory(parentFid: "0", page: 1, cookie: cookie, session: session)
-        return items.count
+    static func buildQRLoginURL(token: String) -> URL {
+        let encoded = token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? token
+        let raw = "https://su.quark.cn/4_eMHBJ?token=\(encoded)&client_id=\(qrClientID)&ssb=weblogin&uc_param_str=&uc_biz_str=S%3Acustom%7COPT%3ASAREA%400%7COPT%3AIMMERSIVE%401%7COPT%3ABACK_BTN_STYLE%400"
+        return URL(string: raw) ?? URL(string: "https://su.quark.cn/4_eMHBJ")!
+    }
+
+    static func parseQRTokenJSON(_ data: Data) throws -> String {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MediaSourceClientError.serverError("夸克二维码接口响应不是合法 JSON")
+        }
+        let status = root["status"] as? Int ?? -1
+        guard status == 2000000 else {
+            let msg = (root["message"] as? String) ?? "状态码 \(status)"
+            throw MediaSourceClientError.serverError("获取夸克登录二维码失败: \(msg)")
+        }
+        let dataDict = root["data"] as? [String: Any] ?? [:]
+        let members = dataDict["members"] as? [String: Any] ?? [:]
+        guard let token = members["token"] as? String, !token.isEmpty else {
+            throw MediaSourceClientError.serverError("夸克二维码接口未返回有效 token")
+        }
+        return token
+    }
+
+    static func parseQRPollJSON(_ data: Data) throws -> QuarkQRPollState {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MediaSourceClientError.serverError("夸克扫码状态响应不是合法 JSON")
+        }
+        let status = root["status"] as? Int ?? -1
+        if status == 2000000 {
+            let dataDict = root["data"] as? [String: Any] ?? [:]
+            let members = dataDict["members"] as? [String: Any] ?? [:]
+            if let st = members["service_ticket"] as? String, !st.isEmpty {
+                return .authorized(serviceTicket: st)
+            }
+            return .pending
+        }
+        let msg = ((root["message"] as? String) ?? "").lowercased()
+        if status == 50004002 || msg.contains("expire") || msg.contains("过期") || msg.contains("失效") {
+            return .expired
+        }
+        return .pending
+    }
+
+    static func requestQRLoginToken(session: URLSession = .shared) async throws -> (token: String, qrURL: URL) {
+        var comps = URLComponents(string: "\(qrCASHost)/cas/ajax/getTokenForQrcodeLogin")
+        comps?.queryItems = [
+            URLQueryItem(name: "client_id", value: qrClientID),
+            URLQueryItem(name: "v", value: "1.2"),
+            URLQueryItem(name: "request_id", value: UUID().uuidString)
+        ]
+        guard let url = comps?.url else {
+            throw MediaSourceClientError.invalidURL("夸克二维码接口 URL 构造失败")
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "GET"
+        req.setValue("https://pan.quark.cn/", forHTTPHeaderField: "Referer")
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await session.data(for: req)
+        try validateHTTPResponse(resp, data: data, serviceName: "夸克二维码申请")
+        let token = try parseQRTokenJSON(data)
+        return (token: token, qrURL: buildQRLoginURL(token: token))
+    }
+
+    static func pollQRLoginTicket(token: String, session: URLSession = .shared) async throws -> QuarkQRPollState {
+        var comps = URLComponents(string: "\(qrCASHost)/cas/ajax/getServiceTicketByQrcodeToken")
+        comps?.queryItems = [
+            URLQueryItem(name: "client_id", value: qrClientID),
+            URLQueryItem(name: "v", value: "1.2"),
+            URLQueryItem(name: "token", value: token),
+            URLQueryItem(name: "request_id", value: UUID().uuidString)
+        ]
+        guard let url = comps?.url else {
+            throw MediaSourceClientError.invalidURL("夸克扫码状态 URL 构造失败")
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "GET"
+        req.setValue("https://pan.quark.cn/", forHTTPHeaderField: "Referer")
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await session.data(for: req)
+        try validateHTTPResponse(resp, data: data, serviceName: "夸克扫码轮询")
+        return try parseQRPollJSON(data)
+    }
+
+    static func bootstrapSessionCookie(
+        from rawCookie: String,
+        session: URLSession = .shared
+    ) async throws -> (itemCount: Int, cookie: String) {
+        let trimmed = rawCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MediaSourceClientError.invalidCredentials("夸克网盘 Cookie 为空，请先完成登录。")
+        }
+        let box = QuarkCookieRefreshBox(trimmed)
+        let items = try await listDirectory(
+            parentFid: "0",
+            page: 1,
+            cookie: trimmed,
+            session: session,
+            onCookieRefresh: { updated in
+                box.update(updated)
+            }
+        )
+        return (itemCount: items.count, cookie: box.snapshot())
+    }
+
+    static func exchangeServiceTicketForCookie(serviceTicket: String) async throws -> String {
+        let encodedST = serviceTicket.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? serviceTicket
+        guard let url = URL(string: "https://pan.quark.cn/account/info?st=\(encodedST)&lw=scan") else {
+            throw MediaSourceClientError.invalidURL("夸克票据兑换 URL 无效")
+        }
+
+        let config = URLSessionConfiguration.ephemeral
+        let cookieStorage = HTTPCookieStorage()
+        config.httpCookieStorage = cookieStorage
+        config.httpShouldSetCookies = true
+        let isolatedSession = URLSession(configuration: config)
+        defer { isolatedSession.finishTasksAndInvalidate() }
+
+        var req = URLRequest(url: url, timeoutInterval: 20)
+        req.httpMethod = "GET"
+        req.setValue("https://pan.quark.cn/", forHTTPHeaderField: "Referer")
+        req.setValue(defaultUserAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await isolatedSession.data(for: req)
+        try validateHTTPResponse(resp, data: data, serviceName: "夸克扫码换取 Cookie")
+
+        var merged = ""
+        if let stored = cookieStorage.cookies {
+            let pairs = stored
+                .filter {
+                    let d = $0.domain.lowercased()
+                    return d.contains("quark.cn") || d.contains("uc.cn")
+                }
+                .map { "\($0.name)=\($0.value)" }
+            if !pairs.isEmpty {
+                merged = LocalHTTPStreamProxy.mergeSetCookieHeaders(pairs, into: merged)
+            }
+        }
+        if let refreshed = extractRefreshedCookie(from: resp, currentCookie: merged) {
+            merged = refreshed
+        }
+        guard !merged.isEmpty else {
+            throw MediaSourceClientError.invalidCredentials("扫码成功但未收到夸克 Cookie，请尝试网页手机号登录。")
+        }
+
+        let bootstrapped = try await bootstrapSessionCookie(from: merged, session: isolatedSession)
+        return bootstrapped.cookie
+    }
+
+    static func verifyAccount(cookie: String, session: URLSession = .shared) async throws -> (itemCount: Int, refreshedCookie: String) {
+        let result = try await bootstrapSessionCookie(from: cookie, session: session)
+        return (itemCount: result.itemCount, refreshedCookie: result.cookie)
     }
 
     static func resolvePlaybackStream(

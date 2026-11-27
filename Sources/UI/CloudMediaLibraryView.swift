@@ -1,52 +1,182 @@
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 import UIKit
 import WebKit
 
-// MARK: - Embedded Quark WebView Login & Cookie Extractor
+// MARK: - Embedded Quark QR + WebView Login & Cookie Extractor
+
+private enum QuarkQRCodeRenderer {
+    private static let ciContext = CIContext()
+
+    static func makeQRCodeImage(from text: String, size: CGFloat = 240) -> UIImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(text.utf8)
+        filter.correctionLevel = "M"
+        guard let outputImage = filter.outputImage else { return nil }
+        let scale = max(4.0, floor(size / max(1.0, outputImage.extent.width)))
+        let scaled = outputImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = ciContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let rawQR = UIImage(cgImage: cgImage)
+
+        let pad: CGFloat = 24
+        let totalSize = CGSize(width: rawQR.size.width + pad * 2, height: rawQR.size.height + pad * 2)
+        let renderer = UIGraphicsImageRenderer(size: totalSize)
+        return renderer.image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: totalSize))
+            rawQR.draw(at: CGPoint(x: pad, y: pad))
+        }
+    }
+}
+
+@MainActor
+private final class QuarkPhotoSaver: NSObject {
+    private var completion: ((Error?) -> Void)?
+
+    func save(_ image: UIImage, completion: @escaping (Error?) -> Void) {
+        self.completion = completion
+        UIImageWriteToSavedPhotosAlbum(image, self, #selector(handleSave(_:didFinishWithError:contextInfo:)), nil)
+    }
+
+    @objc private func handleSave(
+        _ image: UIImage,
+        didFinishWithError error: Error?,
+        contextInfo: UnsafeMutableRawPointer?
+    ) {
+        let cb = completion
+        completion = nil
+        cb?(error)
+    }
+}
 
 @MainActor
 private struct QuarkLoginWebContainer: UIViewRepresentable {
     let url: URL
     let reloadTrigger: Int
+    let preferDesktopMode: Bool
+    let onPageFinished: () -> Void
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var lastReloadTrigger: Int = 0
+        var lastDesktopMode: Bool = false
+        var onPageFinished: () -> Void
+
+        init(onPageFinished: @escaping () -> Void) {
+            self.onPageFinished = onPageFinished
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if navigationAction.targetFrame == nil {
+                webView.load(navigationAction.request)
+            }
+            return nil
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction
+        ) async -> WKNavigationActionPolicy {
+            guard let targetURL = navigationAction.request.url,
+                  let scheme = targetURL.scheme?.lowercased() else {
+                return .allow
+            }
+            if scheme == "http" || scheme == "https" || scheme == "about" || scheme == "blob" || scheme == "data" {
+                return .allow
+            }
+            UIApplication.shared.open(targetURL)
+            return .cancel
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            onPageFinished()
+        }
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onPageFinished: onPageFinished)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
-        config.defaultWebpagePreferences.preferredContentMode = .desktop
+        config.defaultWebpagePreferences.preferredContentMode = preferDesktopMode ? .desktop : .mobile
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
+        context.coordinator.lastDesktopMode = preferDesktopMode
+        applyUserAgent(to: webView, desktop: preferDesktopMode)
         webView.allowsBackForwardNavigationGestures = true
         webView.load(URLRequest(url: url))
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
+        context.coordinator.onPageFinished = onPageFinished
+        if context.coordinator.lastDesktopMode != preferDesktopMode {
+            context.coordinator.lastDesktopMode = preferDesktopMode
+            uiView.configuration.defaultWebpagePreferences.preferredContentMode = preferDesktopMode ? .desktop : .mobile
+            applyUserAgent(to: uiView, desktop: preferDesktopMode)
+            uiView.reload()
+            return
+        }
         if context.coordinator.lastReloadTrigger != reloadTrigger {
             context.coordinator.lastReloadTrigger = reloadTrigger
             uiView.reload()
         }
     }
+
+    private func applyUserAgent(to webView: WKWebView, desktop: Bool) {
+        if desktop {
+            webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+        } else {
+            webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+        }
+    }
+}
+
+private enum QuarkLoginTab: String, CaseIterable, Identifiable {
+    case qrScan = "夸克 App 扫码"
+    case mobileWeb = "网页/手机登录"
+    var id: Self { self }
 }
 
 struct QuarkWebLoginSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     let onExtractedCookie: (String) -> Void
 
+    @State private var selectedTab: QuarkLoginTab = .qrScan
+    @State private var qrToken: String = ""
+    @State private var qrURL: URL?
+    @State private var qrImage: UIImage?
+    @State private var qrStatusText: String = "正在申请夸克安全登录二维码..."
+    @State private var isLoadingQR: Bool = false
+    @State private var qrExpired: Bool = false
+    @State private var photoSaver: QuarkPhotoSaver?
+
     @State private var reloadTrigger = 0
+    @State private var preferDesktopMode = false
     @State private var isExtracting = false
     @State private var statusHint: String?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                Picker("登录方式", selection: $selectedTab) {
+                    ForEach(QuarkLoginTab.allCases) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
                 if let statusHint {
                     Text(statusHint)
                         .font(.caption)
@@ -57,38 +187,11 @@ struct QuarkWebLoginSheet: View {
                         .background(Color.black.opacity(0.65))
                 }
 
-                QuarkLoginWebContainer(
-                    url: URL(string: "https://pan.quark.cn/")!,
-                    reloadTrigger: reloadTrigger
-                )
-
-                VStack(spacing: 8) {
-                    Text("请在上方完成夸克网盘账号登录（支持扫码或手机验证码），看到网盘文件列表后点击下方按钮")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-
-                    Button {
-                        extractCookies()
-                    } label: {
-                        HStack(spacing: 6) {
-                            if isExtracting {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "checkmark.shield.fill")
-                            }
-                            Text(isExtracting ? "正在读取 Cookie..." : "已完成登录 · 提取夸克 Cookie")
-                                .font(.subheadline.weight(.semibold))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.cyan)
-                    .disabled(isExtracting)
+                if selectedTab == .qrScan {
+                    qrScanContent
+                } else {
+                    webLoginContent
                 }
-                .padding(14)
-                .background(.ultraThinMaterial)
             }
             .navigationTitle("登录夸克网盘")
             .navigationBarTitleDisplayMode(.inline)
@@ -97,19 +200,263 @@ struct QuarkWebLoginSheet: View {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    if selectedTab == .qrScan {
+                        Button {
+                            Task { await loadFreshQR() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                    } else {
+                        HStack(spacing: 12) {
+                            Button(preferDesktopMode ? "手机版" : "桌面版") {
+                                preferDesktopMode.toggle()
+                            }
+                            .font(.caption.weight(.semibold))
+                            Button {
+                                reloadTrigger += 1
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                    }
+                }
+            }
+            .task(id: selectedTab) {
+                guard selectedTab == .qrScan else { return }
+                await loadFreshQR()
+                await pollQRStatusLoop()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active && selectedTab == .qrScan && !qrToken.isEmpty && !qrExpired {
+                    Task { await checkQRStatusOnce() }
+                }
+            }
+        }
+    }
+
+    private var qrScanContent: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                VStack(spacing: 10) {
+                    if let qrImage {
+                        Image(uiImage: qrImage)
+                            .interpolation(.none)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 210, height: 210)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.2), lineWidth: 1)
+                            )
+                            .opacity(qrExpired ? 0.35 : 1.0)
+                    } else {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                            .frame(width: 210, height: 210)
+                            .overlay {
+                                ProgressView()
+                            }
+                    }
+
+                    Text(qrStatusText)
+                        .font(.caption)
+                        .foregroundStyle(qrExpired ? .orange : .secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top, 8)
+
+                VStack(spacing: 10) {
                     Button {
-                        reloadTrigger += 1
+                        saveQRAndOpenQuarkApp()
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Label("保存二维码并打开夸克 App", systemImage: "qrcode.viewfinder")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.cyan)
+                    .disabled(qrImage == nil || isLoadingQR || isExtracting)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            saveQRToPhotos(openQuarkAfter: false)
+                        } label: {
+                            Label("仅存相册", systemImage: "square.and.arrow.down")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(qrImage == nil || isLoadingQR)
+
+                        Button {
+                            Task { await loadFreshQR() }
+                        } label: {
+                            Label("刷新二维码", systemImage: "arrow.clockwise")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isLoadingQR)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("单台手机推荐操作步骤：", systemImage: "iphone.and.arrow.forward")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.cyan)
+                    Text("1. 点击上方蓝色按钮将二维码存入相册并自动打开「夸克 App」。\n2. 在夸克 App 点击右上角/搜索栏「扫一扫」→ 右下角「相册」，选取刚才保存的二维码并点击「确认登录」。\n3. 切回 GlassMPV，程序会自动完成 Cookie（含 __puus）兑换并保存片源。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineSpacing(3)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .padding(16)
+        }
+    }
+
+    private var webLoginContent: some View {
+        VStack(spacing: 0) {
+            QuarkLoginWebContainer(
+                url: URL(string: "https://pan.quark.cn/")!,
+                reloadTrigger: reloadTrigger,
+                preferDesktopMode: preferDesktopMode,
+                onPageFinished: {
+                    autoCheckWebViewCookiesIfReady()
+                }
+            )
+
+            VStack(spacing: 8) {
+                Text("支持手机号验证码或跳转授权，看到「全部文件」列表后会自动提取 Cookie（或点击下方按钮手动提取）")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                Button {
+                    extractCookies(silentIfMissing: false)
+                } label: {
+                    HStack(spacing: 6) {
+                        if isExtracting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "checkmark.shield.fill")
+                        }
+                        Text(isExtracting ? "正在验证并补全 Cookie..." : "已完成登录 · 提取夸克 Cookie")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+                .disabled(isExtracting)
+            }
+            .padding(14)
+            .background(.ultraThinMaterial)
+        }
+    }
+
+    @MainActor
+    private func loadFreshQR() async {
+        isLoadingQR = true
+        qrExpired = false
+        statusHint = nil
+        qrStatusText = "正在申请夸克安全登录二维码..."
+        do {
+            let result = try await QuarkDriveClient.requestQRLoginToken()
+            qrToken = result.token
+            qrURL = result.qrURL
+            qrImage = QuarkQRCodeRenderer.makeQRCodeImage(from: result.qrURL.absoluteString, size: 240)
+            qrStatusText = "二维码已就绪，请用夸克 App 扫一扫确认登录（自动等待回执中...）"
+        } catch {
+            qrStatusText = "二维码申请失败：\(error.localizedDescription)"
+        }
+        isLoadingQR = false
+    }
+
+    @MainActor
+    private func pollQRStatusLoop() async {
+        while !Task.isCancelled && selectedTab == .qrScan {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, selectedTab == .qrScan else { break }
+            if !qrToken.isEmpty && !qrExpired && !isExtracting {
+                await checkQRStatusOnce()
+            }
+        }
+    }
+
+    @MainActor
+    private func checkQRStatusOnce() async {
+        guard !qrToken.isEmpty, !qrExpired, !isExtracting else { return }
+        do {
+            let state = try await QuarkDriveClient.pollQRLoginTicket(token: qrToken)
+            switch state {
+            case .pending:
+                break
+            case .expired:
+                qrExpired = true
+                qrStatusText = "二维码已过期，请点击「刷新二维码」重新生成。"
+            case .authorized(let st):
+                isExtracting = true
+                qrStatusText = "扫码授权成功！正在兑换并校验夸克 Cookie..."
+                let cookie = try await QuarkDriveClient.exchangeServiceTicketForCookie(serviceTicket: st)
+                isExtracting = false
+                onExtractedCookie(cookie)
+                dismiss()
+            }
+        } catch {
+            isExtracting = false
+            statusHint = "扫码兑换遇到问题：\(error.localizedDescription)"
+        }
+    }
+
+    private func saveQRAndOpenQuarkApp() {
+        saveQRToPhotos(openQuarkAfter: true)
+    }
+
+    private func saveQRToPhotos(openQuarkAfter: Bool) {
+        guard let qrImage else { return }
+        statusHint = nil
+        let saver = QuarkPhotoSaver()
+        photoSaver = saver
+        saver.save(qrImage) { error in
+            Task { @MainActor in
+                if let error {
+                    statusHint = "保存相册失败（请确认已允许写入照片权限）：\(error.localizedDescription)"
+                } else {
+                    statusHint = openQuarkAfter
+                        ? "二维码已保存至相册！正在打开夸克 App，请在「扫一扫 → 相册」中扫码确认后返回。"
+                        : "二维码已保存到系统相册，可用夸克 App 扫一扫相册选图。"
+                }
+                if openQuarkAfter, let schemeURL = URL(string: "quark://") {
+                    UIApplication.shared.open(schemeURL) { opened in
+                        if !opened {
+                            Task { @MainActor in
+                                statusHint = "二维码已存相册，但未检测到夸克 App，请手动打开夸克或在上方切到「网页/手机登录」。"
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    private func extractCookies() {
-        isExtracting = true
-        statusHint = nil
+    private func autoCheckWebViewCookiesIfReady() {
+        guard selectedTab == .mobileWeb, !isExtracting else { return }
+        extractCookies(silentIfMissing: true)
+    }
+
+    private func extractCookies(silentIfMissing: Bool) {
+        if !silentIfMissing {
+            isExtracting = true
+            statusHint = nil
+        }
         Task { @MainActor in
             let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
             let quarkCookies = cookies.filter {
@@ -120,21 +467,32 @@ struct QuarkWebLoginSheet: View {
                 .map { "\($0.name)=\($0.value)" }
                 .joined(separator: "; ")
 
-            isExtracting = false
             let hasSessionCookie = quarkCookies.contains { cookie in
                 let name = cookie.name.lowercased()
                 return (name == "__puus" || name == "__pus") && !cookie.value.isEmpty
             }
-            if quarkCookies.isEmpty || cookieString.isEmpty {
-                statusHint = "尚未检测到夸克登录态 Cookie，请先完成账号登录后再试。"
+            guard !quarkCookies.isEmpty, !cookieString.isEmpty, hasSessionCookie else {
+                if !silentIfMissing {
+                    isExtracting = false
+                    statusHint = quarkCookies.isEmpty
+                        ? "尚未检测到夸克登录态 Cookie，请先完成账号登录后再试。"
+                        : "未检测到核心凭证 __puus/__pus，请确认网页已进入「全部文件」列表页后再点击提取。"
+                }
                 return
             }
-            if !hasSessionCookie {
-                statusHint = "未检测到核心凭证 __puus/__pus，请确认网页已进入「全部文件」列表页后再点击提取。"
-                return
+
+            isExtracting = true
+            do {
+                let bootstrapped = try await QuarkDriveClient.bootstrapSessionCookie(from: cookieString)
+                isExtracting = false
+                onExtractedCookie(bootstrapped.cookie)
+                dismiss()
+            } catch {
+                isExtracting = false
+                if !silentIfMissing {
+                    statusHint = "Cookie 校验失败：\(error.localizedDescription)"
+                }
             }
-            onExtractedCookie(cookieString)
-            dismiss()
         }
     }
 }
@@ -287,6 +645,7 @@ struct AddMediaSourceSheet: View {
                 QuarkWebLoginSheet { extracted in
                     quarkCookie = extracted
                     errorMessage = nil
+                    verifyAndSave()
                 }
             }
         }
@@ -301,14 +660,14 @@ struct AddMediaSourceSheet: View {
                 switch selectedKind {
                 case .quark:
                     let cookie = quarkCookie.trimmingCharacters(in: .whitespacesAndNewlines)
-                    _ = try await QuarkDriveClient.verifyAccount(cookie: cookie)
+                    let verified = try await QuarkDriveClient.verifyAccount(cookie: cookie)
                     let finalName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
                     let account = MediaSourceAccount(
                         kind: .quark,
                         name: finalName.isEmpty ? "夸克网盘" : finalName,
                         baseURL: QuarkDriveClient.baseAPIHost
                     )
-                    store.addOrUpdate(account: account, secret: cookie)
+                    store.addOrUpdate(account: account, secret: verified.refreshedCookie)
                     dismiss()
 
                 case .emby:

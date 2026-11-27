@@ -319,6 +319,7 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func captureRuntimeTelemetrySample() {
+        opticalFlowController.flushPublishedTelemetryIfNeeded(force: true)
         let verdict = currentInterpolationVerdict
         let metrics = hudMetrics
         let memMB = DeviceDiagnosticsSampler.currentMemoryFootprintMB()
@@ -1353,6 +1354,40 @@ struct LiquidGlassPlayerView: View {
 
     // MARK: - Clean Floating Player HUD
 
+    private var usesLightweightHighFPSHUD: Bool {
+        optical.isInterpolationEnabled
+            && !optical.isPaused
+            && (optical.effectiveTargetFPS == .fps96 || optical.effectiveTargetFPS == .fps120)
+    }
+
+    @ViewBuilder
+    private func hudPanelSurface<Content: View>(
+        cornerRadius: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        if usesLightweightHighFPSHUD {
+            content()
+                .background(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.black.opacity(0.72))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                                .strokeBorder(
+                                    LinearGradient(
+                                        colors: [Color.white.opacity(0.24), Color.white.opacity(0.08)],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    ),
+                                    lineWidth: 0.8
+                                )
+                        )
+                )
+        } else {
+            content()
+                .glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+        }
+    }
+
     private var playerHUDOverlay: some View {
         VStack {
             HStack(spacing: 8) {
@@ -1367,321 +1402,355 @@ struct LiquidGlassPlayerView: View {
 
             VStack(spacing: 8) {
                 if showQualityPicker {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label(
-                                optical.isDolbyVisionContent
-                                    ? "杜比视界原片自动保留原厂映射"
-                                    : "Metal + MetalFX 实时画质增强（\(optical.activeQualityPipelineLabel)）",
-                                systemImage: "wand.and.stars"
-                            )
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(optical.isDolbyVisionContent ? .yellow : .secondary)
-                            Spacer()
-                            Button {
-                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                    showQualityPicker = false
+                    hudPanelSurface(cornerRadius: 20) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label(
+                                    optical.isDolbyVisionContent
+                                        ? "杜比视界原片自动保留原厂映射"
+                                        : "Metal + MetalFX 实时画质增强（\(optical.activeQualityPipelineLabel)）",
+                                    systemImage: "wand.and.stars"
+                                )
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(optical.isDolbyVisionContent ? .yellow : .secondary)
+                                Spacer()
+                                Button {
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                        showQualityPicker = false
+                                    }
+                                    scheduleHUDAutoHide()
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
-                                scheduleHUDAutoHide()
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
-                        }
 
-                        QualityPresetStrip(
-                            coordinator: coordinator,
-                            optical: optical,
-                            compact: true
-                        )
+                            QualityPresetStrip(
+                                coordinator: coordinator,
+                                optical: optical,
+                                compact: true
+                            )
+                        }
+                        .padding(12)
                     }
-                    .padding(12)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
                     .frame(maxWidth: 680)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 if showFPSPicker {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label(
-                                coordinator.isLowPowerModeEnabled
-                                    ? "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · 低电量 60Hz 上限"
-                                    : "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · ProMotion 智能锁频",
-                                systemImage: coordinator.isLowPowerModeEnabled ? "battery.25" : "sparkles"
-                            )
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(coordinator.isLowPowerModeEnabled ? .yellow : .secondary)
-                            Spacer()
-                            Button {
-                                fpsAutoCloseTask?.cancel()
-                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                    showFPSPicker = false
+                    hudPanelSurface(cornerRadius: 20) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label(
+                                    coordinator.isLowPowerModeEnabled
+                                        ? "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · 低电量 60Hz 上限"
+                                        : "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · ProMotion 智能锁频",
+                                    systemImage: coordinator.isLowPowerModeEnabled ? "battery.25" : "sparkles"
+                                )
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(coordinator.isLowPowerModeEnabled ? .yellow : .secondary)
+                                Spacer()
+                                Button {
+                                    fpsAutoCloseTask?.cancel()
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                        showFPSPicker = false
+                                    }
+                                    scheduleHUDAutoHide()
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
-                                scheduleHUDAutoHide()
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
-                        }
 
-                        FrameRatePresetStrip(
-                            coordinator: coordinator,
-                            optical: optical,
-                            compact: true
-                        ) {
-                            scheduleFPSPickerAutoClose()
+                            FrameRatePresetStrip(
+                                coordinator: coordinator,
+                                optical: optical,
+                                compact: true
+                            ) {
+                                scheduleFPSPickerAutoClose()
+                            }
                         }
+                        .padding(12)
                     }
-                    .padding(12)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
                     .frame(maxWidth: 680)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                VStack(spacing: 10) {
-                    HStack(spacing: 10) {
-                        Text(formatTime(displayTime))
-                            .font(.caption2.monospacedDigit())
-                            .frame(width: 46, alignment: .leading)
+                hudPanelSurface(cornerRadius: 24) {
+                    VStack(spacing: 10) {
+                        HStack(spacing: 10) {
+                            Text(formatTime(displayTime))
+                                .font(.caption2.monospacedDigit())
+                                .frame(width: 46, alignment: .leading)
 
-                        Slider(
-                            value: Binding(
-                                get: { displayTime },
-                                set: { newVal in
-                                    isScrubbing = true
-                                    scrubTime = newVal
-                                    hudAutoHideTask?.cancel()
-                                }
-                            ),
-                            in: 0...max(coordinator.activeDuration, 1),
-                            onEditingChanged: { editing in
-                                if !editing {
-                                    coordinator.seek(to: scrubTime)
-                                    isScrubbing = false
-                                    scheduleHUDAutoHide()
-                                }
-                            }
-                        )
-                        .tint(.cyan)
-
-                        Text(formatTime(coordinator.activeDuration))
-                            .font(.caption2.monospacedDigit())
-                            .frame(width: 46, alignment: .trailing)
-                    }
-
-                    HStack(spacing: 8) {
-                        Button {
-                            coordinator.seekRelative(-10)
-                            scheduleHUDAutoHide()
-                        } label: {
-                            Image(systemName: "gobackward.10")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: 34, height: 34)
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Circle())
-                        .glassEffect(.regular.interactive(), in: .circle)
-
-                        Button {
-                            coordinator.togglePlayPause()
-                            scheduleHUDAutoHide()
-                        } label: {
-                            Image(systemName: coordinator.activePaused ? "play.fill" : "pause.fill")
-                                .font(.title3.weight(.semibold))
-                                .frame(width: 42, height: 42)
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Circle())
-                        .glassEffect(.regular.tint(.cyan).interactive(), in: .circle)
-
-                        Button {
-                            coordinator.seekRelative(10)
-                            scheduleHUDAutoHide()
-                        } label: {
-                            Image(systemName: "goforward.10")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: 34, height: 34)
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Circle())
-                        .glassEffect(.regular.interactive(), in: .circle)
-
-                        Spacer(minLength: 4)
-
-                        let fpsSummary = OpticalFlowTargetFPS.activeCapsuleSummary(
-                            isOff: coordinator.interpolationMode == .off,
-                            requested: coordinator.opticalFlowTargetFPS,
-                            effective: optical.effectiveTargetFPS,
-                            sourceFPS: optical.sourceFPS,
-                            spatial2x: coordinator.vtSpatial2x
-                        )
-                        Button {
-                            fpsAutoCloseTask?.cancel()
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                showQualityPicker = false
-                                showFPSPicker.toggle()
-                            }
-                            if showFPSPicker {
-                                hudAutoHideTask?.cancel()
-                            } else {
-                                scheduleHUDAutoHide()
-                            }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: coordinator.interpolationMode == .off ? "film" : "sparkles")
-                                    .font(.caption2.weight(.bold))
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(fpsSummary.title)
-                                        .font(.caption2.monospacedDigit().weight(.bold))
-                                    Text(fpsSummary.subtitle)
-                                        .font(.system(size: 8.5, weight: .medium))
-                                        .opacity(0.75)
-                                }
-                                Image(systemName: showFPSPicker ? "chevron.down" : "chevron.up")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .opacity(0.75)
-                            }
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 6)
-                            .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Capsule())
-                        .glassEffect(
-                            coordinator.interpolationMode == .vtOpticalFlow ? .regular.tint(.cyan).interactive() : .regular.interactive(),
-                            in: .capsule
-                        )
-
-                        Button {
-                            fpsAutoCloseTask?.cancel()
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                                showFPSPicker = false
-                                showQualityPicker.toggle()
-                            }
-                            if showQualityPicker {
-                                hudAutoHideTask?.cancel()
-                            } else {
-                                scheduleHUDAutoHide()
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: coordinator.videoEnhancementPreset.iconName)
-                                    .font(.caption2.weight(.bold))
-                                Text(coordinator.videoEnhancementPreset.shortBadge)
-                                    .font(.caption2.weight(.bold))
-                            }
-                            .foregroundStyle(coordinator.videoEnhancementPreset == .off ? Color.primary : Color.purple)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                            .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Capsule())
-                        .glassEffect(
-                            coordinator.videoEnhancementPreset != .off ? .regular.tint(.purple).interactive() : .regular.interactive(),
-                            in: .capsule
-                        )
-
-                        if coordinator.currentStreamVariants.count > 1 {
-                            Menu {
-                                ForEach(coordinator.currentStreamVariants) { variant in
-                                    Button {
-                                        coordinator.switchStreamVariant(variant)
+                            Slider(
+                                value: Binding(
+                                    get: { displayTime },
+                                    set: { newVal in
+                                        isScrubbing = true
+                                        scrubTime = newVal
+                                        hudAutoHideTask?.cancel()
+                                    }
+                                ),
+                                in: 0...max(coordinator.activeDuration, 1),
+                                onEditingChanged: { editing in
+                                    if !editing {
+                                        coordinator.seek(to: scrubTime)
+                                        isScrubbing = false
                                         scheduleHUDAutoHide()
-                                    } label: {
-                                        if variant.url == coordinator.currentURL {
-                                            Label(variant.label, systemImage: "checkmark")
-                                        } else {
-                                            Text(variant.label)
-                                        }
                                     }
                                 }
-                            } label: {
-                                Text(coordinator.activeMediaRequest?.sourceLabel ?? "切换画质流")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(.green)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 8)
-                            }
-                            .glassEffect(.regular.tint(.green).interactive(), in: .capsule)
+                            )
+                            .tint(.cyan)
+
+                            Text(formatTime(coordinator.activeDuration))
+                                .font(.caption2.monospacedDigit())
+                                .frame(width: 46, alignment: .trailing)
                         }
 
-                        if optical.isHDRContent {
+                        HStack(spacing: 8) {
                             Button {
-                                coordinator.setEDREnabled(!coordinator.isEDREnabled)
+                                coordinator.seekRelative(-10)
                                 scheduleHUDAutoHide()
                             } label: {
-                                Text(coordinator.isEDREnabled ? "HDR" : "SDR")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 8)
-                                    .contentShape(Capsule())
+                                Image(systemName: "gobackward.10")
+                                    .font(.callout.weight(.semibold))
+                                    .frame(width: 34, height: 34)
+                                    .background(Color.white.opacity(0.14), in: Circle())
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Circle())
+
+                            Button {
+                                coordinator.togglePlayPause()
+                                scheduleHUDAutoHide()
+                            } label: {
+                                Image(systemName: coordinator.activePaused ? "play.fill" : "pause.fill")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundStyle(.black)
+                                    .frame(width: 42, height: 42)
+                                    .background(Color.cyan, in: Circle())
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.28), lineWidth: 0.7))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Circle())
+
+                            Button {
+                                coordinator.seekRelative(10)
+                                scheduleHUDAutoHide()
+                            } label: {
+                                Image(systemName: "goforward.10")
+                                    .font(.callout.weight(.semibold))
+                                    .frame(width: 34, height: 34)
+                                    .background(Color.white.opacity(0.14), in: Circle())
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Circle())
+
+                            Spacer(minLength: 4)
+
+                            let fpsSummary = OpticalFlowTargetFPS.activeCapsuleSummary(
+                                isOff: coordinator.interpolationMode == .off,
+                                requested: coordinator.opticalFlowTargetFPS,
+                                effective: optical.effectiveTargetFPS,
+                                sourceFPS: optical.sourceFPS,
+                                spatial2x: coordinator.vtSpatial2x
+                            )
+                            let isInterpActive = (coordinator.interpolationMode == .vtOpticalFlow)
+                            Button {
+                                fpsAutoCloseTask?.cancel()
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                    showQualityPicker = false
+                                    showFPSPicker.toggle()
+                                }
+                                if showFPSPicker {
+                                    hudAutoHideTask?.cancel()
+                                } else {
+                                    scheduleHUDAutoHide()
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: coordinator.interpolationMode == .off ? "film" : "sparkles")
+                                        .font(.caption2.weight(.bold))
+                                    VStack(alignment: .leading, spacing: 0) {
+                                        Text(fpsSummary.title)
+                                            .font(.caption2.monospacedDigit().weight(.bold))
+                                        Text(fpsSummary.subtitle)
+                                            .font(.system(size: 8.5, weight: .medium))
+                                            .opacity(0.82)
+                                    }
+                                    Image(systemName: showFPSPicker ? "chevron.down" : "chevron.up")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .opacity(0.78)
+                                }
+                                .foregroundStyle(isInterpActive ? .black : .white)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule().fill(isInterpActive ? Color.cyan : Color.white.opacity(0.14))
+                                )
+                                .overlay(
+                                    Capsule().strokeBorder(
+                                        isInterpActive ? Color.cyan.opacity(0.9) : Color.white.opacity(0.16),
+                                        lineWidth: 0.7
+                                    )
+                                )
+                                .contentShape(Capsule())
                             }
                             .buttonStyle(.plain)
                             .contentShape(Capsule())
-                            .glassEffect(
-                                coordinator.isEDREnabled ? .regular.tint(.yellow).interactive() : .regular.interactive(),
-                                in: .capsule
-                            )
-                        }
 
-                        Button {
-                            coordinator.setLooping(!coordinator.isLooping)
-                            scheduleHUDAutoHide()
-                        } label: {
-                            Image(systemName: "repeat")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
-                                .frame(width: 34, height: 34)
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Circle())
-                        .glassEffect(
-                            coordinator.isLooping ? .regular.tint(.cyan).interactive() : .regular.interactive(),
-                            in: .circle
-                        )
-
-                        Menu {
-                            ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
-                                Button("\(rate, specifier: "%.2g")x") {
-                                    coordinator.setSpeed(rate)
+                            let isQualityActive = (coordinator.videoEnhancementPreset != .off)
+                            Button {
+                                fpsAutoCloseTask?.cancel()
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                    showFPSPicker = false
+                                    showQualityPicker.toggle()
+                                }
+                                if showQualityPicker {
+                                    hudAutoHideTask?.cancel()
+                                } else {
                                     scheduleHUDAutoHide()
                                 }
-                            }
-                        } label: {
-                            Text("\(coordinator.speed, specifier: "%.2g")x")
-                                .font(.caption.monospacedDigit().weight(.semibold))
-                                .padding(.horizontal, 9)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: coordinator.videoEnhancementPreset.iconName)
+                                        .font(.caption2.weight(.bold))
+                                    Text(coordinator.videoEnhancementPreset.shortBadge)
+                                        .font(.caption2.weight(.bold))
+                                }
+                                .foregroundStyle(isQualityActive ? .white : Color.primary)
+                                .padding(.horizontal, 10)
                                 .padding(.vertical, 8)
-                        }
-                        .glassEffect(.regular.interactive(), in: .capsule)
+                                .background(
+                                    Capsule().fill(isQualityActive ? Color.purple.opacity(0.92) : Color.white.opacity(0.14))
+                                )
+                                .overlay(
+                                    Capsule().strokeBorder(
+                                        isQualityActive ? Color.purple.opacity(0.9) : Color.white.opacity(0.16),
+                                        lineWidth: 0.7
+                                    )
+                                )
+                                .contentShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
 
-                        Button {
-                            hudAutoHideTask?.cancel()
-                            showEnhancementSheet = true
-                        } label: {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: 34, height: 34)
-                                .contentShape(Circle())
+                            if coordinator.currentStreamVariants.count > 1 {
+                                Menu {
+                                    ForEach(coordinator.currentStreamVariants) { variant in
+                                        Button {
+                                            coordinator.switchStreamVariant(variant)
+                                            scheduleHUDAutoHide()
+                                        } label: {
+                                            if variant.url == coordinator.currentURL {
+                                                Label(variant.label, systemImage: "checkmark")
+                                            } else {
+                                                Text(variant.label)
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Text(coordinator.activeMediaRequest?.sourceLabel ?? "切换画质流")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(.green)
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 8)
+                                        .background(Capsule().fill(Color.green.opacity(0.18)))
+                                        .overlay(Capsule().strokeBorder(Color.green.opacity(0.55), lineWidth: 0.7))
+                                }
+                            }
+
+                            if optical.isHDRContent {
+                                Button {
+                                    coordinator.setEDREnabled(!coordinator.isEDREnabled)
+                                    scheduleHUDAutoHide()
+                                } label: {
+                                    Text(coordinator.isEDREnabled ? "HDR" : "SDR")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 8)
+                                        .background(
+                                            Capsule().fill(coordinator.isEDREnabled ? Color.yellow.opacity(0.20) : Color.white.opacity(0.14))
+                                        )
+                                        .overlay(
+                                            Capsule().strokeBorder(
+                                                coordinator.isEDREnabled ? Color.yellow.opacity(0.55) : Color.white.opacity(0.16),
+                                                lineWidth: 0.7
+                                            )
+                                        )
+                                        .contentShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .contentShape(Capsule())
+                            }
+
+                            Button {
+                                coordinator.setLooping(!coordinator.isLooping)
+                                scheduleHUDAutoHide()
+                            } label: {
+                                Image(systemName: "repeat")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
+                                    .frame(width: 34, height: 34)
+                                    .background(
+                                        Circle().fill(coordinator.isLooping ? Color.cyan.opacity(0.22) : Color.white.opacity(0.14))
+                                    )
+                                    .overlay(
+                                        Circle().strokeBorder(
+                                            coordinator.isLooping ? Color.cyan.opacity(0.55) : Color.white.opacity(0.16),
+                                            lineWidth: 0.7
+                                        )
+                                    )
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Circle())
+
+                            Menu {
+                                ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+                                    Button("\(rate, specifier: "%.2g")x") {
+                                        coordinator.setSpeed(rate)
+                                        scheduleHUDAutoHide()
+                                    }
+                                }
+                            } label: {
+                                Text("\(coordinator.speed, specifier: "%.2g")x")
+                                    .font(.caption.monospacedDigit().weight(.semibold))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 8)
+                                    .background(Capsule().fill(Color.white.opacity(0.14)))
+                                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7))
+                            }
+
+                            Button {
+                                hudAutoHideTask?.cancel()
+                                showEnhancementSheet = true
+                            } label: {
+                                Image(systemName: "slider.horizontal.3")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 34, height: 34)
+                                    .background(Color.indigo.opacity(0.32), in: Circle())
+                                    .overlay(Circle().strokeBorder(Color.indigo.opacity(0.60), lineWidth: 0.7))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Circle())
                         }
-                        .buttonStyle(.plain)
-                        .contentShape(Circle())
-                        .glassEffect(.regular.tint(.indigo).interactive(), in: .circle)
                     }
+                    .padding(14)
                 }
-                .padding(14)
-                .glassEffect(.regular, in: .rect(cornerRadius: 24))
                 .frame(maxWidth: 680)
             }
             .padding(.horizontal, 16)

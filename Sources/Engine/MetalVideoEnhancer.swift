@@ -25,6 +25,39 @@ private struct MetalDisplayVertexUniforms {
     var scaleY: Float
 }
 
+enum MetalDirectRenderResult: Equatable, Sendable {
+    case rendered
+    case skippedBusy
+    case unavailable
+}
+
+private final class MetalInFlightCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inFlightCount: Int = 0
+
+    func tryAcquire(maxInFlight: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inFlightCount < max(1, maxInFlight) else {
+            return false
+        }
+        inFlightCount += 1
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        inFlightCount = max(0, inFlightCount - 1)
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        inFlightCount = 0
+        lock.unlock()
+    }
+}
+
 private final class MetalGPUTimingTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var averageMs: Double = 0
@@ -70,6 +103,7 @@ final class MetalVideoEnhancer {
     private let commandQueue: MTLCommandQueue?
     private var textureCache: CVMetalTextureCache?
     private let gpuTimingTracker = MetalGPUTimingTracker()
+    private let inFlightCounter = MetalInFlightCounter()
 
     private var enhanceLumaPipeline: MTLComputePipelineState?
     private var copyChromaPipeline: MTLComputePipelineState?
@@ -573,6 +607,7 @@ final class MetalVideoEnhancer {
         averageProcessMs = 0
         enhancedFrameCount = 0
         gpuTimingTracker.reset()
+        inFlightCounter.reset()
         if let textureCache {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
@@ -616,16 +651,39 @@ final class MetalVideoEnhancer {
         outputFPS: Double = 24.0,
         thermalState: ProcessInfo.ThermalState = .nominal
     ) -> Bool {
+        renderToLayerStatus(
+            sourceBuffer,
+            on: metalLayer,
+            preset: preset,
+            strength: strength,
+            aspectFill: aspectFill,
+            compareMode: compareMode,
+            outputFPS: outputFPS,
+            thermalState: thermalState
+        ) != .unavailable
+    }
+
+    /// 零拷贝全异步 FP16 直绘路径（带三缓冲并发背压状态，防止 120Hz + Liquid Glass 下 `nextDrawable()` 阻塞主线程）
+    func renderToLayerStatus(
+        _ sourceBuffer: CVPixelBuffer,
+        on metalLayer: CAMetalLayer,
+        preset: VideoEnhancementPreset,
+        strength: VideoEnhancementStrength,
+        aspectFill: Bool,
+        compareMode: VideoEnhancementCompareMode = .off,
+        outputFPS: Double = 24.0,
+        thermalState: ProcessInfo.ThermalState = .nominal
+    ) -> MetalDirectRenderResult {
         guard preset != .off, compareMode != .original else {
             activePipelineLabel = compareMode == .original ? "原画对比" : "关闭"
-            return false
+            return .unavailable
         }
         guard let device,
               let commandQueue,
               let textureCache,
               let displayYUVRenderPipeline,
               let displayBGRARenderPipeline else {
-            return false
+            return .unavailable
         }
 
         let pixFmt = CVPixelBufferGetPixelFormatType(sourceBuffer)
@@ -633,16 +691,28 @@ final class MetalVideoEnhancer {
             || pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
         let isBGRA = (pixFmt == kCVPixelFormatType_32BGRA)
         guard is8BitBiPlanar || isBGRA else {
-            return false
+            return .unavailable
         }
 
         let srcW = CVPixelBufferGetWidth(sourceBuffer)
         let srcH = CVPixelBufferGetHeight(sourceBuffer)
-        guard srcW >= 2, srcH >= 2 else { return false }
+        guard srcW >= 2, srcH >= 2 else { return .unavailable }
 
-        guard let drawable = metalLayer.nextDrawable(),
-              let commandBuffer = commandQueue.makeCommandBuffer() else {
-            return false
+        guard inFlightCounter.tryAcquire(maxInFlight: 3) else {
+            return .skippedBusy
+        }
+        var didCommit = false
+        defer {
+            if !didCommit {
+                inFlightCounter.release()
+            }
+        }
+
+        guard let drawable = metalLayer.nextDrawable() else {
+            return .skippedBusy
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return .unavailable
         }
 
         let params = VideoEnhancementPlanner.parameters(for: preset, strength: strength)
@@ -755,7 +825,7 @@ final class MetalVideoEnhancer {
         rpd.colorAttachments[0].storeAction = .store
 
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else {
-            return false
+            return .unavailable
         }
 
         if let bgraTex = renderedBGRAInput {
@@ -789,16 +859,19 @@ final class MetalVideoEnhancer {
             nextLabel = "\(preset.rawValue)直绘 \(srcW)×\(srcH)"
         } else {
             renderEncoder.endEncoding()
-            return false
+            return .unavailable
         }
 
         renderEncoder.endEncoding()
         let commitHost = CACurrentMediaTime()
         let tracker = gpuTimingTracker
+        let counter = inFlightCounter
         commandBuffer.addCompletedHandler { cb in
+            counter.release()
             tracker.record(gpuStart: cb.gpuStartTime, gpuEnd: cb.gpuEndTime, fallbackStart: commitHost)
         }
         commandBuffer.present(drawable)
+        didCommit = true
         commandBuffer.commit()
 
         activePipelineLabel = nextLabel
@@ -810,7 +883,7 @@ final class MetalVideoEnhancer {
         if enhancedFrameCount % 60 == 0 {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
-        return true
+        return .rendered
     }
 
     func process(

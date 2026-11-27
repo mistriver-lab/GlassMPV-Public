@@ -19,6 +19,12 @@ final class SampleBufferDisplayContainerView: UIView {
     @MainActor var onProMotionTick: (@MainActor () -> Void)?
     @MainActor private(set) var videoTransform: CGAffineTransform = .identity
     @MainActor private(set) var isMetalOverlayActive: Bool = false
+    @MainActor private var metalMaxLongSide: CGFloat = 2560.0
+    @MainActor private var hasPerformedLayoutOnce: Bool = false
+    @MainActor private var lastLayoutBounds: CGRect = .zero
+    @MainActor private var lastLayoutTransform: CGAffineTransform = .identity
+    @MainActor private var lastLayoutScale: CGFloat = 0
+    @MainActor private var lastLayoutMetalCap: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -155,8 +161,21 @@ final class SampleBufferDisplayContainerView: UIView {
         )
     }
 
+    nonisolated static func recommendedMetalMaxLongSide(outputFPS: Double, allowSpatialUpscale: Bool) -> CGFloat {
+        (outputFPS > 65.0 && !allowSpatialUpscale) ? 1600.0 : 2560.0
+    }
+
     func applyVideoTransform(_ transform: CGAffineTransform) {
+        guard videoTransform != transform else { return }
         videoTransform = transform
+        layoutDisplayLayer()
+    }
+
+    @MainActor
+    func updateMetalMaxLongSide(_ maxLongSide: CGFloat) {
+        let clamped = max(640.0, maxLongSide)
+        guard abs(metalMaxLongSide - clamped) > 0.5 else { return }
+        metalMaxLongSide = clamped
         layoutDisplayLayer()
     }
 
@@ -177,6 +196,20 @@ final class SampleBufferDisplayContainerView: UIView {
     }
 
     private func layoutDisplayLayer() {
+        let rawScale = max(1.0, traitCollection.displayScale)
+        if hasPerformedLayoutOnce
+            && bounds == lastLayoutBounds
+            && videoTransform == lastLayoutTransform
+            && abs(rawScale - lastLayoutScale) < 0.01
+            && abs(metalMaxLongSide - lastLayoutMetalCap) < 0.5 {
+            return
+        }
+        hasPerformedLayoutOnce = true
+        lastLayoutBounds = bounds
+        lastLayoutTransform = videoTransform
+        lastLayoutScale = rawScale
+        lastLayoutMetalCap = metalMaxLongSide
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
@@ -196,9 +229,9 @@ final class SampleBufferDisplayContainerView: UIView {
         metalLayer.bounds = CGRect(origin: .zero, size: layerSize)
         metalLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         metalLayer.setAffineTransform(normTransform)
-        let rawScale = max(1.0, traitCollection.displayScale)
         let longPt = max(layerSize.width, layerSize.height)
-        let effectiveScale = (longPt * rawScale > 2560.0 && longPt > 0) ? (2560.0 / longPt) : rawScale
+        let capPx = metalMaxLongSide
+        let effectiveScale = (longPt * rawScale > capPx && longPt > 0) ? (capPx / longPt) : rawScale
         metalLayer.contentsScale = max(1.0, effectiveScale)
         metalLayer.drawableSize = CGSize(
             width: max(2.0, (layerSize.width * metalLayer.contentsScale).rounded()),
@@ -1724,6 +1757,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isRemoteStream: Bool = false
     @MainActor private var rawHDRTransferName: String? = nil
     @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
+    @MainActor private var rawDroppedFrames: Int64 = 0
+    @MainActor private var rawInterpolatedFrameCount: Int = 0
+    @MainActor private var rawPresentedFrameCount: Int = 0
+    @MainActor private var rawSkippedInterpolationCount: Int = 0
+    @MainActor private var rawAverageInterpolationMs: Double = 0
+    @MainActor private var rawActualOutputFPS: Double = 0
+    @MainActor private var rawLatestAVDeltaMs: Double? = nil
+    @MainActor private var rawQualityEnhanceMs: Double = 0
+    @MainActor private var lastTelemetryPublishTimestamp: CFTimeInterval = 0
     private var lastRawPresentedBuffer: CVPixelBuffer?
     private var lastRawPresentedPTS: Double = 0
     private var currentHTTPHeaders: [String: String] = [:]
@@ -1905,9 +1947,56 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    func flushPublishedTelemetryIfNeeded(force: Bool = false) {
+        let now = CACurrentMediaTime()
+        if !force && lastTelemetryPublishTimestamp > 0 && (now - lastTelemetryPublishTimestamp) < 0.25 {
+            return
+        }
+        lastTelemetryPublishTimestamp = now
+        if droppedFrames != rawDroppedFrames {
+            droppedFrames = rawDroppedFrames
+        }
+        if interpolatedFrameCount != rawInterpolatedFrameCount {
+            interpolatedFrameCount = rawInterpolatedFrameCount
+        }
+        if presentedFrameCount != rawPresentedFrameCount {
+            presentedFrameCount = rawPresentedFrameCount
+        }
+        if skippedInterpolationCount != rawSkippedInterpolationCount {
+            skippedInterpolationCount = rawSkippedInterpolationCount
+        }
+        if abs(averageInterpolationMs - rawAverageInterpolationMs) >= 0.05 {
+            averageInterpolationMs = rawAverageInterpolationMs
+        }
+        if abs(actualOutputFPS - rawActualOutputFPS) >= 0.05 {
+            actualOutputFPS = rawActualOutputFPS
+        }
+        if latestAVDeltaMs != rawLatestAVDeltaMs {
+            latestAVDeltaMs = rawLatestAVDeltaMs
+        }
+        if abs(averageQualityEnhanceMs - rawQualityEnhanceMs) >= 0.05 {
+            averageQualityEnhanceMs = rawQualityEnhanceMs
+        }
+    }
+
+    @MainActor
+    private func resetRawTelemetryCounters() {
+        rawDroppedFrames = 0
+        rawInterpolatedFrameCount = 0
+        rawPresentedFrameCount = 0
+        rawSkippedInterpolationCount = 0
+        rawAverageInterpolationMs = 0
+        rawActualOutputFPS = 0
+        rawLatestAVDeltaMs = nil
+        rawQualityEnhanceMs = 0
+        lastTelemetryPublishTimestamp = 0
+    }
+
+    @MainActor
     func refreshDisplayedFrameForQualityChange() {
         guard let raw = lastRawPresentedBuffer, let layer = displayLayer else { return }
         presentFrame(raw, ptsSeconds: lastRawPresentedPTS, on: layer, isRefresh: true)
+        flushPublishedTelemetryIfNeeded(force: true)
     }
 
     @MainActor
@@ -1952,7 +2041,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         player.rate = 0
         self.audioPlayer = player
 
-        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         self.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             let seconds = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor [weak self] in
@@ -2097,8 +2186,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         Task { @MainActor [weak self] in
             guard let self, self.isTokenValid(token) else { return }
             if interpolatedDelta > 0 {
-                self.interpolatedFrameCount += interpolatedDelta
-                self.averageInterpolationMs = avgMs
+                self.rawInterpolatedFrameCount += interpolatedDelta
+                self.rawAverageInterpolationMs = avgMs
+                self.flushPublishedTelemetryIfNeeded()
             }
             if !backendLabel.isEmpty && self.activeBackendLabel != backendLabel {
                 self.activeBackendLabel = backendLabel
@@ -2175,6 +2265,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let allowedSpatial = effectiveInterpolation && spatial2x && targetFPS.allowsSpatial2x
         enableSpatial2xUpscale = allowedSpatial
         errorMessage = nil
+        resetRawTelemetryCounters()
+        droppedFrames = 0
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
         presentedFrameCount = 0
@@ -2368,7 +2460,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     player.rate = 0
                     self.audioPlayer = player
 
-                    let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+                    let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
                     self.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
                         let seconds = time.seconds.isFinite ? time.seconds : 0
                         Task { @MainActor [weak self] in
@@ -2464,6 +2556,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         isPaused = true
         syncDisplayLinkState()
+        flushPublishedTelemetryIfNeeded(force: true)
     }
 
     @MainActor
@@ -2610,6 +2703,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         presentedTimestamps.removeAll()
         lastFPSPublishTimestamp = 0
         lastCurrentTimePublishTimestamp = 0
+        resetRawTelemetryCounters()
         actualOutputFPS = 0
         currentTime = 0
         duration = 0
@@ -2827,7 +2921,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         guard let self,
                               self.isTokenValid(token),
                               self.isPaused,
-                              self.presentedFrameCount == 0,
+                              self.rawPresentedFrameCount == 0,
                               let layer = self.displayLayer else { return }
                         self.presentFrame(previewBox.buffer, ptsSeconds: ptsSeconds, on: layer)
                     }
@@ -3827,7 +3921,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if usesSyntheticClock {
             now = syntheticClock.currentTime()
             let hostNow = CACurrentMediaTime()
-            if hostNow - lastCurrentTimePublishTimestamp >= 0.1 {
+            if hostNow - lastCurrentTimePublishTimestamp >= 0.25 {
                 lastCurrentTimePublishTimestamp = hostNow
                 currentTime = now
             }
@@ -3865,15 +3959,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.unlock()
 
         if let presentedPTS {
-            latestAVDeltaMs = (presentedPTS - now) * 1000.0
+            rawLatestAVDeltaMs = (presentedPTS - now) * 1000.0
         }
 
         if droppedInTick > 0 {
-            droppedFrames += Int64(droppedInTick)
+            rawDroppedFrames += Int64(droppedInTick)
         }
 
         if let buffer = frameToPresent {
             presentFrame(buffer, ptsSeconds: now, on: layer)
+        } else if presentedPTS != nil || droppedInTick > 0 {
+            flushPublishedTelemetryIfNeeded()
         }
 
         if isLoopingEnabled,
@@ -3881,7 +3977,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
            !isPaused,
            eofReached,
            remainingQueueCount == 0,
-           presentedFrameCount > 0 {
+           rawPresentedFrameCount > 0 {
             let reachedDurationEnd = duration > 0 && now >= duration - 0.05
             let passedLastFrame = lastPTS > 0 && now >= lastPTS + 0.08
             if reachedDurationEnd || passedLastFrame {
@@ -3938,13 +4034,40 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.unlock()
 
         if paceResult.droppedCount > 0 {
-            droppedFrames += Int64(paceResult.droppedCount)
+            rawDroppedFrames += Int64(paceResult.droppedCount)
         }
         if let buffer = paceResult.frame {
             presentFrame(buffer, ptsSeconds: hostTime, on: layer)
-        } else if let pb = pulledBuffer, interpolatedFrameCount == 0 {
+        } else if let pb = pulledBuffer, rawInterpolatedFrameCount == 0 {
             presentFrame(pb, ptsSeconds: hostTime, on: layer)
+        } else if paceResult.droppedCount > 0 {
+            flushPublishedTelemetryIfNeeded()
         }
+    }
+
+    @MainActor
+    private func updatePresentedFrameMetrics(isRefresh: Bool, enhanceMs: Double) {
+        rawQualityEnhanceMs = enhanceMs
+        guard !isRefresh else {
+            flushPublishedTelemetryIfNeeded(force: true)
+            return
+        }
+        let wasFirstFrame = (rawPresentedFrameCount == 0)
+        rawPresentedFrameCount += 1
+        if isLoadingPipeline {
+            isLoadingPipeline = false
+            pipelineStatusText = ""
+        }
+        let nowMedia = CACurrentMediaTime()
+        presentedTimestamps.append(nowMedia)
+        presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
+        if presentedTimestamps.count >= 2, let first = presentedTimestamps.first {
+            let span = nowMedia - first
+            if span > 0.05 {
+                rawActualOutputFPS = Double(presentedTimestamps.count - 1) / span
+            }
+        }
+        flushPublishedTelemetryIfNeeded(force: wasFirstFrame)
     }
 
     @MainActor
@@ -3963,49 +4086,47 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if videoEnhancementPreset != .off {
             let enhancer = metalEnhancer
             let liveOutputFPS = isInterpolationEnabled
-                ? max(actualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 48.0)
+                ? max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 48.0)
                 : max(sourceFPS, 24.0)
+            let thermalNow = ProcessInfo.processInfo.thermalState
+            let upscaleBudget = VideoEnhancementPlanner.effectiveUpscaleBudget(
+                outputFPS: liveOutputFPS,
+                thermalState: thermalNow
+            )
 
             if !isDolbyVisionContent,
                !isHDRContent,
                activeCompareMode != .original,
-               let container = displayContainer,
-               enhancer.renderToLayer(
-                   buffer,
-                   on: container.metalLayer,
-                   preset: videoEnhancementPreset,
-                   strength: videoEnhancementStrength,
-                   aspectFill: isAspectFill,
-                   compareMode: activeCompareMode,
-                   outputFPS: liveOutputFPS,
-                   thermalState: ProcessInfo.processInfo.thermalState
-               ) {
-                container.setMetalOverlayActive(true)
-                if activeQualityPipelineLabel != enhancer.activePipelineLabel {
-                    activeQualityPipelineLabel = enhancer.activePipelineLabel
-                }
-                if isRefresh || presentedFrameCount % 15 == 0 {
-                    averageQualityEnhanceMs = enhancer.averageProcessMs
-                }
-                guard !isRefresh else { return }
-                presentedFrameCount += 1
-                if isLoadingPipeline {
-                    isLoadingPipeline = false
-                    pipelineStatusText = ""
-                }
-                let nowMedia = CACurrentMediaTime()
-                presentedTimestamps.append(nowMedia)
-                presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
-                if nowMedia - lastFPSPublishTimestamp >= 0.25 {
-                    lastFPSPublishTimestamp = nowMedia
-                    if presentedTimestamps.count >= 2, let first = presentedTimestamps.first {
-                        let span = nowMedia - first
-                        if span > 0.05 {
-                            actualOutputFPS = Double(presentedTimestamps.count - 1) / span
-                        }
+               let container = displayContainer {
+                let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
+                    outputFPS: liveOutputFPS,
+                    allowSpatialUpscale: videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale
+                )
+                container.updateMetalMaxLongSide(metalCap)
+                let renderStatus = enhancer.renderToLayerStatus(
+                    buffer,
+                    on: container.metalLayer,
+                    preset: videoEnhancementPreset,
+                    strength: videoEnhancementStrength,
+                    aspectFill: isAspectFill,
+                    compareMode: activeCompareMode,
+                    outputFPS: liveOutputFPS,
+                    thermalState: thermalNow
+                )
+                switch renderStatus {
+                case .rendered:
+                    container.setMetalOverlayActive(true)
+                    if activeQualityPipelineLabel != enhancer.activePipelineLabel {
+                        activeQualityPipelineLabel = enhancer.activePipelineLabel
                     }
+                    updatePresentedFrameMetrics(isRefresh: isRefresh, enhanceMs: enhancer.averageProcessMs)
+                    return
+                case .skippedBusy:
+                    container.setMetalOverlayActive(true)
+                    return
+                case .unavailable:
+                    break
                 }
-                return
             }
 
             displayContainer?.setMetalOverlayActive(false)
@@ -4018,20 +4139,21 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 bypassForComparison: activeCompareMode == .original,
                 compareMode: activeCompareMode,
                 outputFPS: liveOutputFPS,
-                thermalState: ProcessInfo.processInfo.thermalState
+                thermalState: thermalNow
             )
             if activeQualityPipelineLabel != enhancer.activePipelineLabel {
                 activeQualityPipelineLabel = enhancer.activePipelineLabel
             }
-            if isRefresh || presentedFrameCount % 15 == 0 {
-                averageQualityEnhanceMs = enhancer.averageProcessMs
-            }
+            rawQualityEnhanceMs = enhancer.averageProcessMs
         } else {
             displayContainer?.setMetalOverlayActive(false)
             displayBuffer = buffer
             if activeQualityPipelineLabel != "关闭" {
                 activeQualityPipelineLabel = "关闭"
-                averageQualityEnhanceMs = 0
+                rawQualityEnhanceMs = 0
+                if averageQualityEnhanceMs != 0 {
+                    averageQualityEnhanceMs = 0
+                }
             }
         }
         guard let sampleBuffer = makeSampleBuffer(from: displayBuffer, ptsSeconds: ptsSeconds) else { return }
@@ -4047,24 +4169,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         if renderer.isReadyForMoreMediaData {
             renderer.enqueue(sampleBuffer)
-            guard !isRefresh else { return }
-            presentedFrameCount += 1
-            if isLoadingPipeline {
-                isLoadingPipeline = false
-                pipelineStatusText = ""
-            }
-            let nowMedia = CACurrentMediaTime()
-            presentedTimestamps.append(nowMedia)
-            presentedTimestamps.removeAll { nowMedia - $0 > 1.0 }
-            if nowMedia - lastFPSPublishTimestamp >= 0.25 {
-                lastFPSPublishTimestamp = nowMedia
-                if presentedTimestamps.count >= 2, let first = presentedTimestamps.first {
-                    let span = nowMedia - first
-                    if span > 0.05 {
-                        actualOutputFPS = Double(presentedTimestamps.count - 1) / span
-                    }
-                }
-            }
+            updatePresentedFrameMetrics(isRefresh: isRefresh, enhanceMs: rawQualityEnhanceMs)
         }
     }
 
@@ -4920,7 +5025,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 logAsync("[ane][perf] 光流处理落后时钟，临时跳过部分帧插帧以保持音画同步")
             }
             Task { @MainActor [weak self] in
-                self?.skippedInterpolationCount += 1
+                guard let self else { return }
+                self.rawSkippedInterpolationCount += 1
+                self.flushPublishedTelemetryIfNeeded()
             }
             if !state.awaitingClockCatchUpAfterSwitch,
                !state.interpolationExhausted,
@@ -5045,8 +5152,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         }
                         Task { @MainActor [weak self] in
                             guard let self else { return }
-                            self.interpolatedFrameCount += generatedCount
-                            self.averageInterpolationMs = avgMs
+                            self.rawInterpolatedFrameCount += generatedCount
+                            self.rawAverageInterpolationMs = avgMs
+                            self.flushPublishedTelemetryIfNeeded()
                         }
                         shouldEmitOriginalFrame = step.shouldEmitOriginalFrame
 
@@ -5184,7 +5292,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 guard let self,
                       self.isTokenValid(token),
                       self.isPaused,
-                      self.presentedFrameCount == 0,
+                      self.rawPresentedFrameCount == 0,
                       let layer = self.displayLayer else { return }
                 self.presentFrame(previewBox.buffer, ptsSeconds: previewPTS, on: layer)
             }

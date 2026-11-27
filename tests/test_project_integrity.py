@@ -92,6 +92,10 @@ def test_info_plist_valid_and_120hz_enabled():
     assert isinstance(ats, dict) and ats.get("NSAllowsArbitraryLoads") is True, "Missing NSAppTransportSecurity"
     photo_desc = plist.get("NSPhotoLibraryUsageDescription")
     assert isinstance(photo_desc, str) and photo_desc.strip(), "Missing NSPhotoLibraryUsageDescription"
+    photo_add_desc = plist.get("NSPhotoLibraryAddUsageDescription")
+    assert isinstance(photo_add_desc, str) and photo_add_desc.strip(), "Missing NSPhotoLibraryAddUsageDescription"
+    query_schemes = plist.get("LSApplicationQueriesSchemes")
+    assert isinstance(query_schemes, list) and "quark" in query_schemes, "Missing quark in LSApplicationQueriesSchemes"
 
 
 def _strip_comments_and_strings(source: str) -> str:
@@ -220,6 +224,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "final class MetalVideoEnhancer" in metal_enhancer_src
     assert "MTLFXSpatialScaler" in metal_enhancer_src
     assert "renderToLayer" in metal_enhancer_src
+    assert "renderToLayerStatus" in metal_enhancer_src
     assert "displayEnhanceYUVFragment" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
@@ -236,6 +241,10 @@ def test_swift_sources_non_empty_and_balanced():
         ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
     ):
         assert required_cloud_file.is_file(), f"Missing {required_cloud_file}"
+
+    media_clients_src = (ROOT / "Sources" / "Engine" / "MediaSourceClients.swift").read_text(encoding="utf-8")
+    assert "getTokenForQrcodeLogin" in media_clients_src
+    assert "getServiceTicketByQrcodeToken" in media_clients_src
 
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "MPVUI" not in vt_engine
@@ -309,6 +318,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "OpticalFlowDecodedFramePipe" in vt_engine
     assert "recommendedDecodeDimensions" in vt_engine
     assert "effectivePowerThermalCap" in vt_engine
+    assert "recommendedMetalMaxLongSide" in vt_engine
     assert ".latencyCritical" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
@@ -366,6 +376,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testLocalHTTPStreamProxyParsersCookieMergeAndHLSRewrite" in swift_test_src
     assert "testLocalHTTPStreamProxyLiveLoopbackRoundTrip" in swift_test_src
     assert "testMetalDirectRendererAspectMathAndZeroWaitMetrics" in swift_test_src
+    assert "testQuarkQRLoginParsingAndURLBuilder" in swift_test_src
+    assert "testMetalDrawableSizingAndTelemetryThrottling" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

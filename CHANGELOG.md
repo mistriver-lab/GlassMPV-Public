@@ -2,6 +2,17 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.2] - 2026-11-27
+
+### 变更与修复 (Changed & Fixed)
+- **彻底解决 `164451` 实机日志定位的展开控制栏掉帧 (`120fps → 81.4/46.5fps`) (`MetalVideoEnhancer` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - **遥测 4Hz 节流 + 布局幂等防抖**：将 `presentedFrameCount`/`droppedFrames`/`interpolatedFrameCount`/`skippedInterpolationCount`/`averageInterpolationMs`/`actualOutputFPS`/`latestAVDeltaMs`/`averageQualityEnhanceMs` 收敛至内部 `raw*` 计数器，统一按 4Hz（0.25s）节流发布 `@Published`（仅首帧、暂停、切换对比或导出采样强制全量刷新），同时将音频周期时间观察器与合成时钟同步降至 4Hz，彻底消除开启 HUD 时每帧触发 SwiftUI 重排与 120×/s 无效重绘 `metalLayer`。
+  - **高刷直绘分辨率上限 + 3 缓冲背压保护 (`renderToLayerStatus`)**：96/120fps 非超分直绘将 `CAMetalLayer` 长边上限从 `2560px`（~3.0M 像素）降至 `1600px`（~1.15M 像素）降低 60% 片元与合成带宽，并通过 `MetalInFlightCounter` + `renderToLayerStatus` 在 3 帧在途忙碌时跳过冗余编码（`.skippedBusy`），杜绝主线程被 `nextDrawable()` 阻塞。
+  - **去嵌套高刷轻量化 HUD**：移除底栏内部 9 处嵌套 `.glassEffect(...)` 避免双层毛玻璃模糊叠加，在 96/120fps 播放期将底部控制栏与帧率/画质弹窗切换为与左上角悬浮窗同款低开销半透明描边卡片，彻底释放 GPU 合成压力。
+- **重塑单台手机可用的夸克网盘扫码/网页登录与 `__puus` 兜底 (`MediaSourceClients` + `CloudMediaLibraryView` + `Info.plist`)**：
+  - **原生夸克 CAS 扫码通道 (`uop.quark.cn`)**：新增 `requestQRLoginToken`、`pollQRLoginTicket` 与 `exchangeServiceTicketForCookie` 完整原生链路，内置 CoreImage 清晰二维码生成、一键「保存二维码并打开夸克 App (`quark://`)」及后台切回自动 2s 轮询兑票，无需第二台手机即可单机完成登录，并声明 `NSPhotoLibraryAddUsageDescription` 与 `LSApplicationQueriesSchemes`。
+  - **移动端网页登录与 `__puus` 自动补齐 (`bootstrapSessionCookie`)**：`QuarkWebLoginSheet` 网页标签默认启用 `.mobile` 视口并补齐 `WKUIDelegate`/`WKNavigationDelegate`（支持弹窗跳转与外链拉起 `quark://`/`weixin://`），提取或验证时自动调用根目录首访触发 `Set-Cookie: __puus` 滚动补齐与持久化，扫码/提取完成后自动触发账号校验并保存退出。
+
 ## [v0.1.0-beta.1] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
@@ -187,3 +198,15 @@
 - [x] 响应 `153158` 实机日志专项优化 + Phase 2 云端片源库上线（`a956a5c` / 公开镜像 `00fae3e`）：
 
 - [x] **实机过热/去糊/对比修复**：移除高耗时 8 邻域双边 `exp()`，改为单遍多尺度（1px+2px）邻域限幅 Luma 去糊 + 死区门控 + 防光晕 CAS；`MetalFX` 新增高刷/高温保护（`outputFPS > 65` 或过热自动切省电直锐，60fps 封顶 1080p）；`ThermalState.serious` 限档由 `60fps` 调整为 `2×(48fps)` 快速降温；新增可点击「**分屏对比（左原画｜右增强）**」与「**对比原画**」并缓存最近原始帧以支持暂停态零延迟刷新。
+
+- [x] Phase 1 实时 Metal + MetalFX 画质增强引擎上线（`ba872d4` / 公开镜像 `3f51ddf`）：支持「原画 / 老片去糊 / 动漫强化 / 低清超分」，CI Run `45957449192`（24/24 PASS）。
+
+- [x] 响应 `153158` 实机日志专项优化 + Phase 2 云端片源库上线（`a956a5c` / 公开镜像 `00fae3e`）：
+
+- [x] **实机过热/去糊/对比修复**：移除高耗时 8 邻域双边 `exp()`，改为单遍多尺度（1px+2px）邻域限幅 Luma 去糊 + 死区门控 + 防光晕 CAS；`MetalFX` 新增高刷/高温保护（`outputFPS > 65` 或过热自动切省电直锐，60fps 封顶 1080p）；`ThermalState.serious` 限档由 `60fps` 调整为 `2×(48fps)` 快速降温；新增可点击「**分屏对比（左原画｜右增强）**」与「**对比原画**」并缓存最近原始帧以支持暂停态零延迟刷新。
+
+- [x] 响应 `153158` 实机日志专项优化 + Phase 2 云端片源库上线（`a956a5c` / 公开镜像 `00fae3e`）：重构多尺度 Luma 去糊、`.serious` 降档至 `2×(48fps)`、可点选「分屏对比 / 对比原画」暂停即时刷新及 夸克/Emby/WebDAV 云端片源（CI Run `45961120348`，28/28 PASS）。
+
+- [x] `v0.1.0-beta.1 (Build 18)` 性能温控与夸克代理架构重构（`399bd85` / 公开镜像 `08be28d`）：
+
+- [x] **零拷贝异步 FP16 直绘与温控减负**：针对 `160642` 日志暴露的 `waitUntilCompleted()` 与 `+36MB` 冗余拷贝，新增 `CAMetalLayer` 全异步 Fragment Shader（16-bit `half` 5 点硬件双线性采样、零 `copyChroma`、零中间缓冲池、`addCompletedHandler` 非阻塞统计 GPU 耗时）；`48/60fps` 释放 `.latencyCritical`。

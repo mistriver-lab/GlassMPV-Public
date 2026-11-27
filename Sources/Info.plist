@@ -49,8 +49,15 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>GlassMPV 需要保存夸克网盘登录二维码到您的系统相册，以便直接跳转夸克 App 扫一扫完成单机登录。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>GlassMPV 需要访问您的系统相册，以便直接选取并导入本地视频进行超分与补帧播放。</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>quark</string>
+		<string>weixin</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
