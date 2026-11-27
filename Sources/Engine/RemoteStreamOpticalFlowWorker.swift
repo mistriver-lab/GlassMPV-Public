@@ -4,7 +4,7 @@ import Foundation
 import QuartzCore
 import VideoToolbox
 
-struct SendablePixelBuffer: @unchecked Sendable {
+struct RemoteSendablePixelBuffer: @unchecked Sendable {
     let buffer: CVPixelBuffer
 }
 
@@ -14,7 +14,7 @@ struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
 }
 
 /// 面向云端流媒体 (`AVPlayerItemVideoOutput`) 的实时 ANE 硬件光流异步工作器
-actor RemoteStreamOpticalFlowWorker {
+final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     typealias FrameBatchCallback = @Sendable (
         _ frames: [RemoteOpticalFlowOutputFrame],
         _ interpolatedDelta: Int,
@@ -22,17 +22,19 @@ actor RemoteStreamOpticalFlowWorker {
         _ backendLabel: String
     ) -> Void
 
+    private let lock = NSLock()
+    private let onBatch: FrameBatchCallback
     private var targetFPS: OpticalFlowTargetFPS
     private var sourceFPS: Double
-    private let onBatch: FrameBatchCallback
     private var generation: UInt64 = 0
+    private var pendingInput: (pts: Double, box: RemoteSendablePixelBuffer)?
+    private var isProcessing = false
+    private var wantsReconfigure = false
 
     private var previousFrame: (pts: Double, buffer: CVPixelBuffer)?
     private var phaseScheduler: OpticalFlowPhaseScheduler
     private var totalInterpolationMs: Double = 0
     private var batchCount: Int = 0
-    private var pendingInput: (pts: Double, box: SendablePixelBuffer)?
-    private var isProcessing = false
 
 #if !targetEnvironment(simulator)
     private var processor: VTFrameProcessor?
@@ -52,56 +54,101 @@ actor RemoteStreamOpticalFlowWorker {
         onBatch: @escaping FrameBatchCallback
     ) {
         self.targetFPS = targetFPS
-        self.sourceFPS = max(12.0, sourceFPS)
-        self.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: targetFPS, sourceFPS: max(12.0, sourceFPS))
+        let clamped = max(12.0, sourceFPS)
+        self.sourceFPS = clamped
+        self.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: targetFPS, sourceFPS: clamped)
         self.onBatch = onBatch
     }
 
     func reconfigure(targetFPS: OpticalFlowTargetFPS, sourceFPS: Double) {
+        lock.lock()
         self.targetFPS = targetFPS
-        let clampedSource = max(12.0, sourceFPS)
-        self.sourceFPS = clampedSource
-        self.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: targetFPS, sourceFPS: clampedSource)
-        generation &+= 1
-        previousFrame = nil
-        pendingInput = nil
-#if !targetEnvironment(simulator)
-        teardownSession()
-#endif
+        self.sourceFPS = max(12.0, sourceFPS)
+        self.generation &+= 1
+        self.pendingInput = nil
+        self.wantsReconfigure = true
+        lock.unlock()
     }
 
     func reset() {
-        generation &+= 1
-        previousFrame = nil
-        pendingInput = nil
-        phaseScheduler.reset()
-        totalInterpolationMs = 0
-        batchCount = 0
-#if !targetEnvironment(simulator)
-        teardownSession()
-#endif
+        lock.lock()
+        self.generation &+= 1
+        self.pendingInput = nil
+        self.wantsReconfigure = true
+        lock.unlock()
     }
 
-    func submitFrame(pts: Double, box: SendablePixelBuffer) {
+    func submitFrame(pts: Double, box: RemoteSendablePixelBuffer) {
+        lock.lock()
         pendingInput = (pts: pts, box: box)
-        guard !isProcessing else { return }
-        isProcessing = true
-        Task {
-            await drainLoop()
+        let shouldLaunch = !isProcessing
+        if shouldLaunch {
+            isProcessing = true
         }
+        lock.unlock()
+
+        if shouldLaunch {
+            Task.detached(priority: .userInteractive) { [weak self] in
+                await self?.drainLoop()
+            }
+        }
+    }
+
+    private func popNextJob() -> (
+        pts: Double,
+        box: RemoteSendablePixelBuffer,
+        generation: UInt64,
+        targetFPS: OpticalFlowTargetFPS,
+        sourceFPS: Double,
+        needsReconfigure: Bool
+    )? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let next = pendingInput else {
+            isProcessing = false
+            return nil
+        }
+        pendingInput = nil
+        let reconfig = wantsReconfigure
+        wantsReconfigure = false
+        return (next.pts, next.box, generation, targetFPS, sourceFPS, reconfig)
+    }
+
+    private func readGeneration() -> UInt64 {
+        lock.lock()
+        let g = generation
+        lock.unlock()
+        return g
     }
 
     private func drainLoop() async {
-        while let next = pendingInput {
-            pendingInput = nil
-            await processSingleFrame(pts: next.pts, currBuffer: next.box.buffer)
+        while let job = popNextJob() {
+            if job.needsReconfigure {
+                previousFrame = nil
+                phaseScheduler = OpticalFlowPhaseScheduler(targetTier: job.targetFPS, sourceFPS: job.sourceFPS)
+                totalInterpolationMs = 0
+                batchCount = 0
+#if !targetEnvironment(simulator)
+                teardownSession()
+#endif
+            }
+            await processSingleFrame(
+                pts: job.pts,
+                currBuffer: job.box.buffer,
+                jobGeneration: job.generation,
+                targetFPS: job.targetFPS,
+                sourceFPS: job.sourceFPS
+            )
         }
-        isProcessing = false
     }
 
-    private func processSingleFrame(pts currPTS: Double, currBuffer: CVPixelBuffer) async {
-        let localGeneration = generation
-
+    private func processSingleFrame(
+        pts currPTS: Double,
+        currBuffer: CVPixelBuffer,
+        jobGeneration: UInt64,
+        targetFPS: OpticalFlowTargetFPS,
+        sourceFPS: Double
+    ) async {
 #if targetEnvironment(simulator)
         previousFrame = (pts: currPTS, buffer: currBuffer)
         let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
@@ -124,7 +171,7 @@ actor RemoteStreamOpticalFlowWorker {
                 return
             }
 
-            if ensureSession(srcWidth: srcW, srcHeight: srcH),
+            if ensureSession(srcWidth: srcW, srcHeight: srcH, targetFPS: targetFPS, sourceFPS: sourceFPS),
                let processor,
                let activeCandidate,
                let destPool {
@@ -168,7 +215,7 @@ actor RemoteStreamOpticalFlowWorker {
                         do {
                             let startHost = CACurrentMediaTime()
                             _ = try await processor.process(parameters: params)
-                            guard localGeneration == generation else { return }
+                            guard readGeneration() == jobGeneration else { return }
                             let elapsedMs = (CACurrentMediaTime() - startHost) * 1000.0
                             totalInterpolationMs += elapsedMs
                             batchCount += 1
@@ -205,9 +252,14 @@ actor RemoteStreamOpticalFlowWorker {
     }
 
 #if !targetEnvironment(simulator)
-    private func ensureSession(srcWidth: Int, srcHeight: Int) -> Bool {
+    private func ensureSession(
+        srcWidth: Int,
+        srcHeight: Int,
+        targetFPS: OpticalFlowTargetFPS,
+        sourceFPS: Double
+    ) -> Bool {
         let maxInterp = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
-        let exponent = OpticalFlowResolutionPlanner.lowLatencyExponent(forMaxInterpolatedFrames: maxInterp)
+        let exponent = OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: maxInterp)
         let sig = "\(srcWidth)x\(srcHeight):\(exponent)"
         if sig == activeSignature, processor != nil, destPool != nil {
             return true
@@ -238,32 +290,47 @@ actor RemoteStreamOpticalFlowWorker {
             }
             let proc = VTFrameProcessor()
             do {
-                try config.startSession(on: proc)
+                try proc.startSession(configuration: config)
             } catch {
                 proc.endSession()
                 continue
             }
 
-            let supportedFormats = config.frameSupportedPixelFormats.map(\.uint32Value)
-            let chosenFormat = OpticalFlowResolutionPlanner.selectOptimalPixelFormat(
-                supportedFormats: supportedFormats,
-                prefer10Bit: false
-            ) ?? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            let supportedFormats = (config.sourcePixelBufferAttributes[kCVPixelBufferPixelFormatTypeKey as String] as? [NSNumber])?.map(\.uint32Value) ?? []
+            let chosenFormat: OSType = supportedFormats.isEmpty
+                ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                : OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: supportedFormats, prefer10Bit: false)
 
             let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 4]
-            var srcNormAttrs = (config.sourcePixelBufferAttributes as? [String: Any]) ?? [:]
+            var srcNormAttrs: [String: Any] = [:]
+            for (k, v) in config.sourcePixelBufferAttributes {
+                srcNormAttrs[k] = v
+            }
             srcNormAttrs[kCVPixelBufferWidthKey as String] = candidate.width
             srcNormAttrs[kCVPixelBufferHeightKey as String] = candidate.height
             srcNormAttrs[kCVPixelBufferPixelFormatTypeKey as String] = NSNumber(value: chosenFormat)
-            srcNormAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            if srcNormAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+                srcNormAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            }
+            if srcNormAttrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+                srcNormAttrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+            }
             var normPool: CVPixelBufferPool?
             CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs as CFDictionary, srcNormAttrs as CFDictionary, &normPool)
 
-            var dstAttrs = (config.destinationPixelBufferAttributes as? [String: Any]) ?? [:]
+            var dstAttrs: [String: Any] = [:]
+            for (k, v) in config.destinationPixelBufferAttributes {
+                dstAttrs[k] = v
+            }
             dstAttrs[kCVPixelBufferWidthKey as String] = candidate.width
             dstAttrs[kCVPixelBufferHeightKey as String] = candidate.height
             dstAttrs[kCVPixelBufferPixelFormatTypeKey as String] = NSNumber(value: chosenFormat)
-            dstAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            if dstAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+                dstAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            }
+            if dstAttrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+                dstAttrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+            }
             var outPool: CVPixelBufferPool?
             let dstStatus = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs as CFDictionary, dstAttrs as CFDictionary, &outPool)
             guard dstStatus == kCVReturnSuccess, let outPool else {
@@ -293,7 +360,9 @@ actor RemoteStreamOpticalFlowWorker {
         targetHeight: Int,
         targetFormat: OSType
     ) -> CVPixelBuffer? {
-        if CVPixelBufferGetWidth(buffer) == targetWidth,
+        let hasIOSurface = CVPixelBufferGetIOSurface(buffer) != nil
+        if hasIOSurface,
+           CVPixelBufferGetWidth(buffer) == targetWidth,
            CVPixelBufferGetHeight(buffer) == targetHeight,
            CVPixelBufferGetPixelFormatType(buffer) == targetFormat {
             return buffer

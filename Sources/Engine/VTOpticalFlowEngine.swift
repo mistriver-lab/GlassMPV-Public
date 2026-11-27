@@ -1986,14 +1986,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                     if startAt > 0.25 {
                         let targetCM = CMTime(seconds: startAt, preferredTimescale: 600)
-                        player.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                        _ = await player.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
                     }
                     if let worker = self.remoteFlowWorker {
                         let srcRate = self.sourceFPS > 1 ? self.sourceFPS : 24.0
                         let tier = self.effectiveTargetFPS
-                        Task {
-                            await worker.reconfigure(targetFPS: tier, sourceFPS: srcRate)
-                        }
+                        worker.reconfigure(targetFPS: tier, sourceFPS: srcRate)
                     }
                     self.isLoadingPipeline = false
                     self.pipelineStatusText = ""
@@ -2450,11 +2448,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         if isRemoteStream {
             lastRemoteSamplePTS = -1
-            if let worker = remoteFlowWorker {
-                Task {
-                    await worker.reset()
-                }
-            }
+            remoteFlowWorker?.reset()
             isLoadingPipeline = false
             pipelineStatusText = ""
             isPipelineReadyToPlay = true
@@ -2596,9 +2590,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         remoteVideoOutput = nil
         if let worker = remoteFlowWorker {
             remoteFlowWorker = nil
-            Task {
-                await worker.reset()
-            }
+            worker.reset()
         }
         lastRemoteSamplePTS = -1
         currentHTTPHeaders = [:]
@@ -3867,10 +3859,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         if let pb = pulledBuffer, samplePTS > lastRemoteSamplePTS + 0.002, let worker = remoteFlowWorker {
             lastRemoteSamplePTS = samplePTS
-            let box = SendablePixelBuffer(buffer: pb)
-            Task {
-                await worker.submitFrame(pts: samplePTS, box: box)
-            }
+            worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
         }
 
         let pacerNow = max(0, samplePTS - 0.055)
@@ -4210,12 +4199,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         if isRemoteStream {
             clearBufferedFrames()
-            if let worker = remoteFlowWorker {
-                let srcRate = safeSrc
-                Task {
-                    await worker.reconfigure(targetFPS: targetFPS, sourceFPS: srcRate)
-                }
-            }
+            remoteFlowWorker?.reconfigure(targetFPS: targetFPS, sourceFPS: safeSrc)
             appendLog("[remote][switch] 云端流在线切换目标档位: \(targetFPS.shortBadge)")
             return
         }
