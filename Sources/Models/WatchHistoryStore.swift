@@ -139,7 +139,6 @@ final class WatchHistoryStore: ObservableObject {
     private let historyFileURL: URL
     private let thumbnailsDirectory: URL
     private let maxEntries = 80
-    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     init(storageDirectory: URL? = nil) {
         let baseDir: URL
@@ -373,6 +372,7 @@ final class WatchHistoryStore: ObservableObject {
         let scaled = scale < 0.99
             ? ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             : ciImage
+        let ciContext = CIContext(options: [.useSoftwareRenderer: false])
         guard let cgImage = ciContext.createCGImage(scaled, from: scaled.extent) else {
             return nil
         }

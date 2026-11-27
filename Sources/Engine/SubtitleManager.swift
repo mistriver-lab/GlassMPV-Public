@@ -43,7 +43,7 @@ final class SubtitleManager: ObservableObject {
     private let styleDefaultsKey = "glassmpv.subtitle.style.v1"
     private let styleDefaults: UserDefaults
     private weak var activePlayerItem: AVPlayerItem?
-    private weak var activeLocalAsset: AVAsset?
+    private var activeLocalURL: URL?
     private var activeLegibleGroup: AVMediaSelectionGroup?
     private var activeLegibleOutput: AVPlayerItemLegibleOutput?
     private var legibleBridge: LegibleOutputBridge?
@@ -74,7 +74,7 @@ final class SubtitleManager: ObservableObject {
         loadGeneration &+= 1
         detachLegibleOutput()
         activePlayerItem = nil
-        activeLocalAsset = nil
+        activeLocalURL = nil
         activeLegibleGroup = nil
         availableTracks.removeAll()
         selectedTrackID = nil
@@ -180,7 +180,7 @@ final class SubtitleManager: ObservableObject {
     }
 
     func inspectLocalAsset(_ asset: AVAsset, url: URL) {
-        activeLocalAsset = asset
+        activeLocalURL = url
         discoverLocalSidecarSubtitles(for: url)
         let currentGen = loadGeneration
         Task { @MainActor [weak self] in
@@ -283,11 +283,11 @@ final class SubtitleManager: ObservableObject {
                 attachLegibleOutputIfNeeded(to: item)
                 item.select(group.options[optionIndex], in: group)
                 statusMessage = "已启用内嵌字幕：\(track.displayName)"
-            } else if let asset = activeLocalAsset {
+            } else if let localURL = activeLocalURL {
                 detachLegibleOutput()
                 isLoadingTrack = true
                 Task.detached(priority: .userInitiated) { [weak self] in
-                    let cues = await Self.extractCuesFromLocalAsset(asset, optionIndex: optionIndex)
+                    let cues = await Self.extractCuesFromLocalAsset(url: localURL, optionIndex: optionIndex)
                     await MainActor.run {
                         guard let self, self.loadGeneration == gen else { return }
                         self.isLoadingTrack = false
@@ -424,7 +424,8 @@ final class SubtitleManager: ObservableObject {
         return base
     }
 
-    private nonisolated static func extractCuesFromLocalAsset(_ asset: AVAsset, optionIndex: Int) async -> [SubtitleCue] {
+    private nonisolated static func extractCuesFromLocalAsset(url: URL, optionIndex: Int) async -> [SubtitleCue] {
+        let asset = AVURLAsset(url: url)
         let subtitleTracks = (try? await asset.loadTracks(withMediaType: .subtitle)) ?? []
         let textTracks = (try? await asset.loadTracks(withMediaType: .text)) ?? []
         let tracks = subtitleTracks + textTracks
