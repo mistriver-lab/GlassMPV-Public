@@ -2,6 +2,18 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.10] - 2026-11-27
+
+### 修复与增强 (Fixed & Improved)
+- **彻底解决「开 120fps 依然模糊」(`RemoteStreamOpticalFlowWorker` + `MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - **淘汰 480p 糊档**：120fps 远程光流直接从 `1280×720` 起步、最低 `960×540`（`60/96fps` 升级 `1440×810 → 1280×720 → 960×540`）。
+  - **解锁 2560px 图层渲染 + 原画 MetalFX 纹理还原**：`VTOpticalFlowEngine` 对降采样光流解除 `1600px` 封顶；`MetalVideoEnhancer.opticalFlowDownsampleRestoreParameters()` 与自动硬件 `MTLFXSpatialScaler`（最高 `1920×1080 / 2560×1440`）轻量还原下采样流失细节，零白边零过锐。
+- **彻底修复「120fps 误降档到 60fps」与缓冲恢复跌至 2.0fps (`RemoteStreamOpticalFlowWorker` + `VTOpticalFlowEngine`)**：
+  - 删除降档分支误抹除 `30` 对冷却期的 `budgetGuard.reset()`，新增 `isCatchUpOverload` 真实耗时门限（仅在 `processMs > 0.85 * sourceIntervalMs` 时算追帧过载），`pendingInputs` 扩至 `6`、冷启动预热扩至 `8` 对。
+  - `handleRemoteDisplayTick` 统一 `mediaClock` 并在 `AVPlayer` 等待网络缓冲时冻结送显时钟，恢复播放时一次性清理陈旧突发帧并放宽容限至 `120ms`。
+- **彻底突破 5.86GB 真 4K 周期性卡死 (`LocalHTTPStreamProxy` + `VTOpticalFlowEngine`)**：
+  - 新增 `ProxyRouteChunkCache`（`2MB × 4` 路并发预读 + `32MB` 固定片头 LRU 缓存）与 `ParallelChunkedStreamRelay` Pull 式流控直传，修复 `UpstreamStreamRelay.cancelAll()` 挂起态取消锁死 `CFNetwork` 连接池的问题，并将 `preferredForwardBufferDuration` 提升至 `20s`。
+
 ## [v0.1.0-beta.9] - 2026-11-27
 
 ### 修复与增强 (Fixed & Improved)

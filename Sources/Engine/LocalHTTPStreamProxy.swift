@@ -21,6 +21,8 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     private var listeningPort: UInt16 = 0
     private var routes: [String: ProxyRoute] = [:]
     private var routeNormalLogCounts: [String: Int] = [:]
+    private var chunkCaches: [String: ProxyRouteChunkCache] = [:]
+    private var chunkCacheOrder: [String] = []
 
     private init() {}
 
@@ -116,19 +118,51 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             let port = try ensureStarted()
             let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
             let safeExt = url.pathExtension.isEmpty ? (isHLS ? "m3u8" : "mp4") : url.pathExtension
+            let resolvedIsHLS = isHLS || safeExt.lowercased() == "m3u8"
+            var evictedCaches: [ProxyRouteChunkCache] = []
             lock.lock()
             if routes.count > 512 {
                 routes.removeAll()
                 routeNormalLogCounts.removeAll()
             }
-            routes[token] = ProxyRoute(
+            let route = ProxyRoute(
                 upstreamURL: url,
                 headers: headers,
-                isHLS: isHLS || safeExt.lowercased() == "m3u8",
+                isHLS: resolvedIsHLS,
                 onCookieUpdate: onCookieUpdate,
                 onLog: onLog
             )
+            routes[token] = route
+            if !resolvedIsHLS {
+                let cacheKey = url.absoluteString
+                if let existing = chunkCaches[cacheKey] {
+                    existing.updateHeaders(headers)
+                    chunkCacheOrder.removeAll { $0 == cacheKey }
+                    chunkCacheOrder.append(cacheKey)
+                } else {
+                    chunkCaches[cacheKey] = ProxyRouteChunkCache(
+                        upstreamURL: url,
+                        headers: headers,
+                        onCookieResponse: { [weak self] http in
+                            self?.captureRefreshedCookies(from: http, route: route, token: token)
+                        },
+                        onLog: { [weak self] important, msg in
+                            self?.emitRouteLog(token: token, route: route, important: important, message: msg)
+                        }
+                    )
+                    chunkCacheOrder.append(cacheKey)
+                    while chunkCacheOrder.count > 2 {
+                        let oldestKey = chunkCacheOrder.removeFirst()
+                        if let removed = chunkCaches.removeValue(forKey: oldestKey) {
+                            evictedCaches.append(removed)
+                        }
+                    }
+                }
+            }
             lock.unlock()
+            for cache in evictedCaches {
+                cache.invalidate()
+            }
             return URL(string: "http://127.0.0.1:\(port)/stream/\(token)/media.\(safeExt)") ?? url
         } catch {
             return url
@@ -163,7 +197,13 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         lock.lock()
         routes.removeAll()
         routeNormalLogCounts.removeAll()
+        let caches = Array(chunkCaches.values)
+        chunkCaches.removeAll()
+        chunkCacheOrder.removeAll()
         lock.unlock()
+        for cache in caches {
+            cache.invalidate()
+        }
     }
 
     func stop() {
@@ -173,8 +213,22 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         listeningPort = 0
         routes.removeAll()
         routeNormalLogCounts.removeAll()
+        let caches = Array(chunkCaches.values)
+        chunkCaches.removeAll()
+        chunkCacheOrder.removeAll()
         lock.unlock()
+        for cache in caches {
+            cache.invalidate()
+        }
         active?.cancel()
+    }
+
+    private func chunkCache(for route: ProxyRoute) -> ProxyRouteChunkCache? {
+        guard !route.isHLS else { return nil }
+        lock.lock()
+        let found = chunkCaches[route.upstreamURL.absoluteString]
+        lock.unlock()
+        return found
     }
 
     private func route(forPath path: String) -> (token: String, route: ProxyRoute)? {
@@ -334,6 +388,32 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             return
         }
 
+        if parsed.method == "GET",
+           !isManifest,
+           let routeChunkCache = chunkCache(for: matchedRoute),
+           let totalLen = routeChunkCache.knownTotalLength,
+           totalLen >= 4 * 1024 * 1024,
+           let byteRange = parsed.rangeHeader.flatMap({ Self.parseByteRangeHeader($0, totalLength: totalLen) })
+               ?? (parsed.rangeHeader == nil ? (start: Int64(0), end: totalLen - 1) : nil),
+           (byteRange.end - byteRange.start + 1) > Int64(ProxyRouteChunkCache.chunkSize) {
+            let parallelRelay = ParallelChunkedStreamRelay(
+                connection: connection,
+                chunkCache: routeChunkCache,
+                rangeStart: byteRange.start,
+                rangeEnd: byteRange.end,
+                totalLength: totalLen,
+                hadRangeHeader: parsed.rangeHeader != nil,
+                upstreamHost: upstreamHost,
+                enableMP4HEV1Patch: true,
+                onLog: { [weak self] important, msg in
+                    self?.emitRouteLog(token: token, route: matchedRoute, important: important, message: msg)
+                }
+            )
+            parallelRelay.start()
+            return
+        }
+
+        let matchedCache = chunkCache(for: matchedRoute)
         let streamRelay = UpstreamStreamRelay(
             connection: connection,
             headers: matchedRoute.headers,
@@ -341,6 +421,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             requestMethod: parsed.method,
             upstreamHost: upstreamHost,
             enableMP4HEV1Patch: parsed.method != "HEAD",
+            chunkCache: matchedCache,
             onResponse: { [weak self] http in
                 self?.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
             },
@@ -405,6 +486,43 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     }
 
     // MARK: - Pure Testable Helpers
+
+    static func parseContentRangeTotalLength(_ contentRange: String?) -> Int64? {
+        guard let contentRange else { return nil }
+        guard let slashIdx = contentRange.lastIndex(of: "/") else { return nil }
+        let suffix = contentRange[contentRange.index(after: slashIdx)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard suffix != "*", let total = Int64(suffix), total > 0 else { return nil }
+        return total
+    }
+
+    static func parseByteRangeHeader(_ rangeHeader: String?, totalLength: Int64) -> (start: Int64, end: Int64)? {
+        guard totalLength > 0, let raw = rangeHeader?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        guard raw.lowercased().hasPrefix("bytes=") else { return nil }
+        let spec = String(raw.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spec.isEmpty, !spec.contains(",") else { return nil }
+        let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let left = parts[0].trimmingCharacters(in: .whitespaces)
+        let right = parts[1].trimmingCharacters(in: .whitespaces)
+        if left.isEmpty, !right.isEmpty {
+            guard let suffixLen = Int64(right), suffixLen > 0 else { return nil }
+            let start = max(0, totalLength - suffixLen)
+            return (start: start, end: totalLength - 1)
+        }
+        guard !left.isEmpty, let start = Int64(left), start >= 0, start < totalLength else {
+            return nil
+        }
+        if right.isEmpty {
+            return (start: start, end: totalLength - 1)
+        }
+        guard let rawEnd = Int64(right), rawEnd >= start else {
+            return nil
+        }
+        return (start: start, end: min(rawEnd, totalLength - 1))
+    }
 
     static func parseHTTPRequestHead(_ raw: String) -> (method: String, path: String, rangeHeader: String?)? {
         let lines = raw.components(separatedBy: "\r\n")
@@ -862,11 +980,18 @@ private final class RedirectHeaderPreservingDelegate: NSObject, URLSessionTaskDe
     }
 }
 
+private protocol ProxySessionTaskHandler: AnyObject, Sendable {
+    func handleRedirect(newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void)
+    func handleResponse(_ response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void)
+    func handleData(_ data: Data)
+    func handleCompletion(error: Error?)
+}
+
 private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     static let shared = ProxyUpstreamSessionPool()
 
     private let lock = NSLock()
-    private var relays: [Int: UpstreamStreamRelay] = [:]
+    private var handlers: [Int: any ProxySessionTaskHandler] = [:]
     private var session: URLSession!
 
     private override init() {
@@ -874,17 +999,17 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
         config.timeoutIntervalForResource = 1800
-        config.httpMaximumConnectionsPerHost = 6
+        config.httpMaximumConnectionsPerHost = 8
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
         self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
-    func startTask(with request: URLRequest, relay: UpstreamStreamRelay) -> URLSessionDataTask {
+    func startTask(with request: URLRequest, handler: any ProxySessionTaskHandler) -> URLSessionDataTask {
         let task = session.dataTask(with: request)
         lock.lock()
-        relays[task.taskIdentifier] = relay
+        handlers[task.taskIdentifier] = handler
         lock.unlock()
         task.resume()
         return task
@@ -892,13 +1017,13 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
 
     func removeTask(withIdentifier taskId: Int) {
         lock.lock()
-        relays.removeValue(forKey: taskId)
+        handlers.removeValue(forKey: taskId)
         lock.unlock()
     }
 
-    private func relay(for task: URLSessionTask) -> UpstreamStreamRelay? {
+    private func handler(for task: URLSessionTask) -> (any ProxySessionTaskHandler)? {
         lock.lock()
-        let found = relays[task.taskIdentifier]
+        let found = handlers[task.taskIdentifier]
         lock.unlock()
         return found
     }
@@ -910,8 +1035,8 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        if let relay = relay(for: task) {
-            relay.handleRedirect(newRequest: request, completionHandler: completionHandler)
+        if let handler = handler(for: task) {
+            handler.handleRedirect(newRequest: request, completionHandler: completionHandler)
         } else {
             completionHandler(request)
         }
@@ -923,32 +1048,33 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        if let relay = relay(for: dataTask) {
-            relay.handleResponse(response, completionHandler: completionHandler)
+        if let handler = handler(for: dataTask) {
+            handler.handleResponse(response, completionHandler: completionHandler)
         } else {
             completionHandler(.cancel)
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        relay(for: dataTask)?.handleData(data)
+        handler(for: dataTask)?.handleData(data)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         lock.lock()
-        let relay = relays.removeValue(forKey: task.taskIdentifier)
+        let handler = handlers.removeValue(forKey: task.taskIdentifier)
         lock.unlock()
-        relay?.handleCompletion(error: error)
+        handler?.handleCompletion(error: error)
     }
 }
 
-private final class UpstreamStreamRelay: @unchecked Sendable {
+private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sendable {
     private let connection: NWConnection
     private let headers: [String: String]
     private let rangeHeader: String?
     private let requestMethod: String
     private let upstreamHost: String
     private let enableMP4HEV1Patch: Bool
+    private weak var chunkCache: ProxyRouteChunkCache?
     private let onResponse: @Sendable (HTTPURLResponse) -> Void
     private let onLog: @Sendable (Bool, String) -> Void
     private let lock = NSLock()
@@ -970,6 +1096,7 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
         requestMethod: String = "GET",
         upstreamHost: String = "upstream",
         enableMP4HEV1Patch: Bool = true,
+        chunkCache: ProxyRouteChunkCache? = nil,
         onResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
         onLog: @escaping @Sendable (Bool, String) -> Void
     ) {
@@ -979,6 +1106,7 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
         self.requestMethod = requestMethod
         self.upstreamHost = upstreamHost
         self.enableMP4HEV1Patch = enableMP4HEV1Patch
+        self.chunkCache = chunkCache
         self.onResponse = onResponse
         self.onLog = onLog
     }
@@ -991,7 +1119,7 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
                 self?.cancelAll()
             }
         }
-        let task = ProxyUpstreamSessionPool.shared.startTask(with: request, relay: self)
+        let task = ProxyUpstreamSessionPool.shared.startTask(with: request, handler: self)
         lock.lock()
         if didFinish {
             lock.unlock()
@@ -1006,11 +1134,16 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
     private func cancelAll() {
         lock.lock()
         let task = dataTask
+        let wasSuspended = isUpstreamSuspended
+        isUpstreamSuspended = false
         didFinish = true
         dataTask = nil
         lock.unlock()
         if let task {
             ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
+            if wasSuspended {
+                task.resume()
+            }
             task.cancel()
         }
     }
@@ -1041,8 +1174,19 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
         onResponse(http)
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
         let isMP4OrBinary = !contentType.lowercased().contains("mpegurl") && !contentType.lowercased().contains("text/")
-        let contentRange = http.value(forHTTPHeaderField: "Content-Range")?.lowercased() ?? ""
-        let startsAtZero = (http.statusCode == 200) || contentRange.hasPrefix("bytes 0-")
+        let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? ""
+        let startsAtZero = (http.statusCode == 200) || contentRange.lowercased().hasPrefix("bytes 0-")
+        if isMP4OrBinary, (200...299).contains(http.statusCode), let cache = chunkCache {
+            cache.setKnownContentType(contentType)
+            let parsedTotal = LocalHTTPStreamProxy.parseContentRangeTotalLength(contentRange)
+                ?? (http.statusCode == 200 ? http.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) } : nil)
+            if let parsedTotal, parsedTotal >= 4 * 1024 * 1024 {
+                cache.setKnownTotalLength(parsedTotal)
+                if requestMethod == "GET", rangeHeader == "bytes=0-1" {
+                    cache.prefetchAhead(startingAfter: -1)
+                }
+            }
+        }
         lock.lock()
         shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
         if shouldPatchMP4Stream {
@@ -1153,6 +1297,572 @@ private final class UpstreamStreamRelay: @unchecked Sendable {
         if !trailing.isEmpty {
             connection.send(content: trailing, completion: .contentProcessed { _ in })
         }
+        connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+            self?.connection.cancel()
+        })
+    }
+}
+
+private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked Sendable {
+    private let headers: [String: String]
+    private let rangeHeader: String
+    private let expectRangeStart: Int64
+    private let onCookieResponse: @Sendable (HTTPURLResponse) -> Void
+    private let onComplete: @Sendable (Result<Data, Error>) -> Void
+    private let lock = NSLock()
+    private var dataTask: URLSessionDataTask?
+    private var buffer = Data()
+    private var statusCode: Int = 0
+    private var didComplete = false
+
+    init(
+        headers: [String: String],
+        rangeHeader: String,
+        expectRangeStart: Int64,
+        expectedSize: Int,
+        onCookieResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
+        onComplete: @escaping @Sendable (Result<Data, Error>) -> Void
+    ) {
+        self.headers = headers
+        self.rangeHeader = rangeHeader
+        self.expectRangeStart = expectRangeStart
+        self.onCookieResponse = onCookieResponse
+        self.onComplete = onComplete
+        if expectedSize > 0 {
+            self.buffer.reserveCapacity(expectedSize)
+        }
+    }
+
+    func start(with request: URLRequest) {
+        let task = ProxyUpstreamSessionPool.shared.startTask(with: request, handler: self)
+        lock.lock()
+        if didComplete {
+            lock.unlock()
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
+            task.cancel()
+            return
+        }
+        self.dataTask = task
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        didComplete = true
+        let task = dataTask
+        dataTask = nil
+        buffer.removeAll(keepingCapacity: false)
+        lock.unlock()
+        if let task {
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
+            task.cancel()
+        }
+        onComplete(.failure(URLError(.cancelled)))
+    }
+
+    func handleRedirect(
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var next = request
+        for (k, v) in headers {
+            next.setValue(v, forHTTPHeaderField: k)
+        }
+        next.setValue(rangeHeader, forHTTPHeaderField: "Range")
+        completionHandler(next)
+    }
+
+    func handleResponse(
+        _ response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            finish(with: .failure(URLError(.badServerResponse)))
+            return
+        }
+        onCookieResponse(http)
+        lock.lock()
+        statusCode = http.statusCode
+        lock.unlock()
+        guard (200...299).contains(http.statusCode) else {
+            completionHandler(.cancel)
+            finish(with: .failure(NSError(domain: "GlassMPV.LocalProxy", code: http.statusCode, userInfo: [
+                NSLocalizedDescriptionKey: "分块拉取 HTTP \(http.statusCode)"
+            ])))
+            return
+        }
+        if http.statusCode == 200 && (expectRangeStart > 0 || http.expectedContentLength <= 0 || http.expectedContentLength > Int64(ProxyRouteChunkCache.chunkSize) * 2) {
+            completionHandler(.cancel)
+            finish(with: .failure(NSError(domain: "GlassMPV.LocalProxy", code: -416, userInfo: [
+                NSLocalizedDescriptionKey: "上游忽略 Range 返回完整 200"
+            ])))
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func handleData(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        buffer.append(data)
+        lock.unlock()
+    }
+
+    func handleCompletion(error: Error?) {
+        if let error {
+            finish(with: .failure(error))
+            return
+        }
+        lock.lock()
+        let out = buffer
+        let code = statusCode
+        lock.unlock()
+        guard (200...299).contains(code) else {
+            finish(with: .failure(URLError(.badServerResponse)))
+            return
+        }
+        finish(with: .success(out))
+    }
+
+    private func finish(with result: Result<Data, Error>) {
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        didComplete = true
+        dataTask = nil
+        if case .failure = result {
+            buffer.removeAll(keepingCapacity: false)
+        }
+        lock.unlock()
+        onComplete(result)
+    }
+}
+
+private final class ProxyRouteChunkCache: @unchecked Sendable {
+    static let chunkSize: Int = 2 * 1024 * 1024
+    static let maxCachedChunks: Int = 16
+    static let prefetchAheadCount: Int = 3
+
+    private let upstreamURL: URL
+    private let onCookieResponse: @Sendable (HTTPURLResponse) -> Void
+    private let onLog: @Sendable (Bool, String) -> Void
+    private let lock = NSLock()
+    private var headers: [String: String]
+    private var knownTotalLengthStorage: Int64?
+    private var knownContentTypeStorage: String?
+    private var chunks: [Int: Data] = [:]
+    private var lruOrder: [Int] = []
+    private var inFlightWaiters: [Int: [@Sendable (Result<Data, Error>) -> Void]] = [:]
+    private var activeTasks: [Int: UpstreamChunkFetchTask] = [:]
+    private var isInvalidated = false
+
+    init(
+        upstreamURL: URL,
+        headers: [String: String],
+        onCookieResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
+        onLog: @escaping @Sendable (Bool, String) -> Void
+    ) {
+        self.upstreamURL = upstreamURL
+        self.headers = headers
+        self.onCookieResponse = onCookieResponse
+        self.onLog = onLog
+    }
+
+    var knownTotalLength: Int64? {
+        lock.lock()
+        let total = knownTotalLengthStorage
+        lock.unlock()
+        return total
+    }
+
+    var knownContentType: String? {
+        lock.lock()
+        let ct = knownContentTypeStorage
+        lock.unlock()
+        return ct
+    }
+
+    func setKnownTotalLength(_ total: Int64) {
+        guard total > 0 else { return }
+        lock.lock()
+        knownTotalLengthStorage = total
+        lock.unlock()
+    }
+
+    func setKnownContentType(_ contentType: String) {
+        guard !contentType.isEmpty else { return }
+        lock.lock()
+        knownContentTypeStorage = contentType
+        lock.unlock()
+    }
+
+    func updateHeaders(_ newHeaders: [String: String]) {
+        lock.lock()
+        headers = newHeaders
+        lock.unlock()
+    }
+
+    func invalidate() {
+        lock.lock()
+        isInvalidated = true
+        let tasksToCancel = Array(activeTasks.values)
+        activeTasks.removeAll()
+        let pendingGroups = Array(inFlightWaiters.values)
+        inFlightWaiters.removeAll()
+        chunks.removeAll()
+        lruOrder.removeAll()
+        lock.unlock()
+
+        for task in tasksToCancel {
+            task.cancel()
+        }
+        let err = URLError(.cancelled)
+        for group in pendingGroups {
+            for waiter in group {
+                waiter(.failure(err))
+            }
+        }
+    }
+
+    func prefetchAhead(startingAfter chunkIndex: Int) {
+        lock.lock()
+        guard !isInvalidated, let totalLen = knownTotalLengthStorage else {
+            lock.unlock()
+            return
+        }
+        var toFetch: [Int] = []
+        for offset in 1...Self.prefetchAheadCount {
+            let idx = chunkIndex + offset
+            guard idx >= 0, Int64(idx) * Int64(Self.chunkSize) < totalLen else { break }
+            if chunks[idx] == nil && inFlightWaiters[idx] == nil {
+                toFetch.append(idx)
+            }
+        }
+        lock.unlock()
+
+        for idx in toFetch {
+            fetchChunk(index: idx) { _ in }
+        }
+    }
+
+    func fetchChunk(
+        index chunkIndex: Int,
+        completion: @escaping @Sendable (Result<Data, Error>) -> Void
+    ) {
+        lock.lock()
+        if isInvalidated {
+            lock.unlock()
+            completion(.failure(URLError(.cancelled)))
+            return
+        }
+        if let cached = chunks[chunkIndex] {
+            if chunkIndex != 0 {
+                lruOrder.removeAll { $0 == chunkIndex }
+                lruOrder.append(chunkIndex)
+            }
+            lock.unlock()
+            completion(.success(cached))
+            return
+        }
+        if var waiters = inFlightWaiters[chunkIndex] {
+            waiters.append(completion)
+            inFlightWaiters[chunkIndex] = waiters
+            lock.unlock()
+            return
+        }
+        guard let totalLen = knownTotalLengthStorage else {
+            lock.unlock()
+            completion(.failure(URLError(.resourceUnavailable)))
+            return
+        }
+        let chunkStart = Int64(chunkIndex) * Int64(Self.chunkSize)
+        guard chunkIndex >= 0, chunkStart < totalLen else {
+            lock.unlock()
+            completion(.failure(URLError(.dataLengthExceedsMaximum)))
+            return
+        }
+        inFlightWaiters[chunkIndex] = [completion]
+        lock.unlock()
+
+        launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLen, attempt: 0)
+    }
+
+    private func launchFetchTask(chunkIndex: Int, totalLength: Int64, attempt: Int) {
+        let chunkStart = Int64(chunkIndex) * Int64(Self.chunkSize)
+        let chunkEnd = min(totalLength - 1, chunkStart + Int64(Self.chunkSize) - 1)
+        let expectedBytes = Int(chunkEnd - chunkStart + 1)
+        let rangeHeader = "bytes=\(chunkStart)-\(chunkEnd)"
+
+        lock.lock()
+        guard !isInvalidated else {
+            let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            activeTasks.removeValue(forKey: chunkIndex)
+            lock.unlock()
+            for waiter in waiters {
+                waiter(.failure(URLError(.cancelled)))
+            }
+            return
+        }
+        let currentHeaders = headers
+        lock.unlock()
+
+        var req = URLRequest(url: upstreamURL, timeoutInterval: 15)
+        req.httpMethod = "GET"
+        for (k, v) in currentHeaders {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        req.setValue(rangeHeader, forHTTPHeaderField: "Range")
+
+        let fetchTask = UpstreamChunkFetchTask(
+            headers: currentHeaders,
+            rangeHeader: rangeHeader,
+            expectRangeStart: chunkStart,
+            expectedSize: expectedBytes,
+            onCookieResponse: onCookieResponse
+        ) { [weak self] result in
+            self?.handleFetchFinished(chunkIndex: chunkIndex, totalLength: totalLength, attempt: attempt, result: result)
+        }
+        lock.lock()
+        guard !isInvalidated else {
+            let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            activeTasks.removeValue(forKey: chunkIndex)
+            lock.unlock()
+            for waiter in waiters {
+                waiter(.failure(URLError(.cancelled)))
+            }
+            return
+        }
+        activeTasks[chunkIndex] = fetchTask
+        lock.unlock()
+        fetchTask.start(with: req)
+    }
+
+    private func handleFetchFinished(
+        chunkIndex: Int,
+        totalLength: Int64,
+        attempt: Int,
+        result: Result<Data, Error>
+    ) {
+        switch result {
+        case .success(let data):
+            lock.lock()
+            let invalidated = isInvalidated
+            let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            activeTasks.removeValue(forKey: chunkIndex)
+            if !invalidated {
+                chunks[chunkIndex] = data
+                if chunkIndex != 0 {
+                    lruOrder.removeAll { $0 == chunkIndex }
+                    lruOrder.append(chunkIndex)
+                }
+                while chunks.count > Self.maxCachedChunks, let victim = lruOrder.first {
+                    lruOrder.removeFirst()
+                    chunks.removeValue(forKey: victim)
+                }
+            }
+            lock.unlock()
+            let finalResult: Result<Data, Error> = invalidated ? .failure(URLError(.cancelled)) : .success(data)
+            for waiter in waiters {
+                waiter(finalResult)
+            }
+
+        case .failure(let error):
+            let nsErr = error as NSError
+            let isCancelled = (nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled)
+            lock.lock()
+            let canRetry = !isInvalidated && !isCancelled && attempt == 0 && inFlightWaiters[chunkIndex] != nil
+            if !canRetry {
+                let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+                activeTasks.removeValue(forKey: chunkIndex)
+                lock.unlock()
+                if !isCancelled {
+                    onLog(true, "[proxy][error] 并发分块 #\(chunkIndex) 失败: \(error.localizedDescription)")
+                }
+                for waiter in waiters {
+                    waiter(.failure(error))
+                }
+                return
+            }
+            lock.unlock()
+            launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLength, attempt: 1)
+        }
+    }
+}
+
+private final class ParallelChunkedStreamRelay: @unchecked Sendable {
+    private let connection: NWConnection
+    private let chunkCache: ProxyRouteChunkCache
+    private let rangeStart: Int64
+    private let rangeEnd: Int64
+    private let totalLength: Int64
+    private let hadRangeHeader: Bool
+    private let upstreamHost: String
+    private let enableMP4HEV1Patch: Bool
+    private let onLog: @Sendable (Bool, String) -> Void
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var mp4Patcher: MP4HEV1StreamPatcher
+
+    init(
+        connection: NWConnection,
+        chunkCache: ProxyRouteChunkCache,
+        rangeStart: Int64,
+        rangeEnd: Int64,
+        totalLength: Int64,
+        hadRangeHeader: Bool,
+        upstreamHost: String,
+        enableMP4HEV1Patch: Bool,
+        onLog: @escaping @Sendable (Bool, String) -> Void
+    ) {
+        self.connection = connection
+        self.chunkCache = chunkCache
+        self.rangeStart = rangeStart
+        self.rangeEnd = rangeEnd
+        self.totalLength = totalLength
+        self.hadRangeHeader = hadRangeHeader
+        self.upstreamHost = upstreamHost
+        self.enableMP4HEV1Patch = enableMP4HEV1Patch
+        self.onLog = onLog
+        self.mp4Patcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: rangeStart == 0)
+    }
+
+    func start() {
+        connection.stateUpdateHandler = { [weak self] state in
+            if case .cancelled = state {
+                self?.markCancelled()
+            } else if case .failed = state {
+                self?.markCancelled()
+            }
+        }
+
+        let contentLength = rangeEnd - rangeStart + 1
+        let statusLine = hadRangeHeader ? "HTTP/1.1 206 Partial Content" : "HTTP/1.1 200 OK"
+        let contentType = chunkCache.knownContentType ?? "video/mp4"
+        var headerLines = [
+            statusLine,
+            "Content-Type: \(contentType)",
+            "Content-Length: \(contentLength)"
+        ]
+        if hadRangeHeader {
+            headerLines.append("Content-Range: bytes \(rangeStart)-\(rangeEnd)/\(totalLength)")
+        }
+        headerLines.append("Accept-Ranges: bytes")
+        headerLines.append("Connection: close")
+        let headPacket = Data((headerLines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+
+        let statusCode = hadRangeHeader ? 206 : 200
+        onLog(false, "[proxy] GET \(upstreamHost) -> 并发分块直传 HTTP \(statusCode) (range=\(rangeStart)-\(rangeEnd)/\(totalLength))")
+
+        connection.send(content: headPacket, completion: .contentProcessed { [weak self] sendError in
+            guard let self else { return }
+            if sendError != nil {
+                self.markCancelled()
+                self.connection.cancel()
+                return
+            }
+            self.sendNextChunk(at: self.rangeStart)
+        })
+    }
+
+    private func markCancelled() {
+        lock.lock()
+        isCancelled = true
+        lock.unlock()
+    }
+
+    private func readCancelled() -> Bool {
+        lock.lock()
+        let cancelled = isCancelled
+        lock.unlock()
+        return cancelled
+    }
+
+    private func sendNextChunk(at cursor: Int64) {
+        guard !readCancelled() else { return }
+
+        if cursor > rangeEnd {
+            let trailing: Data
+            lock.lock()
+            trailing = enableMP4HEV1Patch ? mp4Patcher.flush() : Data()
+            lock.unlock()
+            if !trailing.isEmpty {
+                connection.send(content: trailing, completion: .contentProcessed { [weak self] _ in
+                    self?.finishConnection()
+                })
+            } else {
+                finishConnection()
+            }
+            return
+        }
+
+        let chunkSize64 = Int64(ProxyRouteChunkCache.chunkSize)
+        let chunkIdx = Int(cursor / chunkSize64)
+        let chunkStart = Int64(chunkIdx) * chunkSize64
+        chunkCache.prefetchAhead(startingAfter: chunkIdx)
+
+        chunkCache.fetchChunk(index: chunkIdx) { [weak self] result in
+            guard let self, !self.readCancelled() else { return }
+            switch result {
+            case .failure(let error):
+                let nsErr = error as NSError
+                if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
+                    self.onLog(true, "[proxy][error] 并发分块直传终止 (#\(chunkIdx)): \(error.localizedDescription)")
+                }
+                self.markCancelled()
+                self.connection.cancel()
+
+            case .success(let chunkData):
+                let sliceStart = Int(cursor - chunkStart)
+                let availableEndOffset = chunkStart + Int64(chunkData.count) - 1
+                let targetEnd = min(self.rangeEnd, availableEndOffset)
+                let sliceEnd = Int(targetEnd - chunkStart) + 1
+                guard sliceStart >= 0, sliceEnd > sliceStart, sliceEnd <= chunkData.count else {
+                    self.markCancelled()
+                    self.connection.cancel()
+                    return
+                }
+                let rawSlice: Data = (sliceStart == 0 && sliceEnd == chunkData.count)
+                    ? chunkData
+                    : chunkData.subdata(in: sliceStart..<sliceEnd)
+                let outgoing: Data
+                self.lock.lock()
+                if self.enableMP4HEV1Patch {
+                    outgoing = self.mp4Patcher.processChunk(rawSlice)
+                } else {
+                    outgoing = rawSlice
+                }
+                self.lock.unlock()
+
+                let nextCursor = targetEnd + 1
+                if outgoing.isEmpty {
+                    self.sendNextChunk(at: nextCursor)
+                } else {
+                    self.connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
+                        guard let self else { return }
+                        if sendError != nil {
+                            self.markCancelled()
+                            self.connection.cancel()
+                            return
+                        }
+                        self.sendNextChunk(at: nextCursor)
+                    })
+                }
+            }
+        }
+    }
+
+    private func finishConnection() {
         connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
             self?.connection.cancel()
         })

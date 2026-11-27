@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.9"
+    static let releaseTag = "0.1.0-beta.10"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.10",
+            date: "2026-11-27",
+            highlights: [
+                "根治「开 120fps 依然模糊」：RemoteOpticalFlowBudgetPlanner 淘汰 480p 糊档并锁定 120fps 从 720p(1280×720) 起跑、最低 540p；VTOpticalFlowEngine 对降采样光流解除 1600px 图层封顶解锁 2560px 全屏渲染；MetalVideoEnhancer 将原画 MetalFX 重建提升至 1080p/1440p 并叠加零光晕轻量下采样纹理恢复",
+                "根治「120fps 仅 28ms 却连降三级到 60fps」与卡顿恢复跌至 2fps：修复降档后误调用 budgetGuard.reset() 抹除 30 对冷却期的 Bug，增加 isCatchUpOverload 耗时门限、6 帧输入队列与 8 对冷启动预热；handleRemoteDisplayTick 冻结缓冲暂停时钟并一次性跳过突发陈旧帧",
+                "根治 5.86GB 真 4K 每 9 秒卡死 4~6 秒：LocalHTTPStreamProxy 新增 ProxyRouteChunkCache（4 路并发 2MB 预读 + 32MB LRU 缓存）与 ParallelChunkedStreamRelay 拉取流式直传，修复挂起态 cancel() 连接池锁死并提升前向缓冲至 20s"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.9",
             date: "2026-11-27",

@@ -20,9 +20,9 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
             return [(1920, 1080), (1280, 720)]
         }
         if maxInterp <= 3 {
-            return [(1280, 720), (960, 540)]
+            return [(1440, 810), (1280, 720), (960, 540)]
         }
-        return [(960, 540), (854, 480)]
+        return [(1280, 720), (960, 540)]
     }
 
     static func shouldEmitPreparedOriginalFrame(
@@ -32,6 +32,15 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
         candidateHeight: Int
     ) -> Bool {
         candidateWidth < sourceWidth || candidateHeight < sourceHeight
+    }
+
+    static func isCatchUpOverload(
+        skippedInputs: Int,
+        processMs: Double,
+        sourceIntervalMs: Double
+    ) -> Bool {
+        guard skippedInputs > 0 else { return false }
+        return processMs > max(4.0, sourceIntervalMs) * 0.85
     }
 
     static func recommendedPacerLagSeconds(
@@ -115,12 +124,12 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     private var phaseScheduler: OpticalFlowPhaseScheduler
     private var budgetGuard = OpticalFlowBudgetGuard(
         windowSize: 12,
-        overloadRatioThreshold: 0.90,
+        overloadRatioThreshold: 0.92,
         consecutiveOverloadWindowsRequired: 2,
         maxConsecutiveCatchUpSkips: 5,
-        cooldownPairs: 16
+        cooldownPairs: 30
     )
-    private var warmupPairsRemaining: Int = 0
+    private var warmupPairsRemaining: Int = 8
     private var totalInterpolationMs: Double = 0
     private var batchCount: Int = 0
 
@@ -163,7 +172,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         self.pendingInputs.removeAll(keepingCapacity: true)
         self.droppedInputCounter = 0
         self.wantsReconfigure = true
-        self.warmupPairsRemaining = 4
+        self.warmupPairsRemaining = 8
         lock.unlock()
     }
 
@@ -173,13 +182,13 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         self.pendingInputs.removeAll(keepingCapacity: true)
         self.droppedInputCounter = 0
         self.wantsReconfigure = true
-        self.warmupPairsRemaining = 4
+        self.warmupPairsRemaining = 8
         lock.unlock()
     }
 
     func submitFrame(pts: Double, box: RemoteSendablePixelBuffer) {
         lock.lock()
-        if pendingInputs.count >= 3 {
+        if pendingInputs.count >= 6 {
             pendingInputs.removeFirst()
             droppedInputCounter += 1
         }
@@ -241,7 +250,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 workingTargetFPS = job.targetFPS
                 phaseScheduler = OpticalFlowPhaseScheduler(targetTier: job.targetFPS, sourceFPS: job.sourceFPS)
                 budgetGuard.reset()
-                warmupPairsRemaining = 4
+                warmupPairsRemaining = 8
                 totalInterpolationMs = 0
                 batchCount = 0
 #if !targetEnvironment(simulator)
@@ -395,10 +404,15 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                             let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
                             let canDowngradeRes = (candidateIndex + 1) < candidates.count
                             let canDowngradeFPS = targetFPS.nextLowerTier != nil
+                            let catchUpOverload = RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                                skippedInputs: skippedInputs,
+                                processMs: elapsedMs,
+                                sourceIntervalMs: sourceIntervalMs
+                            )
                             let action = budgetGuard.recordPair(
                                 processMs: elapsedMs,
                                 sourceIntervalMs: sourceIntervalMs,
-                                skippedForCatchUp: skippedInputs > 0,
+                                skippedForCatchUp: catchUpOverload,
                                 canDowngradeResolution: canDowngradeRes,
                                 canDowngradeTargetFPS: canDowngradeFPS
                             )
@@ -411,10 +425,9 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                     candidateIndex += 1
                                     let nextLabel = candidates[candidateIndex].displayLabel
                                     teardownSession()
-                                    budgetGuard.reset()
                                     totalInterpolationMs = 0
                                     batchCount = 0
-                                    onLog?("[remote][perf] 远程光流推理耗时 \(String(format: "%.1f", elapsedMs))ms 超出源帧间隔 \(String(format: "%.1f", sourceIntervalMs))ms，\(prevLabel) 自动降分辨率 -> \(nextLabel)")
+                                    onLog?("[remote][perf] 远程光流超预算 (单对=\(String(format: "%.1f", elapsedMs))ms, 均值=\(String(format: "%.1f", avgMs))ms, 预算=\(String(format: "%.1f", sourceIntervalMs))ms)，\(prevLabel) 自动降分辨率 -> \(nextLabel)")
                                     return nil
                                 } else if let lower = targetFPS.nextLowerTier {
                                     updateWorkerTargetTier(lower)
@@ -423,7 +436,6 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                     candidates.removeAll(keepingCapacity: true)
                                     candidatePlanSignature = ""
                                     teardownSession()
-                                    budgetGuard.reset()
                                     totalInterpolationMs = 0
                                     batchCount = 0
                                     onTargetDowngrade?(lower, "远程光流分辨率已触底，自动稳帧降档至 \(lower.shortBadge)")
@@ -437,7 +449,6 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                     candidates.removeAll(keepingCapacity: true)
                                     candidatePlanSignature = ""
                                     teardownSession()
-                                    budgetGuard.reset()
                                     totalInterpolationMs = 0
                                     batchCount = 0
                                     onTargetDowngrade?(lower, "远程光流持续超预算或追帧跳过，自动稳帧至 \(lower.shortBadge)")
@@ -573,7 +584,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             self.sourceTransferSession = xfer
             self.destPool = outPool
             self.activeSignature = "\(planSig):\(exponent):idx\(index)"
-            self.warmupPairsRemaining = 4
+            self.warmupPairsRemaining = 8
             onLog?("[remote][ane] 已激活远程光流会话: \(candidate.displayLabel) (exp=\(exponent), fmt=\(HEVCFormatNormalizer.fourCCString(chosenFormat)))")
             return true
         }

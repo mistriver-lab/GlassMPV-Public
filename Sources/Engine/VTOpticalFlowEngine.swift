@@ -1781,6 +1781,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var remoteVideoOutput: AVPlayerItemVideoOutput?
     private var remoteFlowWorker: RemoteStreamOpticalFlowWorker?
     private var lastRemoteSamplePTS: Double = -1
+    @MainActor private var lastRemoteClockPTS: Double = -1
     @MainActor private var remotePacerLagSeconds: Double = 0.110
     @MainActor private var lastRemotePresentedHostTime: CFTimeInterval = 0
     private var remoteStatusObserver: NSKeyValueObservation?
@@ -2071,7 +2072,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 10.0
+        item.preferredForwardBufferDuration = 20.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -2767,6 +2768,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         if isRemoteStream {
             lastRemoteSamplePTS = -1
+            lastRemoteClockPTS = -1
             didLogFirstRemoteFrame = false
             remoteFlowWorker?.reset()
             isLoadingPipeline = false
@@ -2930,6 +2932,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             worker.reset()
         }
         lastRemoteSamplePTS = -1
+        lastRemoteClockPTS = -1
         remotePacerLagSeconds = 0.110
         lastRemotePresentedHostTime = 0
         didLogFirstRemoteFrame = false
@@ -4238,18 +4241,37 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
         }
 
-        let pacerNow = max(0, samplePTS - remotePacerLagSeconds)
+        let mediaClock = (hostItemTime.isValid && hostItemTime.seconds.isFinite) ? hostItemTime.seconds : currentItemTime.seconds
+        let isActivelyPlaying = (player.timeControlStatus == .playing)
+        let activeClockPTS: Double
+        if !isActivelyPlaying && pulledBuffer == nil && lastRemoteClockPTS >= 0 {
+            activeClockPTS = lastRemoteClockPTS
+        } else {
+            lastRemoteClockPTS = max(lastRemoteClockPTS, mediaClock)
+            activeClockPTS = lastRemoteClockPTS
+        }
+        let pacerNow = max(0, activeClockPTS - remotePacerLagSeconds)
+
+        var skippedStaleBurst = false
         bufferLock.lock()
+        if frameQueue.count > 2, pacerNow - frameQueue[0].pts > 0.40 {
+            while frameQueue.count > 2, frameQueue[0].pts < pacerNow - 0.06 {
+                frameQueue.removeFirst()
+                skippedStaleBurst = true
+            }
+        }
         let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
             from: &frameQueue,
             now: pacerNow,
             isInterpolationEnabled: true,
-            maxLateGraceSeconds: 0.075
+            maxLateGraceSeconds: 0.120
         )
         bufferLock.unlock()
 
-        if paceResult.droppedCount > 0 {
-            rawDroppedFrames += Int64(paceResult.droppedCount)
+        if skippedStaleBurst || paceResult.droppedCount > 0 {
+            if paceResult.droppedCount > 0 {
+                rawDroppedFrames += Int64(paceResult.droppedCount)
+            }
         }
         if let buffer = paceResult.frame {
             lastRemotePresentedHostTime = hostTime
@@ -4326,7 +4348,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                (activeCompareMode != .original || wantsHighFPSMetalPassthrough),
                let container = displayContainer {
                 let allowMetalCapRaise = (videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale)
-                    || (videoEnhancementPreset == .off && isDownsampledOpticalFlow && liveOutputFPS <= 65.0)
+                    || (videoEnhancementPreset == .off && isDownsampledOpticalFlow)
                 let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
                     outputFPS: liveOutputFPS,
                     allowSpatialUpscale: allowMetalCapRaise
@@ -4692,6 +4714,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         )
         clearBufferedFrames()
         lastRemoteSamplePTS = -1
+        lastRemoteClockPTS = -1
         remoteFlowWorker = makeRemoteFlowWorker(
             targetFPS: targetFPS,
             sourceFPS: safeSrc,

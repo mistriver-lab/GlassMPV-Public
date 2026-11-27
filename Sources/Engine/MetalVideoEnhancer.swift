@@ -723,6 +723,20 @@ final class MetalVideoEnhancer {
             && thermalState != .critical
     }
 
+    /// 针对光流降采样帧的轻量无光晕纹理恢复参数（零黑边、仅轻微补偿下采样细节）
+    nonisolated static func opticalFlowDownsampleRestoreParameters() -> VideoEnhancementParameters {
+        VideoEnhancementParameters(
+            denoiseStrength: 0,
+            denoiseThreshold: 0.028,
+            casStrength: 0.38,
+            lineDarken: 0.0,
+            clarityStrength: 0.10,
+            wantsSpatialUpscale: false,
+            deblurStrength: 0.30,
+            noiseDeadzone: 0.018
+        )
+    }
+
     /// 零拷贝全异步 FP16 直绘路径：直接由 Fragment Shader 采样解码帧输出至 CAMetalLayer，消除 waitUntilCompleted 与中间像素池拷贝
     func renderToLayer(
         _ sourceBuffer: CVPixelBuffer,
@@ -922,8 +936,8 @@ final class MetalVideoEnhancer {
         } else if wantsAutoMetalFX,
                   let yuvToBGRAPipeline {
 #if canImport(MetalFX) && !targetEnvironment(simulator)
-            let autoMaxLong = (outputFPS > 65.0) ? 1600 : 1920
-            let autoMaxShort = (outputFPS > 65.0) ? 900 : 1080
+            let autoMaxLong = (outputFPS > 65.0) ? 1920 : 2560
+            let autoMaxShort = (outputFPS > 65.0) ? 1080 : 1440
             if let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
                 inputWidth: srcW,
                 inputHeight: srcH,
@@ -966,13 +980,28 @@ final class MetalVideoEnhancer {
                         spatialScaler.outputTexture = upscaledTex
                         spatialScaler.encode(commandBuffer: commandBuffer)
                         renderedBGRAInput = upscaledTex
-                        uniforms.isVideoRange = 0
-                        uniforms.compareMode = 2
+                        let restoreParams = Self.opticalFlowDownsampleRestoreParameters()
+                        uniforms = makeUniforms(
+                            params: restoreParams,
+                            isVideoRange: 0,
+                            isBT601: isBT601,
+                            compareUniform: 0
+                        )
                         nextLabel = "原画高刷·MetalFX \(srcW)×\(srcH)→\(outDims.width)×\(outDims.height)"
                     }
                 }
             }
 #endif
+        }
+
+        if renderedBGRAInput == nil, wantsAutoMetalFX, compareMode != .original {
+            let restoreParams = Self.opticalFlowDownsampleRestoreParameters()
+            uniforms = makeUniforms(
+                params: restoreParams,
+                isVideoRange: isVideoRange,
+                isBT601: isBT601,
+                compareUniform: 0
+            )
         }
 
         let rpd = MTLRenderPassDescriptor()
@@ -1000,7 +1029,9 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(uvTex, index: 1)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            if useHighFPSNeutralCubic {
+            if wantsAutoMetalFX && compareMode != .original {
+                nextLabel = "原画高刷·超清直绘 \(srcW)×\(srcH)"
+            } else if useHighFPSNeutralCubic {
                 nextLabel = "原画高刷直绘 \(srcW)×\(srcH)"
             } else if isPassthroughDraw {
                 nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"
@@ -1017,7 +1048,9 @@ final class MetalVideoEnhancer {
             renderEncoder.setFragmentTexture(bgraTex, index: 0)
             renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalEnhanceUniforms>.size, index: 0)
             renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-            if useHighFPSNeutralCubic {
+            if wantsAutoMetalFX && compareMode != .original {
+                nextLabel = "原画高刷·超清直绘 \(srcW)×\(srcH)"
+            } else if useHighFPSNeutralCubic {
                 nextLabel = "原画高刷直绘 \(srcW)×\(srcH)"
             } else if isPassthroughDraw {
                 nextLabel = preset == .off ? "原画直绘 \(srcW)×\(srcH)" : "原画对比 \(srcW)×\(srcH)"

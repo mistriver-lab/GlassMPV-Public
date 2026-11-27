@@ -232,6 +232,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "allowPassthrough" in metal_enhancer_src
     assert "sampleLumaNeutralCubicH" in metal_enhancer_src
     assert "shouldAutoMetalFXUpscaleOpticalFlow" in metal_enhancer_src
+    assert "opticalFlowDownsampleRestoreParameters" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -245,6 +246,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "httpErrorStatus" in local_proxy_src
     assert "startsAtFileOffsetZero" in local_proxy_src
     assert "highWaterBytes" in local_proxy_src
+    assert "ProxyRouteChunkCache" in local_proxy_src
+    assert "ParallelChunkedStreamRelay" in local_proxy_src
+    assert "parseContentRangeTotalLength" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -276,6 +280,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "preparedBuffer" in remote_worker_src
     assert "shouldEmitPreparedOriginalFrame" in remote_worker_src
     assert "warmupPairsRemaining" in remote_worker_src
+    assert "isCatchUpOverload" in remote_worker_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src
@@ -442,6 +447,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testPlayerGestureMathPinchZoom" in swift_test_src
     assert "testMP4HEV1StreamPatcherBoxAwareMdatSkipAndTailMoov" in swift_test_src
     assert "testAutoMetalFXUpscaleOpticalFlowDecision" in swift_test_src
+    assert "testLocalHTTPStreamProxyParallelChunkedRangeAndCacheReuse" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src

@@ -1955,16 +1955,38 @@ final class GlassMPVTests: XCTestCase {
             sourceHeight: 2160,
             maxInterpolatedFrames: 3
         )
-        XCTAssertEqual(plan96.map(\.height), [720, 540])
-        XCTAssertFalse(plan96.contains(where: { $0.height <= 360 }))
+        XCTAssertEqual(plan96.map(\.height), [810, 720, 540])
+        XCTAssertFalse(plan96.contains(where: { $0.height <= 480 }))
 
         let plan120 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
             sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 4
         )
-        XCTAssertEqual(plan120.map(\.height), [540, 480])
-        XCTAssertFalse(plan120.contains(where: { $0.height <= 360 }))
+        XCTAssertEqual(plan120.map(\.height), [720, 540])
+        XCTAssertFalse(plan120.contains(where: { $0.height <= 480 }))
+
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                skippedInputs: 2,
+                processMs: 28.8,
+                sourceIntervalMs: 40.0
+            )
+        )
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                skippedInputs: 1,
+                processMs: 36.5,
+                sourceIntervalMs: 40.0
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                skippedInputs: 0,
+                processMs: 45.0,
+                sourceIntervalMs: 40.0
+            )
+        )
 
         XCTAssertTrue(
             RemoteOpticalFlowBudgetPlanner.shouldEmitPreparedOriginalFrame(
@@ -2388,5 +2410,188 @@ final class GlassMPVTests: XCTestCase {
                 thermalState: .nominal
             )
         )
+        let restoreParams = MetalVideoEnhancer.opticalFlowDownsampleRestoreParameters()
+        XCTAssertGreaterThan(restoreParams.casStrength, 0)
+        XCTAssertEqual(restoreParams.lineDarken, 0, accuracy: 0.0001)
+    }
+
+    func testLocalHTTPStreamProxyParallelChunkedRangeAndCacheReuse() async throws {
+        XCTAssertEqual(
+            LocalHTTPStreamProxy.parseContentRangeTotalLength("bytes 0-1/5864456763"),
+            5_864_456_763
+        )
+        XCTAssertNil(LocalHTTPStreamProxy.parseContentRangeTotalLength("bytes 0-1/*"))
+        let parsedClosed = try XCTUnwrap(LocalHTTPStreamProxy.parseByteRangeHeader("bytes=100-999", totalLength: 500))
+        XCTAssertEqual(parsedClosed.start, 100)
+        XCTAssertEqual(parsedClosed.end, 499)
+        let parsedOpen = try XCTUnwrap(LocalHTTPStreamProxy.parseByteRangeHeader("bytes=200-", totalLength: 500))
+        XCTAssertEqual(parsedOpen.start, 200)
+        XCTAssertEqual(parsedOpen.end, 499)
+        let parsedSuffix = try XCTUnwrap(LocalHTTPStreamProxy.parseByteRangeHeader("bytes=-50", totalLength: 500))
+        XCTAssertEqual(parsedSuffix.start, 450)
+        XCTAssertEqual(parsedSuffix.end, 499)
+
+        func makeBox(fourCC: String, payload: Data) -> Data {
+            var box = Data()
+            var total = UInt32(8 + payload.count).bigEndian
+            withUnsafeBytes(of: &total) { box.append(contentsOf: $0) }
+            box.append(contentsOf: fourCC.utf8.prefix(4))
+            box.append(payload)
+            return box
+        }
+
+        func makeValidHEV1Entry(width: UInt16, height: UInt16) -> Data {
+            var entry = Data()
+            var sizePlaceholder = UInt32(0).bigEndian
+            withUnsafeBytes(of: &sizePlaceholder) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: "hev1".utf8)
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 6))
+            var dataRefIdx = UInt16(1).bigEndian
+            withUnsafeBytes(of: &dataRefIdx) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 16))
+            var w = width.bigEndian
+            var h = height.bigEndian
+            withUnsafeBytes(of: &w) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &h) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 46))
+            var depth = UInt16(0x0018).bigEndian
+            var preDef = UInt16(0xFFFF).bigEndian
+            withUnsafeBytes(of: &depth) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &preDef) { entry.append(contentsOf: $0) }
+            var childLen = UInt32(16).bigEndian
+            withUnsafeBytes(of: &childLen) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: "hvcC".utf8)
+            entry.append(contentsOf: [UInt8](repeating: 0x01, count: 8))
+            var totalLen = UInt32(entry.count).bigEndian
+            entry.replaceSubrange(0..<4, with: withUnsafeBytes(of: &totalLen) { Data($0) })
+            return entry
+        }
+
+        let ftyp = makeBox(fourCC: "ftyp", payload: Data("isom\0\0\u{02}\0isomiso2mp41".utf8))
+        let tailMoov = makeBox(
+            fourCC: "moov",
+            payload: Data("trak_stbl_stsd".utf8) + makeValidHEV1Entry(width: 3840, height: 2160)
+        )
+        let targetTotalSize = 6 * 1024 * 1024
+        let mdatPayloadSize = targetTotalSize - ftyp.count - 8 - tailMoov.count
+        let mdat = makeBox(fourCC: "mdat", payload: Data(repeating: 0x5A, count: mdatPayloadSize))
+        let fullFileData = ftyp + mdat + tailMoov
+        XCTAssertEqual(fullFileData.count, targetTotalSize)
+
+        final class RangeMockServer: @unchecked Sendable {
+            private let lock = NSLock()
+            private let readySem = DispatchSemaphore(value: 0)
+            private var port: UInt16 = 0
+            private(set) var recordedRanges: [(start: Int64, end: Int64)] = []
+            let bodyData: Data
+
+            init(bodyData: Data) {
+                self.bodyData = bodyData
+            }
+
+            func markReady(port: UInt16) {
+                lock.lock()
+                self.port = port
+                lock.unlock()
+                readySem.signal()
+            }
+
+            func waitForPort() -> UInt16 {
+                _ = readySem.wait(timeout: .now() + 2.0)
+                lock.lock()
+                let p = port
+                lock.unlock()
+                return p
+            }
+
+            func record(start: Int64, end: Int64) {
+                lock.lock()
+                recordedRanges.append((start: start, end: end))
+                lock.unlock()
+            }
+
+            func snapshotRanges() -> [(start: Int64, end: Int64)] {
+                lock.lock()
+                let copy = recordedRanges
+                lock.unlock()
+                return copy
+            }
+        }
+
+        let mockServer = RangeMockServer(bodyData: fullFileData)
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        let stubQueue = DispatchQueue(label: "com.glassmpv.test.parallel.upstream")
+
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                mockServer.markReady(port: listener.port?.rawValue ?? 0)
+            }
+        }
+        listener.newConnectionHandler = { conn in
+            conn.start(queue: stubQueue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, _ in
+                let reqText = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let parsed = LocalHTTPStreamProxy.parseHTTPRequestHead(reqText)
+                let totalLen = Int64(mockServer.bodyData.count)
+                let rangeTuple = parsed?.rangeHeader.flatMap {
+                    LocalHTTPStreamProxy.parseByteRangeHeader($0, totalLength: totalLen)
+                } ?? (start: 0, end: totalLen - 1)
+                mockServer.record(start: rangeTuple.start, end: rangeTuple.end)
+                let slice = mockServer.bodyData.subdata(in: Int(rangeTuple.start)..<Int(rangeTuple.end + 1))
+                let head = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: \(slice.count)\r\nContent-Range: bytes \(rangeTuple.start)-\(rangeTuple.end)/\(totalLen)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                var packet = Data(head.utf8)
+                packet.append(slice)
+                conn.send(content: packet, completion: .contentProcessed { _ in
+                    conn.cancel()
+                })
+            }
+        }
+        listener.start(queue: stubQueue)
+        defer {
+            listener.cancel()
+            LocalHTTPStreamProxy.shared.resetRoutes()
+        }
+
+        let port = mockServer.waitForPort()
+        XCTAssertGreaterThan(port, 0)
+
+        let upstreamURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/4k_movie.mp4"))
+        let proxyURL = LocalHTTPStreamProxy.shared.registerStream(
+            url: upstreamURL,
+            headers: ["Referer": "https://pan.quark.cn/"],
+            isHLS: false
+        )
+
+        var probeReq = URLRequest(url: proxyURL)
+        probeReq.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        let (probeData, probeResp) = try await URLSession.shared.data(for: probeReq)
+        let probeHTTP = try XCTUnwrap(probeResp as? HTTPURLResponse)
+        XCTAssertEqual(probeHTTP.statusCode, 206)
+        XCTAssertEqual(probeData, fullFileData.subdata(in: 0..<2))
+
+        var fullReq = URLRequest(url: proxyURL)
+        fullReq.setValue("bytes=0-\(targetTotalSize - 1)", forHTTPHeaderField: "Range")
+        let (streamedData, fullResp) = try await URLSession.shared.data(for: fullReq)
+        let fullHTTP = try XCTUnwrap(fullResp as? HTTPURLResponse)
+        XCTAssertEqual(fullHTTP.statusCode, 206)
+        XCTAssertEqual(streamedData.count, targetTotalSize)
+        XCTAssertEqual(streamedData.subdata(in: ftyp.count..<(ftyp.count + mdat.count)), mdat)
+        let outMoovSlice = streamedData.subdata(in: (ftyp.count + mdat.count)..<streamedData.count)
+        XCTAssertNotNil(outMoovSlice.range(of: Data("hvc1".utf8)))
+        XCTAssertNil(outMoovSlice.range(of: Data("hev1".utf8)))
+
+        let upstreamCountAfterFull = mockServer.snapshotRanges().count
+        var midReq = URLRequest(url: proxyURL)
+        midReq.setValue("bytes=2500000-5000000", forHTTPHeaderField: "Range")
+        let (midData, midResp) = try await URLSession.shared.data(for: midReq)
+        let midHTTP = try XCTUnwrap(midResp as? HTTPURLResponse)
+        XCTAssertEqual(midHTTP.statusCode, 206)
+        XCTAssertEqual(midData.count, 5_000_000 - 2_500_000 + 1)
+        XCTAssertEqual(midData, fullFileData.subdata(in: 2_500_000..<5_000_001))
+        XCTAssertEqual(mockServer.snapshotRanges().count, upstreamCountAfterFull, "已缓存 2MB 分块再次读取应零上游请求命中缓存")
+        let chunkSizes = mockServer.snapshotRanges().map { $0.end - $0.start + 1 }
+        XCTAssertTrue(chunkSizes.allSatisfy { $0 <= Int64(2 * 1024 * 1024) }, "所有上游分块请求不得超过 2MB")
     }
 }
