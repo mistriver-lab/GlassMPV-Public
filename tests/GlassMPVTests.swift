@@ -1768,6 +1768,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertGreaterThan(fillScale.y, 1.3)
 
         let enhancer = MetalVideoEnhancer()
+        XCTAssertNil(enhancer.shaderInitError)
         let metalLayer = CAMetalLayer()
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.pixelFormat = .bgra8Unorm
@@ -1845,6 +1846,7 @@ final class GlassMPVTests: XCTestCase {
         container.applyVideoTransform(.identity)
 
         let enhancer = MetalVideoEnhancer()
+        XCTAssertNil(enhancer.shaderInitError)
         let metalLayer = CAMetalLayer()
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.pixelFormat = .bgra8Unorm
@@ -2142,6 +2144,7 @@ final class GlassMPVTests: XCTestCase {
     @MainActor
     func testMetalDirectPassthroughModeForHighFPSOriginalQuality() throws {
         let enhancer = MetalVideoEnhancer()
+        XCTAssertNil(enhancer.shaderInitError)
         let metalLayer = CAMetalLayer()
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.pixelFormat = .bgra8Unorm
@@ -2701,6 +2704,7 @@ final class GlassMPVTests: XCTestCase {
         )
 
         let enhancer = MetalVideoEnhancer()
+        XCTAssertNil(enhancer.shaderInitError)
         let metalLayer = CAMetalLayer()
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.pixelFormat = .bgra8Unorm

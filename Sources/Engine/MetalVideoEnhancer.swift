@@ -113,6 +113,7 @@ final class MetalVideoEnhancer {
     private(set) var activePipelineLabel: String = "关闭"
     private(set) var averageProcessMs: Double = 0
     private(set) var enhancedFrameCount: Int = 0
+    private(set) var shaderInitError: String?
 
     private let device: MTLDevice?
     private let commandQueue: MTLCommandQueue?
@@ -285,6 +286,62 @@ final class MetalVideoEnhancer {
     }
 
     // FP16 5-tap + 4-diagonal bilinear multi-scale luma restoration (halo-clamped, zero exp)
+    inline half computeEnhancedLumaParamsH(
+        half c,
+        half n,
+        half s,
+        half w,
+        half e,
+        half d0,
+        half d1,
+        half d2,
+        half d3,
+        float deblurStrength,
+        float casStrength,
+        float lineDarken,
+        float clarityStrength,
+        float noiseDeadzone
+    ) {
+        half mn1 = min(min(c, n), min(s, min(w, e)));
+        half mx1 = max(max(c, n), max(s, max(w, e)));
+        half working = c;
+        half deadzone = half(noiseDeadzone);
+
+        if (deblurStrength > 0.001f) {
+            half blurFine = half(0.25h) * (n + s + w + e);
+            half blurWide = half(0.25h) * (d0 + d1 + d2 + d3);
+            half detailFine = c - blurFine;
+            half detailWide = c - blurWide;
+            half signF = detailFine >= half(0.0h) ? half(1.0h) : half(-1.0h);
+            half signW = detailWide >= half(0.0h) ? half(1.0h) : half(-1.0h);
+            half gatedFine = signF * max(half(0.0h), abs(detailFine) - deadzone * half(0.65h));
+            half gatedWide = signW * max(half(0.0h), abs(detailWide) - deadzone);
+            half rawUnsharp = working + half(deblurStrength) * (half(0.55h) * gatedFine + half(0.70h) * gatedWide);
+            working = clamp(rawUnsharp, mn1 - half(0.025h), mx1 + half(0.025h));
+        }
+
+        if (casStrength > 0.001f) {
+            half peakAmp = sqrt(clamp(min(mn1, half(1.0h) - mx1) / max(mx1, half(0.001h)), half(0.0h), half(1.0h)));
+            half sharpenWeight = peakAmp * half(-0.125f - 0.075f * clamp(casStrength, 0.0f, 1.0f));
+            half sharpened = (working + (n + s + w + e) * sharpenWeight) / (half(1.0h) + half(4.0h) * sharpenWeight);
+            working = clamp(sharpened, max(half(0.0h), mn1 - half(0.02h)), min(half(1.0h), mx1 + half(0.02h)));
+        }
+
+        if (lineDarken > 0.001f) {
+            half avgLocal = half(0.25h) * (n + s + w + e);
+            half darkDelta = max(half(0.0h), avgLocal - working);
+            half gatedDark = max(half(0.0h), darkDelta - deadzone * half(0.5h));
+            working = max(half(0.0h), working - gatedDark * half(lineDarken * 1.55f));
+        }
+
+        if (clarityStrength > 0.001f) {
+            half midOffset = working - half(0.5h);
+            working = clamp(working + half(clarityStrength) * (working * (half(1.0h) - working) * (midOffset * half(1.85h))), half(0.0h), half(1.0h));
+        }
+
+        return clamp(working, half(0.0h), half(1.0h));
+    }
+
     inline half computeEnhancedLumaFastH(
         half c,
         half n,
@@ -297,44 +354,10 @@ final class MetalVideoEnhancer {
         half d3,
         constant EnhanceUniforms& u
     ) {
-        half mn1 = min(min(c, n), min(s, min(w, e)));
-        half mx1 = max(max(c, n), max(s, max(w, e)));
-        half working = c;
-        half deadzone = half(u.noiseDeadzone);
-
-        if (u.deblurStrength > 0.001f) {
-            half blurFine = half(0.25h) * (n + s + w + e);
-            half blurWide = half(0.25h) * (d0 + d1 + d2 + d3);
-            half detailFine = c - blurFine;
-            half detailWide = c - blurWide;
-            half signF = detailFine >= half(0.0h) ? half(1.0h) : half(-1.0h);
-            half signW = detailWide >= half(0.0h) ? half(1.0h) : half(-1.0h);
-            half gatedFine = signF * max(half(0.0h), abs(detailFine) - deadzone * half(0.65h));
-            half gatedWide = signW * max(half(0.0h), abs(detailWide) - deadzone);
-            half rawUnsharp = working + half(u.deblurStrength) * (half(0.55h) * gatedFine + half(0.70h) * gatedWide);
-            working = clamp(rawUnsharp, mn1 - half(0.025h), mx1 + half(0.025h));
-        }
-
-        if (u.casStrength > 0.001f) {
-            half peakAmp = sqrt(clamp(min(mn1, half(1.0h) - mx1) / max(mx1, half(0.001h)), half(0.0h), half(1.0h)));
-            half sharpenWeight = peakAmp * half(-0.125f - 0.075f * clamp(u.casStrength, 0.0f, 1.0f));
-            half sharpened = (working + (n + s + w + e) * sharpenWeight) / (half(1.0h) + half(4.0h) * sharpenWeight);
-            working = clamp(sharpened, max(half(0.0h), mn1 - half(0.02h)), min(half(1.0h), mx1 + half(0.02h)));
-        }
-
-        if (u.lineDarken > 0.001f) {
-            half avgLocal = half(0.25h) * (n + s + w + e);
-            half darkDelta = max(half(0.0h), avgLocal - working);
-            half gatedDark = max(half(0.0h), darkDelta - deadzone * half(0.5h));
-            working = max(half(0.0h), working - gatedDark * half(u.lineDarken * 1.55f));
-        }
-
-        if (u.clarityStrength > 0.001f) {
-            half midOffset = working - half(0.5h);
-            working = clamp(working + half(u.clarityStrength) * (working * (half(1.0h) - working) * (midOffset * half(1.85h))), half(0.0h), half(1.0h));
-        }
-
-        return clamp(working, half(0.0h), half(1.0h));
+        return computeEnhancedLumaParamsH(
+            c, n, s, w, e, d0, d1, d2, d3,
+            u.deblurStrength, u.casStrength, u.lineDarken, u.clarityStrength, u.noiseDeadzone
+        );
     }
 
     vertex QuadVaryings fullscreenQuadVertex(
@@ -493,15 +516,15 @@ final class MetalVideoEnhancer {
         float2 invFlow = float2(u.invFlowWidth, u.invFlowHeight);
         float2 f0 = inForwardFlow.sample(linearSampler, uv).rg * invFlow;
         float2 b0 = inBackwardFlow.sample(linearSampler, uv).rg * invFlow;
-        if (!all(isfinite(f0))) { f0 = float2(0.0f); }
-        if (!all(isfinite(b0))) { b0 = float2(0.0f); }
+        if (!isfinite(f0.x) || !isfinite(f0.y)) { f0 = float2(0.0f); }
+        if (!isfinite(b0.x) || !isfinite(b0.y)) { b0 = float2(0.0f); }
 
         float2 uv0Rough = clamp(uv - t * f0, float2(0.0f), float2(1.0f));
         float2 uv1Rough = clamp(uv - (1.0f - t) * b0, float2(0.0f), float2(1.0f));
         float2 fRef = inForwardFlow.sample(linearSampler, uv0Rough).rg * invFlow;
         float2 bRef = inBackwardFlow.sample(linearSampler, uv1Rough).rg * invFlow;
-        if (!all(isfinite(fRef))) { fRef = f0; }
-        if (!all(isfinite(bRef))) { bRef = b0; }
+        if (!isfinite(fRef.x) || !isfinite(fRef.y)) { fRef = f0; }
+        if (!isfinite(bRef.x) || !isfinite(bRef.y)) { bRef = b0; }
 
         float2 flow = 0.5f * (fRef - bRef);
         float fbErr = length(fRef + bRef);
@@ -514,8 +537,8 @@ final class MetalVideoEnhancer {
 
         float2 uv0Raw = uv - t * flow;
         float2 uv1Raw = uv + (1.0f - t) * flow;
-        bool oob0 = any(uv0Raw < float2(0.0f)) || any(uv0Raw > float2(1.0f));
-        bool oob1 = any(uv1Raw < float2(0.0f)) || any(uv1Raw > float2(1.0f));
+        bool oob0 = (uv0Raw.x < 0.0f || uv0Raw.x > 1.0f || uv0Raw.y < 0.0f || uv0Raw.y > 1.0f);
+        bool oob1 = (uv1Raw.x < 0.0f || uv1Raw.x > 1.0f || uv1Raw.y < 0.0f || uv1Raw.y > 1.0f);
         float2 uv0 = clamp(uv0Raw, float2(0.0f), float2(1.0f));
         float2 uv1 = clamp(uv1Raw, float2(0.0f), float2(1.0f));
 
@@ -555,18 +578,10 @@ final class MetalVideoEnhancer {
             half yE = toUnitLumaH(inPrevY.sample(linearSampler, clamp(uv0 + dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw0
                 + toUnitLumaH(inCurrY.sample(linearSampler, clamp(uv1 + dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw1;
 
-            EnhanceUniforms eu;
-            eu.deblurStrength = u.deblurStrength;
-            eu.casStrength = u.casStrength;
-            eu.lineDarken = u.lineDarken;
-            eu.clarityStrength = u.clarityStrength;
-            eu.noiseDeadzone = u.noiseDeadzone;
-            eu.isVideoRange = u.isVideoRange;
-            eu.isBT601 = u.isBT601;
-            eu.compareMode = 0u;
-            eu.splitX = u.splitX;
-            eu.padding = 0u;
-            yWarp = computeEnhancedLumaFastH(yWarp, yN, yS, yW, yE, yN, yS, yW, yE, eu);
+            yWarp = computeEnhancedLumaParamsH(
+                yWarp, yN, yS, yW, yE, yN, yS, yW, yE,
+                u.deblurStrength, u.casStrength, u.lineDarken, u.clarityStrength, u.noiseDeadzone
+            );
         }
 
         return half4(yuvSampleToRGBH(yWarp, cWarp, u.isVideoRange, u.isBT601), half(1.0h));
@@ -807,6 +822,7 @@ final class MetalVideoEnhancer {
                     }
                 }
             } catch {
+                self.shaderInitError = error.localizedDescription
                 self.enhanceLumaPipeline = nil
                 self.copyChromaPipeline = nil
                 self.enhanceBGRAPipeline = nil
