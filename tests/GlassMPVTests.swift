@@ -1049,7 +1049,7 @@ final class GlassMPVTests: XCTestCase {
         ]
         let dvExt: [String: Any] = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: dvAtoms,
-            kCMFormatDescriptionExtension_TransferFunction as String: kCMFormatDescriptionTransferFunction_ITU_R_2100_PQ as String
+            kCMFormatDescriptionExtension_TransferFunction as String: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
         ]
         let dvStatus = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
