@@ -1763,7 +1763,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isRemoteStream: Bool = false
     @Published @MainActor var availableAudioTracks: [AudioTrackOption] = []
     @Published @MainActor var selectedAudioTrackIndex: Int? = nil
-    @MainActor private var activeAudibleGroup: AVMediaSelectionGroup? = nil
+    private var activeAudibleGroup: AVMediaSelectionGroup?
     @MainActor private var rawHDRTransferName: String? = nil
     @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
     @MainActor private var rawDroppedFrames: Int64 = 0
