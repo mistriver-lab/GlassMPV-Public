@@ -264,6 +264,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "runPassthroughTask" in vt_engine
     assert "let preferFRC = false" in vt_engine
     assert "HH:mm:ss.SSS" in vt_engine
+    assert "preferredDynamicRange" in vt_engine
+    assert "isDolbyVision" in vt_engine
+    assert "updateTargetConfiguration" in vt_engine
+    assert "applyUserSwitchInPlace" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]
@@ -275,6 +279,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "MPVPlayerController" not in player_view
     assert "MPVVideoSurface" not in player_view
     assert "MPV 超分核" not in player_view
+    assert "playBuiltInSampleVideo" not in player_view
+    assert "内置 3 秒" not in player_view
     assert "import PhotosUI" in player_view
     assert "PhotosPicker" in player_view
     assert ".fileImporter(" not in player_view
@@ -293,6 +299,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "activeBackendLabel" in player_view
     assert "opticalFlowTargetFPS" in player_view
     assert "setOpticalFlowTargetFPS" in player_view
+    assert "selectFrameRateOption" in player_view
+    assert "setEDREnabled" in player_view
+    assert "setAspectFill" in player_view
+    assert "setLooping" in player_view
     assert "retryWithoutInterpolation" in player_view
     assert "lastSessionSummary" in player_view
     assert "uiAuditLogs" in player_view
@@ -305,6 +315,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testOpticalFlowExponentPixelFormatAndThermalPolicy" in swift_test_src
     assert "testCoordinatorIdempotencyAndPassthroughMode" in swift_test_src
     assert "testDiagnosticLogUpgradeSessionSummaryAndMemorySampler" in swift_test_src
+    assert "testIdentifiableSelectionTagsDolbyVisionAndDisplaySwitches" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

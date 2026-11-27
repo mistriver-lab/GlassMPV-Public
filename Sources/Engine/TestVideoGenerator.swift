@@ -4,7 +4,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-/// 内置测试视频生成器（用于端内一键自测与 CI 模拟器 XCTest 真实解码验证）
+/// 内置测试视频生成器（仅用于 XCTest 单元测试与模拟器解码链路自检）
 enum TestVideoGenerator: Sendable {
     enum GeneratorError: LocalizedError {
         case cannotCreateWriter(String)

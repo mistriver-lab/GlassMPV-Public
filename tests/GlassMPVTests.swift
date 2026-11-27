@@ -157,6 +157,10 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: "pq", isHDRActive: true), "HDR10✓")
         XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: "hlg", isHDRActive: false), "HLG")
         XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: false, transferName: "bt.709", isHDRActive: false), "SDR")
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: nil, isHDRActive: false, isDolbyVision: true), "杜比视界")
+        XCTAssertEqual(PlaybackHUDMetrics.formatHDRTag(isHDRContent: true, transferName: nil, isHDRActive: true, isDolbyVision: true), "杜比视界✓")
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("dvh1"), "HEVC (DV)")
+        XCTAssertEqual(PlaybackHUDMetrics.formatCodecName("dav1"), "AV1 (DV)")
 
         XCTAssertEqual(PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: "videotoolbox"), "硬解 VT")
         XCTAssertEqual(PlaybackHUDMetrics.formatDecoderBadge(hardwareDecoder: "software"), "软解")
@@ -994,5 +998,75 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertNil(coordinator.currentURL)
         XCTAssertEqual(coordinator.lastSessionSummary?.resolution, "1920×1080")
         XCTAssertEqual(coordinator.lastSessionSummary?.mediaFilename, "sample.mp4")
+    }
+
+    @MainActor
+    func testIdentifiableSelectionTagsDolbyVisionAndDisplaySwitches() throws {
+        // 确保 Identifiable id 为自身而非 String，防止 SwiftUI 选择器 Tag 失配
+        for tier in OpticalFlowTargetFPS.allCases {
+            XCTAssertEqual(tier.id, tier)
+        }
+        for mode in InterpolationMode.allCases {
+            XCTAssertEqual(mode.id, mode)
+        }
+
+        let coordinator = PlayerCoordinator()
+        defer { coordinator.closeToHome() }
+
+        coordinator.selectFrameRateOption(.fps96)
+        XCTAssertEqual(coordinator.interpolationMode, .vtOpticalFlow)
+        XCTAssertEqual(coordinator.opticalFlowTargetFPS, .fps96)
+        XCTAssertEqual(coordinator.opticalFlowController.requestedTargetFPS, .fps96)
+
+        coordinator.selectFrameRateOption(.fps120)
+        XCTAssertEqual(coordinator.opticalFlowTargetFPS, .fps120)
+        XCTAssertEqual(coordinator.opticalFlowController.requestedTargetFPS, .fps120)
+
+        coordinator.selectFrameRateOption(nil)
+        XCTAssertEqual(coordinator.interpolationMode, .off)
+
+        coordinator.selectFrameRateOption(.x2)
+        XCTAssertEqual(coordinator.interpolationMode, .vtOpticalFlow)
+        XCTAssertEqual(coordinator.opticalFlowTargetFPS, .x2)
+
+        coordinator.setEDREnabled(false)
+        XCTAssertFalse(coordinator.isEDREnabled)
+        XCTAssertFalse(coordinator.opticalFlowController.isEDREnabled)
+        coordinator.setEDREnabled(true)
+        XCTAssertTrue(coordinator.opticalFlowController.isEDREnabled)
+
+        coordinator.setAspectFill(true)
+        XCTAssertTrue(coordinator.opticalFlowController.isAspectFill)
+
+        coordinator.setLooping(false)
+        XCTAssertFalse(coordinator.opticalFlowController.isLoopingEnabled)
+
+        // Dolby Vision 描述归一化保留 dvcC 与 passthrough 优先级
+        var dvDescOpt: CMVideoFormatDescription?
+        let dvAtoms: [String: Any] = [
+            "hvcC": Data([1, 2, 3, 4]),
+            "dvcC": Data([1, 0, 0, 5])
+        ]
+        let dvExt: [String: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String: dvAtoms,
+            kCMFormatDescriptionExtension_TransferFunction as String: kCMFormatDescriptionTransferFunction_ITU_R_2100_PQ as String
+        ]
+        let dvStatus = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: HEVCFormatNormalizer.fourCCCode("dvhe"),
+            width: 3840,
+            height: 2160,
+            extensions: dvExt as CFDictionary,
+            formatDescriptionOut: &dvDescOpt
+        )
+        XCTAssertEqual(dvStatus, noErr)
+        let dvDesc = try XCTUnwrap(dvDescOpt)
+        let dvCandidates = HEVCFormatNormalizer.makeNormalizedFormatDescriptionCandidates(from: dvDesc)
+        XCTAssertEqual(dvCandidates.first?.strategy, "dvhe-to-dvh1")
+        XCTAssertTrue(dvCandidates.contains(where: { $0.strategy == "passthrough" }))
+        let cleanAtoms = (CMFormatDescriptionGetExtensions(dvCandidates[0].description) as? [String: Any])?[
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String
+        ] as? [String: Any]
+        XCTAssertNotNil(cleanAtoms?["dvcC"])
     }
 }

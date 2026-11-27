@@ -124,6 +124,10 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
             return "HEVC"
         case "dvh1", "dvhe":
             return "HEVC (DV)"
+        case "dav1":
+            return "AV1 (DV)"
+        case "dva1", "dvav":
+            return "H.264 (DV)"
         case "h264", "h.264", "avc1", "avc3":
             return "H.264"
         case "av1", "av01":
@@ -173,10 +177,17 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
         return "--"
     }
 
-    static func formatHDRTag(isHDRContent: Bool, transferName: String?, isHDRActive: Bool) -> String {
+    static func formatHDRTag(
+        isHDRContent: Bool,
+        transferName: String?,
+        isHDRActive: Bool,
+        isDolbyVision: Bool = false
+    ) -> String {
         let lower = (transferName ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let baseTag: String
-        if lower.contains("pq") || lower.contains("2084") {
+        if isDolbyVision || lower.contains("dolby") || lower.contains("dovi") || lower.contains("ipt") {
+            baseTag = "杜比视界"
+        } else if lower.contains("pq") || lower.contains("2084") {
             baseTag = "HDR10"
         } else if lower.contains("hlg") || lower.contains("b67") {
             baseTag = "HLG"

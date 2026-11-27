@@ -1,11 +1,11 @@
 import Foundation
 
 /// 补帧模式（纯 VideoToolbox ANE 硬件光流真补帧 / 原帧率硬解直通）
-enum InterpolationMode: String, CaseIterable, Identifiable, Sendable {
+enum InterpolationMode: String, CaseIterable, Identifiable, Hashable, Sendable {
     case off = "关闭补帧"
     case vtOpticalFlow = "ANE 光流真补帧"
 
-    var id: String { rawValue }
+    var id: Self { self }
 
     var shortBadge: String {
         switch self {
@@ -23,9 +23,19 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
     case fps96 = "96fps"
     case fps120 = "120fps"
 
-    var id: String { rawValue }
+    var id: Self { self }
 
     var shortBadge: String { rawValue }
+
+    var pillTitle: String {
+        switch self {
+        case .x2: return "2×"
+        case .fps60: return "60"
+        case .fps72: return "72"
+        case .fps96: return "96"
+        case .fps120: return "120"
+        }
+    }
 
     var targetFPSValue: Double? {
         switch self {

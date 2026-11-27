@@ -5,11 +5,16 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
-- **彻底移除 MPV 引擎并升级为纯 VideoToolbox ANE 光流播放器 (`project.yml` + `OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
-  - 移除 `MPVUI` (`MPVKit`) 包依赖、`MPVPlayerCore.swift`、58 个 GLSL 着色器及所有 MPV 探针/超分 UI；新增 `InterpolationMode.off` 原生硬解直通模式（`runPassthroughTask`），跨真机/模拟器支持 `AVAssetReader` + 压缩透传 `VTDecompressionSession` 直通输出，错误横幅支持「以原帧率直通重试」。
-- **根治 `120fps` 误入 `FRC (RGhA)` 导致卡顿丢帧并修复 Picker 重复重载 (`VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
-  - 实机日志证实 `FRC (RGhA)` 占用 ~591MB 且耗时 ~70ms/帧对，而 `LowLatency (420v)` 仅占 ~215MB 且支持 4 相 `120fps`/`96fps`；调整 `buildCandidatePlan` 使所有 `LowLatency` 分辨率档位严格排在 `FRC` 之前，并为 `120fps` 提供 `720p → 540p → 480p`、`96fps`/`60fps` 提供 `720p → 540p` 候选梯队。
-  - 修复 `setOpticalFlowTargetFPS` / `setInterpolation` / `setVTSpatial2x` 在 SwiftUI `Picker` 同值重触发时的重复加载，同时支持自动降档（如 `120fps→96fps`）后再次点选 `120fps` 重新尝试。
+- **根治补帧档位切换失效与热切换卡顿 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - `095509` 实机日志证实 `UI Switch Audit` 零条 `setOpticalFlowTargetFPS` 记录，根因为 `OpticalFlowTargetFPS`/`InterpolationMode` 的 `id: String` 导致 SwiftUI `Picker + ForEach` 隐式 Tag 失配、点选 `60/72/96/120` 全部静默丢弃。现将 `id` 改为 `Self`，全面撤除 `Picker` 并改用直点式 `FrameRatePillStrip` 胶囊按钮条（支持首页预设、控制栏直切与控制台同步联动）。
+  - 新增 `updateTargetConfiguration` + `applyUserSwitchInPlace`，播放中切换 `2×/60/72/96/120` 与 `2×超分` 时原地热替换 `VTFrameProcessor` 会话，不再重建 `AVPlayer` 音轨与 `AVAssetReader`。
+- **全面打通杜比视界 (Dolby Vision) 与 HDR10 / HLG 播放 (`VTOpticalFlowEngine` + `PlaybackTelemetry` + `Info.plist`)**：
+  - `HEVCFormatNormalizer` 优先保留 `dvh1` / `dvcC` / `dvvC` / `dvwC` 与主控/亮度静动态元数据（`MasteringDisplayColorVolume`、`ContentLightLevelInfo`、`AmbientViewingEnvironment`），`VTDecompressionSession` 启用 `kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata`。
+  - 修复 Profile 5 杜比视界（无显式 PQ Transfer）被误判为 8-bit SDR 的问题，解码输出强制 `10-bit`（`x420`）并在缺失色彩附件时回填 BT.2020/PQ；`AVSampleBufferDisplayLayer` 开启 `preferredDynamicRange = .high` 与防休眠。
+- **重塑美观极简 Liquid Glass 界面并移除内置 3 秒测试 (`LiquidGlassPlayerView`)**：
+  - 移除首页与诊断中心中的「内置 3 秒自测视频」入口；默认隐藏参数浮窗（点右上角分辨率/杜比视界徽章显隐），控制栏播放 4.5s 自动淡出，并新增 `HDR/EDR`、`铺满全屏 (AspectFill)` 与 `循环播放` 快捷开关。
+- **彻底移除 MPV 引擎与着色器 (`project.yml` + `VTOpticalFlowEngine`)**：
+  - 移除 `MPVUI`/`MPVKit`、`MPVPlayerCore.swift` 与 58 个 `.glsl` 着色器；`120fps` 与全档位优先 `LowLatency (420v)`，关闭补帧时走跨平台 `AVAssetReader + VTDecompressionSession` 原帧率硬解直通。
 
 ## [v2026.11.26] - 2026-11-26
 

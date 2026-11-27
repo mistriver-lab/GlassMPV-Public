@@ -26,9 +26,10 @@ enum AppReleaseInfo {
             version: "v2026.11.27",
             date: "2026-11-27",
             highlights: [
-                "彻底移除 MPV 内核、58 个 GLSL 着色器及 MPVUI/MPVKit 依赖，升级为纯原生 VideoToolbox ANE 硬件光流播放器（保留「原帧率硬解直通」模式，显著减小包体积与内存占用）",
-                "根治 120fps 误跳 FRC(RGhA 591MB) 卡顿：全档位优先使用 LowLatency (420v, 215MB) 管线，120fps/96fps 自动从 720p 起跑并支持 720p→540p→480p 阶梯平滑降档",
-                "修复目标帧率 Picker 重复触发重载竞态，并在降档后允许用户再次点选恢复 120fps"
+                "根治补帧档位切换仅 2× 生效问题：修复 OpticalFlowTargetFPS / InterpolationMode 的 Identifiable id 与 SwiftUI Picker Tag 失配 bug，并将播放期档位条重构为直点胶囊按钮，同时支持播放中无感热切换目标帧率（不中断音频与解码器）",
+                "完整支持杜比视界（Dolby Vision dvh1/dvhe/dvcC/dvvC）及 HDR10/HLG 峰值亮度输出：开启 AVSampleBufferDisplayLayer EDR（preferredDynamicRange = .high）与逐帧 HDR 元数据透传，并在缺省色域附件时自动回填 BT.2020/PQ 防止闪烁",
+                "全新极简 Liquid Glass 播放界面：移除内置 3 秒自测视频入口，新增播放页 4.5s 自动隐藏、原帧/2×/60/72/96/120 一体化直选条、HDR/EDR 开关、铺满屏幕裁剪（Fill/Fit）与循环播放快捷开关",
+                "彻底移除 MPV 内核、58 个 GLSL 着色器及 MPVUI/MPVKit 依赖，升级为纯原生 VideoToolbox ANE 硬件光流播放器（保留「原帧率硬解直通」模式），全档位优先 LowLatency (420v) 低功耗低内存管线"
             ]
         ),
         ReleaseNoteEntry(

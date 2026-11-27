@@ -16,8 +16,26 @@ final class SampleBufferDisplayContainerView: UIView {
         backgroundColor = .black
         clipsToBounds = true
         displayLayer.videoGravity = .resizeAspect
+        displayLayer.preferredDynamicRange = .high
+        displayLayer.preventsDisplaySleepDuringVideoPlayback = true
         layer.addSublayer(displayLayer)
         layoutDisplayLayer()
+    }
+
+    @MainActor
+    func setAspectFill(_ aspectFill: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.videoGravity = aspectFill ? .resizeAspectFill : .resizeAspect
+        CATransaction.commit()
+    }
+
+    @MainActor
+    func setEDREnabled(_ enabled: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.preferredDynamicRange = enabled ? .high : .standard
+        CATransaction.commit()
     }
 
     @available(*, unavailable)
@@ -160,8 +178,28 @@ enum HEVCFormatNormalizer {
         kCMFormatDescriptionExtension_FullRangeVideo as String,
         kCMFormatDescriptionExtension_PixelAspectRatio as String,
         kCMFormatDescriptionExtension_CleanAperture as String,
-        kCMFormatDescriptionExtension_BitsPerComponent as String
+        kCMFormatDescriptionExtension_BitsPerComponent as String,
+        kCMFormatDescriptionExtension_MasteringDisplayColorVolume as String,
+        kCMFormatDescriptionExtension_ContentLightLevelInfo as String,
+        kCMFormatDescriptionExtension_AmbientViewingEnvironment as String,
+        kCMFormatDescriptionExtension_ChromaLocationTopField as String,
+        kCMFormatDescriptionExtension_ChromaLocationBottomField as String
     ]
+
+    static func isDolbyVision(subType: FourCharCode, atoms: [String: Any]?) -> Bool {
+        let dvCodecs: Set<FourCharCode> = [
+            fourCCCode("dvh1"),
+            fourCCCode("dvhe"),
+            fourCCCode("dva1"),
+            fourCCCode("dvav"),
+            fourCCCode("dav1")
+        ]
+        if dvCodecs.contains(subType) {
+            return true
+        }
+        guard let atoms else { return false }
+        return atoms["dvcC"] != nil || atoms["dvvC"] != nil || atoms["dvwC"] != nil
+    }
 
     static func fourCCCode(_ string: String) -> FourCharCode {
         let bytes = Array(string.utf8.prefix(4))
@@ -193,7 +231,9 @@ enum HEVCFormatNormalizer {
         let atoms = exts?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
         let atomKeys = atoms.map { Array($0.keys).sorted().joined(separator: ",") } ?? "none"
         let hvccLen = (atoms?["hvcC"] as? Data)?.count ?? 0
-        return "fourCC=\(fourCCString(subType)), dims=\(dims.width)x\(dims.height), atoms=[\(atomKeys)], hvcC=\(hvccLen)B"
+        let transfer = exts?[kCMFormatDescriptionExtension_TransferFunction as String] as? String ?? "none"
+        let isDV = isDolbyVision(subType: subType, atoms: atoms)
+        return "fourCC=\(fourCCString(subType)), dims=\(dims.width)x\(dims.height), dv=\(isDV), transfer=\(transfer), atoms=[\(atomKeys)], hvcC=\(hvccLen)B"
     }
 
     static func parseHEVCParameterSets(fromHVCC data: Data) -> (nalLengthSize: Int32, parameterSets: [Data])? {
@@ -296,6 +336,44 @@ enum HEVCFormatNormalizer {
             }
         }
 
+        let isDV = isDolbyVision(subType: subType, atoms: atoms)
+        let isHEVCBase = (subType == fourCCCode("hev1")
+            || subType == fourCCCode("hvc1")
+            || subType == fourCCCode("dvh1")
+            || subType == fourCCCode("dvhe")
+            || atoms?["hvcC"] != nil)
+
+        var dvCandidates: [(strategy: String, description: CMVideoFormatDescription)] = []
+        if isDV && isHEVCBase, let atoms {
+            var dvAtoms: [String: Any] = [:]
+            for key in ["hvcC", "dvcC", "dvvC", "dvwC", "hvcE", "lhvC"] {
+                if let val = atoms[key] {
+                    dvAtoms[key] = val
+                }
+            }
+            if !dvAtoms.isEmpty {
+                var dvExt = safeColorExtensions
+                dvExt[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] = dvAtoms
+                var dvh1Desc: CMVideoFormatDescription?
+                let dvStatus = CMVideoFormatDescriptionCreate(
+                    allocator: kCFAllocatorDefault,
+                    codecType: fourCCCode("dvh1"),
+                    width: dims.width,
+                    height: dims.height,
+                    extensions: dvExt as CFDictionary,
+                    formatDescriptionOut: &dvh1Desc
+                )
+                if dvStatus == noErr, let dvh1Desc {
+                    if subType == fourCCCode("dvh1") {
+                        dvCandidates.append((strategy: "dvh1-clean", description: dvh1Desc))
+                    } else {
+                        dvCandidates.append((strategy: "dvhe-to-dvh1", description: dvh1Desc))
+                    }
+                }
+            }
+        }
+
+        var hevcFallbackCandidates: [(strategy: String, description: CMVideoFormatDescription)] = []
         var parsedHVCC: (nalLengthSize: Int32, parameterSets: [Data])?
         if let hvcCData = atoms?["hvcC"] as? Data, !hvcCData.isEmpty {
             parsedHVCC = parseHEVCParameterSets(fromHVCC: hvcCData)
@@ -312,7 +390,7 @@ enum HEVCFormatNormalizer {
                 formatDescriptionOut: &hvc1Desc
             )
             if status == noErr, let hvc1Desc {
-                candidates.append((strategy: "hvcC-to-hvc1", description: hvc1Desc))
+                hevcFallbackCandidates.append((strategy: "hvcC-to-hvc1", description: hvc1Desc))
             }
 
             if let parsed = parsedHVCC,
@@ -321,12 +399,11 @@ enum HEVCFormatNormalizer {
                    nalLengthSize: parsed.nalLengthSize,
                    extensions: safeColorExtensions
                ) {
-                candidates.append((strategy: "hvcc-param-sets", description: paramDesc))
+                hevcFallbackCandidates.append((strategy: "hvcc-param-sets", description: paramDesc))
             }
         }
 
-        let isHEVC = (subType == fourCCCode("hev1") || subType == fourCCCode("hvc1") || atoms?["hvcC"] != nil)
-        if isHEVC, let sampleData = fallbackSampleData, !sampleData.isEmpty {
+        if isHEVCBase, let sampleData = fallbackSampleData, !sampleData.isEmpty {
             let nalLen = Int(parsedHVCC?.nalLengthSize ?? 4)
             let inbandSets = extractHEVCParameterSets(fromLengthPrefixed: sampleData, nalLengthSize: nalLen)
             if inbandSets.count >= 2,
@@ -335,8 +412,27 @@ enum HEVCFormatNormalizer {
                    nalLengthSize: Int32(nalLen),
                    extensions: safeColorExtensions
                ) {
-                candidates.append((strategy: "inband-param-sets", description: inbandDesc))
+                hevcFallbackCandidates.append((strategy: "inband-param-sets", description: inbandDesc))
             }
+        }
+
+        if isDV && isHEVCBase {
+            if subType == fourCCCode("dvh1") {
+                candidates.append((strategy: "passthrough", description: rawDesc))
+                candidates.append(contentsOf: dvCandidates)
+            } else {
+                candidates.append(contentsOf: dvCandidates)
+                candidates.append((strategy: "passthrough", description: rawDesc))
+            }
+            candidates.append(contentsOf: hevcFallbackCandidates)
+            return candidates
+        }
+
+        candidates.append(contentsOf: hevcFallbackCandidates)
+
+        if subType == fourCCCode("av01") || subType == fourCCCode("dav1") {
+            candidates.append((strategy: "passthrough", description: rawDesc))
+            return candidates
         }
 
         if subType == fourCCCode("avc3"),
@@ -1251,6 +1347,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var effectiveTargetFPS: OpticalFlowTargetFPS = .x2
     @Published @MainActor var latestAVDeltaMs: Double? = nil
     @Published @MainActor var isInterpolationEnabled: Bool = true
+    @Published @MainActor var isAspectFill: Bool = false
+    @Published @MainActor var isEDREnabled: Bool = true
+    @Published @MainActor var isDolbyVisionContent: Bool = false
+    @Published @MainActor var isHDRContent: Bool = false
+    @MainActor private var rawHDRTransferName: String? = nil
 
     @MainActor
     var targetSummaryBadge: String {
@@ -1288,11 +1389,25 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 #endif
     }
 
+    private struct TrackColorFallbackMetadata {
+        var isHDR: Bool = false
+        var isDolbyVision: Bool = false
+        var colorPrimaries: CFString?
+        var transferFunction: CFString?
+        var ycbcrMatrix: CFString?
+        var masteringDisplayColorVolume: CFData?
+        var contentLightLevelInfo: CFData?
+        var ambientViewingEnvironment: CFData?
+    }
+
     private let bufferLock = NSLock()
     private let tokenLock = NSLock()
     private let audioClockLock = NSLock()
     private let passthroughCacheLock = NSLock()
     private var passthroughRequiredURLKeys: Set<String> = []
+    private var colorFallbackMetadata = TrackColorFallbackMetadata()
+    private var pendingUserSwitch: (target: OpticalFlowTargetFPS, spatial2x: Bool)?
+    private var didInspectFirstDecodedColor: Bool = false
     private var frameQueue: [(pts: Double, buffer: CVPixelBuffer)] = []
     private var pendingFirstFrame: (pts: Double, buffer: CVPixelBuffer)?
     private var didAttachDisplayLayer: Bool = false
@@ -1323,7 +1438,28 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     func attach(to container: SampleBufferDisplayContainerView) {
         self.displayContainer = container
         container.applyVideoTransform(videoTransform)
+        container.setAspectFill(isAspectFill)
+        container.setEDREnabled(isEDREnabled)
         attach(to: container.displayLayer)
+    }
+
+    @MainActor
+    func setAspectFill(_ enabled: Bool) {
+        isAspectFill = enabled
+        displayContainer?.setAspectFill(enabled)
+    }
+
+    @MainActor
+    func setEDREnabled(_ enabled: Bool) {
+        isEDREnabled = enabled
+        displayContainer?.setEDREnabled(enabled)
+        isHDRActive = isHDRContent && enabled
+        hdrLabel = PlaybackHUDMetrics.formatHDRTag(
+            isHDRContent: isHDRContent,
+            transferName: rawHDRTransferName,
+            isHDRActive: isHDRActive,
+            isDolbyVision: isDolbyVisionContent
+        )
     }
 
     @MainActor
@@ -1468,12 +1604,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 let tracks = try await asset.loadTracks(withMediaType: .video)
                 let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
                 guard self.isTokenValid(token) else { return }
-                guard let videoTrack = tracks.first else {
+                guard let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else {
                     self.isPaused = true
                     self.isLoadingPipeline = false
                     self.pipelineStatusText = ""
-                    self.appendLog("[ane] 未发现视频轨道（仅支持 MP4/MOV/M4V 容器）")
-                    self.errorMessage = "原生硬解引擎仅支持 MP4/MOV/M4V 容器视频。"
+                    self.appendLog("[ane] 未发现视频轨道（仅支持 MP4/MOV/M4V/TS 等系统原生容器）")
+                    self.errorMessage = "原生硬解引擎未能在该文件中找到可解码的视频轨道。"
                     return
                 }
 
@@ -1488,8 +1624,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
                 self.videoTransform = preferredTransform
                 self.displayContainer?.applyVideoTransform(preferredTransform)
+                self.displayContainer?.setAspectFill(self.isAspectFill)
+                self.displayContainer?.setEDREnabled(self.isEDREnabled)
 
                 let trackMetrics = Self.extractTrackMetrics(from: formatDescriptions.first, naturalSize: naturalSize)
+                self.setColorFallbackMetadata(from: formatDescriptions.first, trackMetrics: trackMetrics)
                 let displayDims = Self.displayDimensions(naturalSize: naturalSize, transform: preferredTransform)
                 let is4K = SuperResolutionPolicy.isAlready4K(width: displayDims.width, height: displayDims.height)
                 let effectiveSpatial2x = allowedSpatial && !is4K
@@ -1507,8 +1646,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.videoHeight = displayDims.height
                 self.videoCodec = trackMetrics.codec
                 self.bitDepthLabel = trackMetrics.bitDepth
-                self.hdrLabel = trackMetrics.hdrTag
-                self.isHDRActive = false
+                self.isHDRContent = trackMetrics.isHDR
+                self.isDolbyVisionContent = trackMetrics.isDolbyVision
+                self.rawHDRTransferName = trackMetrics.transferName
+                self.isHDRActive = trackMetrics.isHDR && self.isEDREnabled
+                self.hdrLabel = PlaybackHUDMetrics.formatHDRTag(
+                    isHDRContent: trackMetrics.isHDR,
+                    transferName: trackMetrics.transferName,
+                    isHDRActive: self.isHDRActive,
+                    isDolbyVision: trackMetrics.isDolbyVision
+                )
                 self.enableSpatial2xUpscale = effectiveSpatial2x
                 if enableInterpolation {
                     let queueLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: resolvedTargetFPS)
@@ -1532,7 +1679,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     self.usesSyntheticClock = false
                     self.clockSourceLabel = "AVPlayer音频"
                     let item: AVPlayerItem
-                    if let sourceAudio = audioTracks.first {
+                    if let sourceAudio = await Self.selectPlayableAudioTrack(from: audioTracks) {
                         do {
                             let audioComposition = AVMutableComposition()
                             guard let compTrack = audioComposition.addMutableTrack(
@@ -1716,7 +1863,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             guard let self, self.isTokenValid(token) else { return }
             let asset = AVURLAsset(url: url)
             guard let tracks = try? await asset.loadTracks(withMediaType: .video),
-                  let videoTrack = tracks.first else { return }
+                  let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else { return }
             let nominalRate = (try? await videoTrack.load(.nominalFrameRate)) ?? 0
             let naturalSize = (try? await videoTrack.load(.naturalSize)) ?? .zero
             let formatDescriptions = (try? await videoTrack.load(.formatDescriptions)) ?? []
@@ -1814,7 +1961,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         videoCodec = ""
         bitDepthLabel = "--"
         hdrLabel = "SDR"
+        isHDRContent = false
+        isDolbyVisionContent = false
+        rawHDRTransferName = nil
         isHDRActive = false
+        clearColorFallbackMetadata()
         droppedFrames = 0
         interpolatedFrameCount = 0
         failedInterpolationCount = 0
@@ -1827,6 +1978,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         pipelineStatusText = ""
         isPipelineReadyToPlay = false
         isPaused = true
+        UIApplication.shared.isIdleTimerDisabled = false
         if hadActiveSession {
             appendLog("[ane] 光流核已停止")
         }
@@ -1847,6 +1999,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func syncDisplayLinkState() {
+        UIApplication.shared.isIdleTimerDisabled = (!isPaused && currentURL != nil)
         guard let displayLink else { return }
         displayLink.isPaused = isPaused
         let targetRate: Double
@@ -1884,6 +2037,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         bufferLock.lock()
         frameQueue.removeAll()
         pendingFirstFrame = nil
+        pendingUserSwitch = nil
+        didInspectFirstDecodedColor = false
         isReaderEOF = false
         lastEnqueuedPTS = 0
         bufferLock.unlock()
@@ -1922,7 +2077,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         do {
             let asset = AVURLAsset(url: url)
             let tracks = try await asset.loadTracks(withMediaType: .video)
-            guard let videoTrack = tracks.first else {
+            guard let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else {
                 Task { @MainActor [weak self] in
                     self?.isLoadingPipeline = false
                     self?.pipelineStatusText = ""
@@ -1940,6 +2095,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             var didCachePendingFirstFrame = false
 
             func emitPassthroughFrame(_ buffer: CVPixelBuffer, ptsSeconds: Double) {
+                inspectDecodedBufferColorOnceIfNeeded(buffer, token: token)
                 if !didCachePendingFirstFrame {
                     didCachePendingFirstFrame = true
                     cachePendingFirstFrame(buffer, ptsSeconds: ptsSeconds)
@@ -1998,7 +2154,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         reader.cancelReading()
                         return
                     }
-                    while queuedCount() >= readMaxQueuedFrames() {
+                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
                         if !isTokenValid(token) {
                             reader.cancelReading()
                             return
@@ -2050,7 +2206,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         passthroughReader.cancelReading()
                         return
                     }
-                    while queuedCount() >= readMaxQueuedFrames() {
+                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
                         if !isTokenValid(token) {
                             passthroughReader.cancelReading()
                             return
@@ -2268,6 +2424,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         key: kVTDecompressionPropertyKey_RealTime,
                         value: kCFBooleanTrue
                     )
+                    _ = VTSessionSetProperty(
+                        session,
+                        key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                        value: kCFBooleanTrue
+                    )
                     logAsync("[ane] VTDecompressionSession 硬解兜底已启动 (strategy=\(candidate.strategy), pixFmt=\(Self.fourCCString(fmt)))")
                     return VTDecompressionSessionHolder(
                         session: session,
@@ -2369,11 +2530,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         var activeSpatial2x: Bool
         var pixelFormat: OSType
         let prefer10Bit: Bool
-        let requestedSpatial2x: Bool
+        var requestedSpatial2x: Bool
         var sourceWidth: Int
         var sourceHeight: Int
         var sourceFPS: Double
-        let requestedTargetFPS: OpticalFlowTargetFPS
+        var requestedTargetFPS: OpticalFlowTargetFPS
         var activeTargetFPS: OpticalFlowTargetFPS
         var phaseScheduler: OpticalFlowPhaseScheduler
         var budgetGuard: OpticalFlowBudgetGuard
@@ -2473,7 +2634,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         do {
             let asset = AVURLAsset(url: url)
             let tracks = try await asset.loadTracks(withMediaType: .video)
-            guard let videoTrack = tracks.first else {
+            guard let videoTrack = await Self.selectPrimaryVideoTrack(from: tracks) else {
                 Task { @MainActor [weak self] in
                     self?.isLoadingPipeline = false
                     self?.pipelineStatusText = ""
@@ -2624,7 +2785,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         return
                     }
 
-                    while queuedCount() >= readMaxQueuedFrames() {
+                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
                         if !isTokenValid(token) {
                             reader.cancelReading()
                             return
@@ -2683,7 +2844,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         return
                     }
 
-                    while queuedCount() >= readMaxQueuedFrames() {
+                    while queuedCount() >= readMaxQueuedFrames() && !hasPendingUserSwitch() {
                         if !isTokenValid(token) {
                             passthroughReader.cancelReading()
                             return
@@ -2978,6 +3139,207 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         passthroughCacheLock.unlock()
     }
 
+    private func enqueuePendingUserSwitch(target: OpticalFlowTargetFPS, spatial2x: Bool) {
+        bufferLock.lock()
+        pendingUserSwitch = (target: target, spatial2x: spatial2x)
+        bufferLock.unlock()
+    }
+
+    private func takePendingUserSwitch() -> (target: OpticalFlowTargetFPS, spatial2x: Bool)? {
+        bufferLock.lock()
+        let pending = pendingUserSwitch
+        pendingUserSwitch = nil
+        bufferLock.unlock()
+        return pending
+    }
+
+    private func hasPendingUserSwitch() -> Bool {
+        bufferLock.lock()
+        let hasPending = (pendingUserSwitch != nil)
+        bufferLock.unlock()
+        return hasPending
+    }
+
+    private func readIsReaderEOF() -> Bool {
+        bufferLock.lock()
+        let eof = isReaderEOF
+        bufferLock.unlock()
+        return eof
+    }
+
+    private func setColorFallbackMetadata(
+        from formatDescription: CMFormatDescription?,
+        trackMetrics: (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String, isHDR: Bool, isDolbyVision: Bool, transferName: String?)
+    ) {
+        var meta = TrackColorFallbackMetadata()
+        meta.isHDR = trackMetrics.isHDR
+        meta.isDolbyVision = trackMetrics.isDolbyVision
+        if let desc = formatDescription,
+           let ext = CMFormatDescriptionGetExtensions(desc) as? [String: Any] {
+            if let primaries = ext[kCMFormatDescriptionExtension_ColorPrimaries as String] as? String {
+                meta.colorPrimaries = primaries as CFString
+            }
+            if let transfer = ext[kCMFormatDescriptionExtension_TransferFunction as String] as? String {
+                meta.transferFunction = transfer as CFString
+            }
+            if let matrix = ext[kCMFormatDescriptionExtension_YCbCrMatrix as String] as? String {
+                meta.ycbcrMatrix = matrix as CFString
+            }
+            if let mdcv = ext[kCMFormatDescriptionExtension_MasteringDisplayColorVolume as String] as? Data {
+                meta.masteringDisplayColorVolume = mdcv as CFData
+            }
+            if let clli = ext[kCMFormatDescriptionExtension_ContentLightLevelInfo as String] as? Data {
+                meta.contentLightLevelInfo = clli as CFData
+            }
+            if let ave = ext[kCMFormatDescriptionExtension_AmbientViewingEnvironment as String] as? Data {
+                meta.ambientViewingEnvironment = ave as CFData
+            }
+        }
+        bufferLock.lock()
+        colorFallbackMetadata = meta
+        bufferLock.unlock()
+    }
+
+    private func readColorFallbackMetadata() -> TrackColorFallbackMetadata {
+        bufferLock.lock()
+        let meta = colorFallbackMetadata
+        bufferLock.unlock()
+        return meta
+    }
+
+    private func clearColorFallbackMetadata() {
+        bufferLock.lock()
+        colorFallbackMetadata = TrackColorFallbackMetadata()
+        didInspectFirstDecodedColor = false
+        bufferLock.unlock()
+    }
+
+    private func inspectDecodedBufferColorOnceIfNeeded(_ buffer: CVPixelBuffer, token: UUID) {
+        bufferLock.lock()
+        let alreadyChecked = didInspectFirstDecodedColor
+        if !alreadyChecked {
+            didInspectFirstDecodedColor = true
+        }
+        bufferLock.unlock()
+        guard !alreadyChecked else { return }
+
+        let info = Self.inspectPixelBufferColorInfo(buffer)
+        Task { @MainActor [weak self] in
+            guard let self, self.isTokenValid(token) else { return }
+            if self.bitDepthLabel == "--", let depth = info.bitDepth {
+                self.bitDepthLabel = depth
+            }
+            if info.isHDR && !self.isHDRContent {
+                self.isHDRContent = true
+                if self.rawHDRTransferName == nil {
+                    self.rawHDRTransferName = info.transferName
+                }
+                self.isHDRActive = self.isEDREnabled
+                self.hdrLabel = PlaybackHUDMetrics.formatHDRTag(
+                    isHDRContent: true,
+                    transferName: self.rawHDRTransferName,
+                    isHDRActive: self.isHDRActive,
+                    isDolbyVision: self.isDolbyVisionContent
+                )
+            }
+        }
+    }
+
+    nonisolated static func inspectPixelBufferColorInfo(
+        _ buffer: CVPixelBuffer
+    ) -> (isHDR: Bool, transferName: String?, bitDepth: String?) {
+        let fmtStr = fourCCString(CVPixelBufferGetPixelFormatType(buffer))
+        let parsedDepth = PlaybackHUDMetrics.parseBitDepth(fromPixelFormat: fmtStr)
+        let transferRef = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil)
+        let transferName = transferRef as? String
+        let lower = (transferName ?? "").lowercased()
+        let isHDR = lower.contains("2084") || lower.contains("pq") || lower.contains("hlg") || lower.contains("2100")
+        return (isHDR, transferName, parsedDepth == "--" ? nil : parsedDepth)
+    }
+
+    private static func selectPrimaryVideoTrack(from tracks: [AVAssetTrack]) async -> AVAssetTrack? {
+        guard tracks.count > 1 else { return tracks.first }
+        var scored: [(track: AVAssetTrack, score: Double)] = []
+        scored.reserveCapacity(tracks.count)
+        for track in tracks {
+            let isEnabled = (try? await track.load(.isEnabled)) ?? true
+            let isPlayable = (try? await track.load(.isPlayable)) ?? true
+            let rate = (try? await track.load(.nominalFrameRate)) ?? 0
+            let size = (try? await track.load(.naturalSize)) ?? .zero
+            let descs = (try? await track.load(.formatDescriptions)) ?? []
+            var score = Double(abs(size.width * size.height))
+            if !isEnabled { score *= 0.1 }
+            if !isPlayable { score *= 0.25 }
+            if rate > 1.0 { score += 1_000_000.0 }
+            if let desc = descs.first {
+                let sub = CMFormatDescriptionGetMediaSubType(desc)
+                let fcc = fourCCString(sub).lowercased()
+                if fcc == "jpeg" || fcc == "mjpa" || fcc == "png" {
+                    score = -1.0
+                } else if fcc == "dvh1" || fcc == "dvhe" {
+                    score += 500_000.0
+                }
+            }
+            scored.append((track: track, score: score))
+        }
+        return scored.max(by: { $0.score < $1.score })?.track ?? tracks.first
+    }
+
+    private static func selectPlayableAudioTrack(from tracks: [AVAssetTrack]) async -> AVAssetTrack? {
+        guard tracks.count > 1 else { return tracks.first }
+        for track in tracks {
+            let isPlayable = (try? await track.load(.isPlayable)) ?? true
+            let isEnabled = (try? await track.load(.isEnabled)) ?? true
+            if isPlayable && isEnabled {
+                return track
+            }
+        }
+        return tracks.first
+    }
+
+    @MainActor
+    func updateTargetConfiguration(targetFPS: OpticalFlowTargetFPS, spatial2x: Bool) {
+        requestedTargetFPS = targetFPS
+        effectiveTargetFPS = targetFPS
+        let is4K = SuperResolutionPolicy.isAlready4K(width: videoWidth, height: videoHeight)
+        let allowedSpatial = isInterpolationEnabled && spatial2x && targetFPS.allowsSpatial2x && !is4K
+        enableSpatial2xUpscale = allowedSpatial
+        let safeSrc = sourceFPS > 1.0 ? sourceFPS : 24.0
+        interpolatedFPS = isInterpolationEnabled
+            ? targetFPS.effectiveTargetFPS(sourceFPS: safeSrc)
+            : safeSrc
+        syncDisplayLinkState()
+
+#if !targetEnvironment(simulator)
+        if isInterpolationEnabled,
+           currentURL != nil,
+           !isPaused,
+           !isLoadingPipeline,
+           errorMessage == nil,
+           !readIsReaderEOF() {
+            let resolvedTargetFPS = targetFPS.effectiveTargetFPS(sourceFPS: safeSrc)
+            let newLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(targetFPS: resolvedTargetFPS)
+            if newLimits.maxQueued > readMaxQueuedFrames() {
+                updateQueueLimits(maxQueued: newLimits.maxQueued, prebuffer: newLimits.prebuffer)
+            }
+            enqueuePendingUserSwitch(target: targetFPS, spatial2x: allowedSpatial)
+            appendLog("[ane][switch] 请求在线切换目标档位: \(targetFPS.shortBadge) (spatial2x=\(allowedSpatial))")
+            return
+        }
+#endif
+
+        if let url = currentURL {
+            load(
+                url: url,
+                spatial2x: spatial2x,
+                targetFPS: targetFPS,
+                startAt: currentTime,
+                autoPlay: !isPaused,
+                enableInterpolation: isInterpolationEnabled
+            )
+        }
+    }
+
     private func readPrebufferFrameTarget() -> Int {
         bufferLock.lock()
         let value = prebufferFrameTarget
@@ -3207,6 +3569,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         state.transferSession = activated.transferSession
         state.previousBuffer = nil
         state.previousPTS = .invalid
+        state.totalInterpolationMs = 0
+        state.localBatchCount = 0
         state.localConsecutiveFailures = 0
         state.didRetryWithNormalizationOnCurrentCandidate = false
         state.frcNeedsRandomSubmission = true
@@ -3360,6 +3724,61 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     }
 
+    private func applyUserSwitchInPlace(
+        target: OpticalFlowTargetFPS,
+        requestedSpatial2x: Bool,
+        state: OpticalFlowPipelineState,
+        token: UUID
+    ) {
+        let is4K = SuperResolutionPolicy.isAlready4K(width: state.sourceWidth, height: state.sourceHeight)
+        let allowedSpatial = requestedSpatial2x && target.allowsSpatial2x && !is4K
+        state.requestedTargetFPS = target
+        state.requestedSpatial2x = allowedSpatial
+        state.interpolationExhausted = false
+        state.budgetGuard.reset()
+        state.localConsecutiveFailures = 0
+        state.didLogCatchUp = false
+
+        var candidateTierOpt: OpticalFlowTargetFPS? = target
+        while let tier = candidateTierOpt {
+            let tierSpatial2x = allowedSpatial && tier.allowsSpatial2x
+            let tierCandidates = buildCandidatePlanForDevice(
+                sourceWidth: state.sourceWidth,
+                sourceHeight: state.sourceHeight,
+                requestedSpatial2x: tierSpatial2x,
+                targetFPS: tier,
+                sourceFPS: state.sourceFPS
+            )
+            if let activated = activateCandidate(
+                in: tierCandidates,
+                startingAt: 0,
+                prefer10Bit: state.prefer10Bit
+            ) {
+                let resolvedTargetFPS = tier.effectiveTargetFPS(sourceFPS: state.sourceFPS)
+                let queueLimits = OpticalFlowResolutionPlanner.recommendedQueueLimits(
+                    targetFPS: resolvedTargetFPS,
+                    isHeavyPixelFormat: OpticalFlowResolutionPlanner.isHeavyPixelFormat(activated.pixelFormat)
+                )
+                updateQueueLimits(maxQueued: queueLimits.maxQueued, prebuffer: queueLimits.prebuffer)
+                state.candidates = tierCandidates
+                state.activeTargetFPS = tier
+                state.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: tier, sourceFPS: state.sourceFPS)
+                state.awaitingClockCatchUpAfterSwitch = true
+                applyActivatedSession(activated, to: state, token: token, reason: "在线档位切换")
+                Task { @MainActor [weak self] in
+                    guard let self, self.isTokenValid(token) else { return }
+                    self.effectiveTargetFPS = tier
+                    self.interpolatedFPS = resolvedTargetFPS
+                    self.enableSpatial2xUpscale = activated.candidate.spatial2x
+                    self.syncDisplayLinkState()
+                }
+                logAsync("[ane][switch] 在线切换光流档位 -> \(tier.shortBadge) (\(activated.candidate.displayLabel))")
+                return
+            }
+            candidateTierOpt = tier.nextLowerTier
+        }
+    }
+
     private func processDecodedFrame(
         _ frameBox: SendablePixelBuffer,
         currentPTS: CMTime,
@@ -3368,6 +3787,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     ) async throws {
         guard isTokenValid(token) else { return }
         let currentBuffer = frameBox.buffer
+        inspectDecodedBufferColorOnceIfNeeded(currentBuffer, token: token)
+
+        if let pendingSwitch = takePendingUserSwitch() {
+            applyUserSwitchInPlace(
+                target: pendingSwitch.target,
+                requestedSpatial2x: pendingSwitch.spatial2x,
+                state: state,
+                token: token
+            )
+        }
 
         if !state.didCheckActualDimensions {
             state.didCheckActualDimensions = true
@@ -3888,7 +4317,29 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 #endif
 
+    private func backfillHDRColorAttachmentsIfNeeded(on pixelBuffer: CVPixelBuffer) {
+        let meta = readColorFallbackMetadata()
+        guard meta.isHDR || meta.isDolbyVision else { return }
+        if CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) == nil {
+            let primaries = meta.colorPrimaries ?? kCVImageBufferColorPrimaries_ITU_R_2020
+            let transfer = meta.transferFunction ?? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+            let matrix = meta.ycbcrMatrix ?? kCVImageBufferYCbCrMatrix_ITU_R_2020
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+        }
+        if let mdcv = meta.masteringDisplayColorVolume,
+           CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) == nil {
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, mdcv, .shouldPropagate)
+        }
+        if let clli = meta.contentLightLevelInfo,
+           CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) == nil {
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, clli, .shouldPropagate)
+        }
+    }
+
     func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, ptsSeconds: Double) -> CMSampleBuffer? {
+        backfillHDRColorAttachmentsIfNeeded(on: pixelBuffer)
         var formatDesc: CMVideoFormatDescription?
         let descStatus = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
@@ -3940,42 +4391,47 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         return (w, h)
     }
 
-    private static func shouldPrefer10Bit(from metrics: (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String)) -> Bool {
-        metrics.bitDepth == "10-bit" || metrics.hdrTag != "SDR"
+    private static func shouldPrefer10Bit(
+        from metrics: (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String, isHDR: Bool, isDolbyVision: Bool, transferName: String?)
+    ) -> Bool {
+        metrics.bitDepth == "10-bit" || metrics.isHDR || metrics.isDolbyVision || metrics.hdrTag != "SDR"
     }
 
     private static func extractTrackMetrics(
         from formatDescription: CMFormatDescription?,
         naturalSize: CGSize
-    ) -> (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String) {
+    ) -> (width: Int, height: Int, codec: String, bitDepth: String, hdrTag: String, isHDR: Bool, isDolbyVision: Bool, transferName: String?) {
         let width = Int(abs(naturalSize.width))
         let height = Int(abs(naturalSize.height))
         guard let desc = formatDescription else {
-            return (width, height, "", "--", "SDR")
+            return (width, height, "", "--", "SDR", false, false, nil)
         }
 
         let subType = CMFormatDescriptionGetMediaSubType(desc)
         let codec = fourCCString(subType)
         let extensions = CMFormatDescriptionGetExtensions(desc) as? [String: Any]
+        let atoms = extensions?[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String] as? [String: Any]
+        let isDolbyVision = HEVCFormatNormalizer.isDolbyVision(subType: subType, atoms: atoms)
         let transfer = extensions?[kCMFormatDescriptionExtension_TransferFunction as String] as? String
         let transferLower = (transfer ?? "").lowercased()
-        let isHDR = transferLower.contains("2084") || transferLower.contains("pq") || transferLower.contains("hlg")
+        let isHDR = isDolbyVision || transferLower.contains("2084") || transferLower.contains("pq") || transferLower.contains("hlg")
         let hdrTag = PlaybackHUDMetrics.formatHDRTag(
             isHDRContent: isHDR,
             transferName: transfer,
-            isHDRActive: false
+            isHDRActive: false,
+            isDolbyVision: isDolbyVision
         )
 
         let bitDepth: String
         if let bpc = extensions?[kCMFormatDescriptionExtension_BitsPerComponent as String] as? Int, bpc > 0 {
             bitDepth = "\(bpc)-bit"
-        } else if isHDR {
+        } else if isHDR || isDolbyVision {
             bitDepth = "10-bit"
         } else {
             bitDepth = "--"
         }
 
-        return (width, height, codec, bitDepth, hdrTag)
+        return (width, height, codec, bitDepth, hdrTag, isHDR, isDolbyVision, transfer)
     }
 
     nonisolated static func formatDetailedError(_ error: Error?) -> String {
@@ -4010,6 +4466,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             if includeIOMetal {
                 for (k, v) in ioMetalBase {
                     settings[k] = v
+                }
+                if prefer10Bit && (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || format == kCVPixelFormatType_32BGRA) {
+                    settings[AVVideoAllowWideColorKey] = true
                 }
             }
             tiers.append((label: label, pixelFormat: format, settings: settings))

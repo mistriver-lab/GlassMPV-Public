@@ -26,9 +26,11 @@ final class PlayerCoordinator: ObservableObject {
     @Published var interpolationMode: InterpolationMode = .vtOpticalFlow
     @Published var opticalFlowTargetFPS: OpticalFlowTargetFPS = .x2
     @Published var vtSpatial2x: Bool = false
+    @Published var isEDREnabled: Bool = true
+    @Published var isAspectFill: Bool = false
+    @Published var isLooping: Bool = true
     @Published var speed: Double = 1.0
     @Published var currentURL: URL?
-    @Published var isGeneratingSample: Bool = false
     @Published var isImportingFile: Bool = false
     @Published var selfCheckReport: String = ""
     @Published var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
@@ -47,6 +49,10 @@ final class PlayerCoordinator: ObservableObject {
     }()
 
     init() {
+        opticalFlowController.setEDREnabled(isEDREnabled)
+        opticalFlowController.setAspectFill(isAspectFill)
+        opticalFlowController.isLoopingEnabled = isLooping
+
         thermalToken.observer = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
             object: nil,
@@ -85,12 +91,12 @@ final class PlayerCoordinator: ObservableObject {
 
     var currentEnhancementSummary: String {
         guard interpolationMode == .vtOpticalFlow else {
-            return "原帧率直通"
+            return "原帧率"
         }
         if vtSpatial2x && opticalFlowTargetFPS.allowsSpatial2x {
-            return "光流 \(opticalFlowTargetFPS.shortBadge) + 超分2×"
+            return "\(opticalFlowTargetFPS.shortBadge) + 2×超分"
         }
-        return "光流 \(opticalFlowTargetFPS.shortBadge)"
+        return opticalFlowTargetFPS.shortBadge
     }
 
     var hudMetrics: PlaybackHUDMetrics {
@@ -214,7 +220,6 @@ final class PlayerCoordinator: ObservableObject {
         opticalFlowController.stop()
         currentURL = nil
         isImportingFile = false
-        isGeneratingSample = false
         OrientationController.shared.returnToHomeOrientation()
     }
 
@@ -303,6 +308,7 @@ final class PlayerCoordinator: ObservableObject {
         let engineLabel = interpolationMode == .vtOpticalFlow ? "ANE 光流核" : "原生硬解直通"
         let telemetrySummary = [
             "Interpolation Verdict: \(verdict.shortLabel) | \(verdict.detailText)",
+            "HDR/EDR: \(metrics.hdrTag) (edr=\(isEDREnabled ? "ON" : "OFF"), active=\(metrics.isHDRActive ? "YES" : "NO")) | Fill=\(isAspectFill ? "Fill" : "Fit") | Loop=\(isLooping ? "ON" : "OFF")",
             "ANE Target: \(opticalFlowController.targetSummaryBadge) (requested=\(opticalFlowController.requestedTargetFPS.shortBadge), effective=\(opticalFlowController.effectiveTargetFPS.shortBadge)) | ANE Backend: \(opticalFlowController.activeBackendLabel) | Clock: \(opticalFlowController.clockSourceLabel) | spatial2x=\(opticalFlowController.enableSpatial2xUpscale ? "ON" : "OFF")",
             "ANE Counters: interpolated=\(opticalFlowController.interpolatedFrameCount) | skipped=\(opticalFlowController.skippedInterpolationCount) | failed=\(opticalFlowController.failedInterpolationCount) | presented=\(opticalFlowController.presentedFrameCount) | avgMs=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | queueDepth=\(opticalFlowController.currentQueueDepthSnapshot()) | avDelta=\(opticalFlowController.latestAVDeltaMs.map { String(format: "%+.1fms", $0) } ?? "--")"
         ]
@@ -317,25 +323,6 @@ final class PlayerCoordinator: ObservableObject {
             telemetrySummary: telemetrySummary,
             mediaFilename: currentURL?.lastPathComponent ?? ""
         )
-    }
-
-    func playBuiltInSampleVideo() {
-        guard !isGeneratingSample else { return }
-        isGeneratingSample = true
-        opticalFlowController.clearError()
-        opticalFlowController.appendLog("[sample] 开始生成内置 3 秒自测视频...")
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let sampleURL = try await TestVideoGenerator.generateSampleMP4()
-                self.isGeneratingSample = false
-                self.open(url: sampleURL, isSecurityScoped: false)
-            } catch {
-                self.isGeneratingSample = false
-                self.opticalFlowController.recordExternalError("内置测试视频生成失败：\(error.localizedDescription)")
-            }
-        }
     }
 
     func retryWithoutInterpolation() {
@@ -369,11 +356,11 @@ final class PlayerCoordinator: ObservableObject {
             }
         }()
 
-        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 模式=\(interpolationMode.rawValue) | 目标=\(opticalFlowController.targetSummaryBadge) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
+        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 模式=\(interpolationMode.rawValue) | HDR=\(opticalFlowController.hdrLabel)(EDR=\(isEDREnabled ? "ON" : "OFF")) | 目标=\(opticalFlowController.targetSummaryBadge) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
 
         let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许2×空间超分"
         let lines = [
-            "=== GlassMPV 真机 4 项体检报告 ===",
+            "=== GlassMPV 运行状态摘要 ===",
             "版本: \(AppReleaseInfo.displayVersion) | 模式: \(interpolationMode.rawValue) | 4K超分门控: \(gateStatus) | 补帧判定: \(verdict.shortLabel) (\(verdict.detailText))",
             "1. 屏幕 ProMotion 上限: \(maxScreenFPS) Hz \(maxScreenFPS >= 120 ? "(PASS)" : "(非120Hz)")",
             "2. 本地/相册导入沙盒通道: \(importCheck)",
@@ -381,6 +368,23 @@ final class PlayerCoordinator: ObservableObject {
             "4. 黑匣子采样: 共 \(runtimeTimeline.count) 条（最近判定=\(runtimeTimeline.last?.verdictLabel ?? "无")）"
         ]
         selfCheckReport = lines.joined(separator: "\n")
+    }
+
+    func selectFrameRateOption(_ target: OpticalFlowTargetFPS?) {
+        guard let target else {
+            setInterpolation(.off)
+            return
+        }
+        if interpolationMode == .off {
+            opticalFlowTargetFPS = target
+            if !target.allowsSpatial2x && vtSpatial2x {
+                vtSpatial2x = false
+            }
+            recordUISwitch("selectFrameRateOption(fromOff) -> \(target.shortBadge)")
+            setInterpolation(.vtOpticalFlow)
+        } else {
+            setOpticalFlowTargetFPS(target)
+        }
     }
 
     func setInterpolation(_ mode: InterpolationMode) {
@@ -413,16 +417,8 @@ final class PlayerCoordinator: ObservableObject {
         }
         let wasPaused = opticalFlowController.isPaused
         recordUISwitch("setOpticalFlowTargetFPS \(previousTarget.shortBadge) -> \(target.shortBadge) (paused=\(wasPaused))")
-        if interpolationMode == .vtOpticalFlow, let url = currentURL {
-            let t = opticalFlowController.currentTime
-            opticalFlowController.load(
-                url: url,
-                spatial2x: vtSpatial2x,
-                targetFPS: target,
-                startAt: t,
-                autoPlay: !wasPaused,
-                enableInterpolation: true
-            )
+        if interpolationMode == .vtOpticalFlow {
+            opticalFlowController.updateTargetConfiguration(targetFPS: target, spatial2x: vtSpatial2x)
             opticalFlowController.setSpeed(speed)
         }
     }
@@ -445,18 +441,31 @@ final class PlayerCoordinator: ObservableObject {
         vtSpatial2x = enabled
         let wasPaused = opticalFlowController.isPaused
         recordUISwitch("setVTSpatial2x(\(enabled)) (paused=\(wasPaused))")
-        if interpolationMode == .vtOpticalFlow, let url = currentURL {
-            let t = opticalFlowController.currentTime
-            opticalFlowController.load(
-                url: url,
-                spatial2x: enabled,
-                targetFPS: opticalFlowTargetFPS,
-                startAt: t,
-                autoPlay: !wasPaused,
-                enableInterpolation: true
-            )
+        if interpolationMode == .vtOpticalFlow {
+            opticalFlowController.updateTargetConfiguration(targetFPS: opticalFlowTargetFPS, spatial2x: enabled)
             opticalFlowController.setSpeed(speed)
         }
+    }
+
+    func setEDREnabled(_ enabled: Bool) {
+        guard enabled != isEDREnabled else { return }
+        isEDREnabled = enabled
+        recordUISwitch("setEDREnabled(\(enabled))")
+        opticalFlowController.setEDREnabled(enabled)
+    }
+
+    func setAspectFill(_ enabled: Bool) {
+        guard enabled != isAspectFill else { return }
+        isAspectFill = enabled
+        recordUISwitch("setAspectFill(\(enabled))")
+        opticalFlowController.setAspectFill(enabled)
+    }
+
+    func setLooping(_ enabled: Bool) {
+        guard enabled != isLooping else { return }
+        isLooping = enabled
+        recordUISwitch("setLooping(\(enabled))")
+        opticalFlowController.isLoopingEnabled = enabled
     }
 
     func setSpeed(_ value: Double) {
@@ -493,6 +502,9 @@ final class PlayerCoordinator: ObservableObject {
 
     private func startPlayback(seekTo: Double = 0, autoPlay: Bool = true) {
         guard let url = currentURL else { return }
+        opticalFlowController.setEDREnabled(isEDREnabled)
+        opticalFlowController.setAspectFill(isAspectFill)
+        opticalFlowController.isLoopingEnabled = isLooping
         let enableInterp = (interpolationMode == .vtOpticalFlow)
         opticalFlowController.load(
             url: url,
@@ -506,12 +518,96 @@ final class PlayerCoordinator: ObservableObject {
     }
 }
 
+// MARK: - Shared Frame-Rate Pill Strip
+
+private struct FrameRatePillStrip: View {
+    @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject var optical: OpticalFlowPlayerController
+    var compact: Bool = false
+    var onInteraction: () -> Void = {}
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: compact ? 6 : 8) {
+                pillButton(
+                    title: "原帧",
+                    isSelected: coordinator.interpolationMode == .off,
+                    accent: .white
+                ) {
+                    coordinator.selectFrameRateOption(nil)
+                    onInteraction()
+                }
+
+                ForEach(OpticalFlowTargetFPS.allCases) { tier in
+                    let isSelected = (coordinator.interpolationMode == .vtOpticalFlow && coordinator.opticalFlowTargetFPS == tier)
+                    let isEffectiveLower = isSelected
+                        && coordinator.currentURL != nil
+                        && optical.effectiveTargetFPS != tier
+                    let label = isEffectiveLower
+                        ? "\(tier.pillTitle)→\(optical.effectiveTargetFPS.pillTitle)"
+                        : tier.pillTitle
+
+                    pillButton(
+                        title: label,
+                        isSelected: isSelected,
+                        accent: .cyan
+                    ) {
+                        coordinator.selectFrameRateOption(tier)
+                        onInteraction()
+                    }
+                }
+
+                if coordinator.interpolationMode == .vtOpticalFlow
+                    && coordinator.opticalFlowTargetFPS.allowsSpatial2x
+                    && !coordinator.isSuperResolutionDisabledBy4K {
+                    pillButton(
+                        title: "2×超分",
+                        isSelected: coordinator.vtSpatial2x,
+                        accent: .indigo
+                    ) {
+                        coordinator.setVTSpatial2x(!coordinator.vtSpatial2x)
+                        onInteraction()
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    private func pillButton(
+        title: String,
+        isSelected: Bool,
+        accent: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: compact ? 12 : 13, weight: isSelected ? .bold : .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(isSelected ? .black : .white.opacity(0.88))
+                .padding(.horizontal, compact ? 11 : 13)
+                .padding(.vertical, compact ? 6 : 8)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(isSelected ? accent : Color.white.opacity(0.11))
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(isSelected ? accent.opacity(0.9) : Color.white.opacity(0.14), lineWidth: 0.7)
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .contentShape(Capsule())
+    }
+}
+
 struct LiquidGlassPlayerView: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject private var optical: OpticalFlowPlayerController
 
     @State private var showHUD: Bool = true
-    @State private var showStatsHUD: Bool = true
+    @State private var showStatsHUD: Bool = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
@@ -520,6 +616,7 @@ struct LiquidGlassPlayerView: View {
     @State private var showDiagnosticSheet: Bool = false
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
+    @State private var hudAutoHideTask: Task<Void, Never>?
 
     init(coordinator: PlayerCoordinator) {
         self.coordinator = coordinator
@@ -535,8 +632,13 @@ struct LiquidGlassPlayerView: View {
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.22)) {
+                        withAnimation(.easeInOut(duration: 0.2)) {
                             showHUD.toggle()
+                        }
+                        if showHUD {
+                            scheduleHUDAutoHide()
+                        } else {
+                            hudAutoHideTask?.cancel()
                         }
                     }
             }
@@ -547,7 +649,7 @@ struct LiquidGlassPlayerView: View {
                 if optical.errorMessage == nil,
                    (optical.isLoadingPipeline || optical.presentedFrameCount == 0) {
                     loadingStatusPill(
-                        optical.pipelineStatusText.isEmpty ? "正在预热 ANE 光流缓冲..." : optical.pipelineStatusText
+                        optical.pipelineStatusText.isEmpty ? "正在预热视频管线..." : optical.pipelineStatusText
                     )
                 }
 
@@ -560,9 +662,9 @@ struct LiquidGlassPlayerView: View {
                         Spacer()
                     }
                     .padding(.horizontal, 16)
-                    .padding(.top, showHUD ? 64 : 12)
+                    .padding(.top, showHUD ? 60 : 14)
                     .allowsHitTesting(false)
-                    .animation(.easeInOut(duration: 0.22), value: showHUD)
+                    .animation(.easeInOut(duration: 0.2), value: showHUD)
                     .transition(.opacity)
                 }
 
@@ -573,7 +675,7 @@ struct LiquidGlassPlayerView: View {
             }
 
             if coordinator.isImportingFile {
-                loadingStatusPill("正在导入视频至沙盒...")
+                loadingStatusPill("正在导入视频...")
             }
 
             if let error = optical.errorMessage {
@@ -584,6 +686,34 @@ struct LiquidGlassPlayerView: View {
             guard let newItem else { return }
             selectedPhotoItem = nil
             coordinator.importFromPhotosItem(newItem)
+        }
+        .onChange(of: coordinator.currentURL) { _, newURL in
+            if newURL != nil {
+                showHUD = true
+                scheduleHUDAutoHide()
+            } else {
+                hudAutoHideTask?.cancel()
+            }
+        }
+        .onChange(of: optical.isPaused) { _, paused in
+            if paused {
+                hudAutoHideTask?.cancel()
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showHUD = true
+                }
+            } else if showHUD {
+                scheduleHUDAutoHide()
+            }
+        }
+        .onChange(of: showEnhancementSheet) { _, presented in
+            if !presented && showHUD {
+                scheduleHUDAutoHide()
+            }
+        }
+        .onChange(of: showDiagnosticSheet) { _, presented in
+            if !presented && showHUD {
+                scheduleHUDAutoHide()
+            }
         }
         .alert("打开网络视频流", isPresented: $showURLPrompt) {
             TextField("https:// 视频地址", text: $streamURLInput)
@@ -614,121 +744,167 @@ struct LiquidGlassPlayerView: View {
         }
     }
 
-    // MARK: - Welcome Empty State
+    private func scheduleHUDAutoHide() {
+        hudAutoHideTask?.cancel()
+        guard coordinator.currentURL != nil,
+              !coordinator.activePaused,
+              !isScrubbing,
+              !showEnhancementSheet,
+              !showDiagnosticSheet else {
+            return
+        }
+        hudAutoHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(4.5))
+            guard !Task.isCancelled,
+                  coordinator.currentURL != nil,
+                  !coordinator.activePaused,
+                  !isScrubbing,
+                  !showEnhancementSheet,
+                  !showDiagnosticSheet else {
+                return
+            }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                showHUD = false
+            }
+        }
+    }
+
+    // MARK: - Minimalist Liquid Glass Home
 
     private var welcomeOverlay: some View {
-        GlassEffectContainer(spacing: 16) {
-            VStack(spacing: 16) {
-                VStack(spacing: 8) {
-                    Image(systemName: "sparkles.tv")
-                        .font(.system(size: 46, weight: .semibold))
-                        .foregroundStyle(.cyan)
-                    Text("GlassMPV")
-                        .font(.largeTitle.bold())
-                    Text("VideoToolbox ANE 硬件光流真补帧 · 120Hz ProMotion")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .padding(24)
-                .glassEffect(.regular, in: .rect(cornerRadius: 28))
+        ScrollView(showsIndicators: false) {
+            GlassEffectContainer(spacing: 16) {
+                VStack(spacing: 16) {
+                    VStack(spacing: 12) {
+                        ZStack {
+                            Circle()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color.cyan.opacity(0.32), Color.indigo.opacity(0.28)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: 64, height: 64)
+                            Image(systemName: "sparkles.tv")
+                                .font(.system(size: 30, weight: .semibold))
+                                .foregroundStyle(.cyan)
+                        }
 
-                HStack(spacing: 12) {
+                        VStack(spacing: 4) {
+                            Text("GlassMPV")
+                                .font(.largeTitle.bold())
+                            Text("ANE 硬件光流 · 杜比视界 HDR · 120Hz ProMotion")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("默认补帧预设")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(coordinator.currentEnhancementSummary)
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.cyan)
+                            }
+                            FrameRatePillStrip(
+                                coordinator: coordinator,
+                                optical: optical,
+                                compact: true
+                            )
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(20)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 28))
+
+                    HStack(spacing: 12) {
+                        Button {
+                            coordinator.presentLocalVideoPicker()
+                        } label: {
+                            Label("本地文件", systemImage: "folder.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Capsule())
+                        .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+
+                        PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
+                            Label("系统相册", systemImage: "photo.on.rectangle.angled")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Capsule())
+                        .glassEffect(.regular.tint(.indigo).interactive(), in: .capsule)
+                    }
+
                     Button {
-                        coordinator.presentLocalVideoPicker()
+                        showURLPrompt = true
                     } label: {
-                        Label("打开本地视频", systemImage: "folder.badge.plus")
-                            .font(.headline)
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 13)
+                        Label("打开网络串流 URL", systemImage: "link")
+                            .font(.subheadline.weight(.medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
                     .contentShape(Capsule())
-                    .glassEffect(.regular.tint(.cyan).interactive(), in: .capsule)
+                    .glassEffect(.regular.interactive(), in: .capsule)
 
-                    PhotosPicker(selection: $selectedPhotoItem, matching: .videos, photoLibrary: .shared()) {
-                        Label("从相册选取", systemImage: "photo.on.rectangle.angled")
-                            .font(.headline)
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 13)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.tint(.indigo).interactive(), in: .capsule)
-                }
-
-                Button {
-                    showURLPrompt = true
-                } label: {
-                    Label("网络串流", systemImage: "link")
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 11)
-                }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .capsule)
-
-                Button {
-                    coordinator.playBuiltInSampleVideo()
-                } label: {
-                    HStack(spacing: 8) {
-                        if coordinator.isGeneratingSample {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: "play.circle.fill")
+                    HStack(spacing: 10) {
+                        Button {
+                            showEnhancementSheet = true
+                        } label: {
+                            Label("播控设置", systemImage: "slider.horizontal.3")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
                         }
-                        Text(coordinator.isGeneratingSample ? "正在生成内置测试视频..." : "一键自测（内置 3 秒测试视频）")
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 11)
-                }
-                .buttonStyle(.plain)
-                .disabled(coordinator.isGeneratingSample)
-                .glassEffect(.regular.tint(.green).interactive(), in: .capsule)
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
 
-                HStack(spacing: 10) {
-                    Button {
-                        showEnhancementSheet = true
-                    } label: {
-                        Label("补帧：\(coordinator.currentEnhancementSummary)", systemImage: "wand.and.stars")
-                            .font(.footnote.weight(.medium))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .capsule)
+                        Button {
+                            showDiagnosticSheet = true
+                        } label: {
+                            Label("运行日志", systemImage: "waveform.path.ecg")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
 
-                    Button {
-                        showDiagnosticSheet = true
-                    } label: {
-                        Label("诊断日志", systemImage: "stethoscope")
-                            .font(.footnote.weight(.medium))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
+                        Button {
+                            showChangelogSheet = true
+                        } label: {
+                            Label("v\(AppReleaseInfo.shortVersion)", systemImage: "doc.text")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
                     }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .capsule)
                 }
-
-                Button {
-                    showChangelogSheet = true
-                } label: {
-                    Label("GlassMPV \(AppReleaseInfo.displayVersion) · 更新日志", systemImage: "doc.text")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .capsule)
+                .frame(maxWidth: 500)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 28)
             }
-            .padding()
+            .frame(maxWidth: .infinity)
         }
     }
 
-    // MARK: - Liquid Glass Floating HUD
+    // MARK: - Clean Floating Player HUD
 
     private var playerHUDOverlay: some View {
         VStack {
@@ -742,11 +918,11 @@ struct LiquidGlassPlayerView: View {
 
             Spacer()
 
-            VStack(spacing: 12) {
+            VStack(spacing: 10) {
                 HStack(spacing: 10) {
                     Text(formatTime(displayTime))
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 48, alignment: .leading)
+                        .font(.caption2.monospacedDigit())
+                        .frame(width: 46, alignment: .leading)
 
                     Slider(
                         value: Binding(
@@ -754,6 +930,7 @@ struct LiquidGlassPlayerView: View {
                             set: { newVal in
                                 isScrubbing = true
                                 scrubTime = newVal
+                                hudAutoHideTask?.cancel()
                             }
                         ),
                         in: 0...max(coordinator.activeDuration, 1),
@@ -761,87 +938,143 @@ struct LiquidGlassPlayerView: View {
                             if !editing {
                                 coordinator.seek(to: scrubTime)
                                 isScrubbing = false
+                                scheduleHUDAutoHide()
                             }
                         }
                     )
                     .tint(.cyan)
 
                     Text(formatTime(coordinator.activeDuration))
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 48, alignment: .trailing)
+                        .font(.caption2.monospacedDigit())
+                        .frame(width: 46, alignment: .trailing)
                 }
 
-                HStack(spacing: 14) {
+                FrameRatePillStrip(
+                    coordinator: coordinator,
+                    optical: optical,
+                    compact: true
+                ) {
+                    scheduleHUDAutoHide()
+                }
+
+                HStack(spacing: 10) {
                     Button {
                         coordinator.seekRelative(-10)
+                        scheduleHUDAutoHide()
                     } label: {
                         Image(systemName: "gobackward.10")
-                            .font(.title3)
-                            .frame(width: 42, height: 42)
+                            .font(.callout.weight(.semibold))
+                            .frame(width: 36, height: 36)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
+                    .contentShape(Circle())
                     .glassEffect(.regular.interactive(), in: .circle)
 
                     Button {
                         coordinator.togglePlayPause()
+                        scheduleHUDAutoHide()
                     } label: {
                         Image(systemName: coordinator.activePaused ? "play.fill" : "pause.fill")
-                            .font(.title2)
-                            .frame(width: 52, height: 52)
+                            .font(.title3.weight(.semibold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
+                    .contentShape(Circle())
                     .glassEffect(.regular.tint(.cyan).interactive(), in: .circle)
 
                     Button {
                         coordinator.seekRelative(10)
+                        scheduleHUDAutoHide()
                     } label: {
                         Image(systemName: "goforward.10")
-                            .font(.title3)
-                            .frame(width: 42, height: 42)
+                            .font(.callout.weight(.semibold))
+                            .frame(width: 36, height: 36)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
+                    .contentShape(Circle())
                     .glassEffect(.regular.interactive(), in: .circle)
 
-                    Spacer()
+                    Spacer(minLength: 4)
+
+                    if optical.isHDRContent {
+                        Button {
+                            coordinator.setEDREnabled(!coordinator.isEDREnabled)
+                            scheduleHUDAutoHide()
+                        } label: {
+                            Text(coordinator.isEDREnabled ? "HDR" : "SDR")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Capsule())
+                        .glassEffect(
+                            coordinator.isEDREnabled ? .regular.tint(.yellow).interactive() : .regular.interactive(),
+                            in: .capsule
+                        )
+                    }
+
+                    Button {
+                        coordinator.setLooping(!coordinator.isLooping)
+                        scheduleHUDAutoHide()
+                    } label: {
+                        Image(systemName: "repeat")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
+                            .frame(width: 34, height: 34)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Circle())
+                    .glassEffect(
+                        coordinator.isLooping ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                        in: .circle
+                    )
 
                     Menu {
                         ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
                             Button("\(rate, specifier: "%.2g")x") {
                                 coordinator.setSpeed(rate)
+                                scheduleHUDAutoHide()
                             }
                         }
                     } label: {
                         Text("\(coordinator.speed, specifier: "%.2g")x")
                             .font(.caption.monospacedDigit().weight(.semibold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
                     }
                     .glassEffect(.regular.interactive(), in: .capsule)
 
                     Button {
+                        hudAutoHideTask?.cancel()
                         showEnhancementSheet = true
                     } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "wand.and.stars")
-                            Text("光流设置")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.callout.weight(.semibold))
+                            .frame(width: 34, height: 34)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .glassEffect(.regular.tint(.indigo).interactive(), in: .capsule)
+                    .contentShape(Circle())
+                    .glassEffect(.regular.tint(.indigo).interactive(), in: .circle)
                 }
             }
-            .padding(16)
-            .glassEffect(.regular, in: .rect(cornerRadius: 26))
+            .padding(14)
+            .glassEffect(.regular, in: .rect(cornerRadius: 24))
+            .frame(maxWidth: 680)
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
         }
     }
 
     private var toolbarActionButtons: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Button {
                 coordinator.closeToHome()
             } label: {
@@ -856,6 +1089,7 @@ struct LiquidGlassPlayerView: View {
 
             Button {
                 OrientationController.shared.toggleVideoOrientation()
+                scheduleHUDAutoHide()
             } label: {
                 Image(systemName: "rotate.right")
                     .font(.body.weight(.semibold))
@@ -867,33 +1101,34 @@ struct LiquidGlassPlayerView: View {
             .glassEffect(.regular.interactive(), in: .circle)
 
             Button {
-                showDiagnosticSheet = true
+                coordinator.setAspectFill(!coordinator.isAspectFill)
+                scheduleHUDAutoHide()
             } label: {
-                Image(systemName: "stethoscope")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 34, height: 34)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .contentShape(Circle())
-            .glassEffect(.regular.interactive(), in: .circle)
-
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    showStatsHUD.toggle()
-                }
-            } label: {
-                Image(systemName: showStatsHUD ? "info.circle.fill" : "info.circle")
-                    .font(.body.weight(.semibold))
+                Image(systemName: coordinator.isAspectFill ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(coordinator.isAspectFill ? .cyan : .primary)
                     .frame(width: 34, height: 34)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .contentShape(Circle())
             .glassEffect(
-                showStatsHUD ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                coordinator.isAspectFill ? .regular.tint(.cyan).interactive() : .regular.interactive(),
                 in: .circle
             )
+
+            Button {
+                hudAutoHideTask?.cancel()
+                showDiagnosticSheet = true
+            } label: {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.footnote.weight(.semibold))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .contentShape(Circle())
+            .glassEffect(.regular.interactive(), in: .circle)
         }
     }
 
@@ -902,10 +1137,18 @@ struct LiquidGlassPlayerView: View {
             withAnimation(.easeInOut(duration: 0.2)) {
                 showStatsHUD.toggle()
             }
+            scheduleHUDAutoHide()
         } label: {
             VStack(alignment: .trailing, spacing: 2) {
-                Text(activeResolutionText)
-                    .font(.caption2.monospacedDigit().weight(.semibold))
+                HStack(spacing: 4) {
+                    Text(activeResolutionText)
+                    if optical.hdrLabel != "SDR" {
+                        Text(optical.hdrLabel)
+                            .foregroundStyle(optical.isHDRActive ? .yellow : .orange)
+                    }
+                }
+                .font(.caption2.monospacedDigit().weight(.semibold))
+
                 Text("\(coordinator.hudMetrics.interpolationBadge) · \(activeFPSText)")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -915,7 +1158,10 @@ struct LiquidGlassPlayerView: View {
             .padding(.vertical, 6)
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .capsule)
+        .glassEffect(
+            showStatsHUD ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+            in: .capsule
+        )
     }
 
     private func compactStatsHUD(metrics: PlaybackHUDMetrics) -> some View {
@@ -991,7 +1237,7 @@ struct LiquidGlassPlayerView: View {
 
     private func playbackErrorBanner(_ message: String) -> some View {
         VStack(spacing: 12) {
-            Label("播放或光流遇到异常", systemImage: "exclamationmark.triangle.fill")
+            Label("播放遇到异常", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline)
                 .foregroundStyle(.yellow)
             Text(message)
@@ -1003,7 +1249,7 @@ struct LiquidGlassPlayerView: View {
                     Button {
                         coordinator.retryWithoutInterpolation()
                     } label: {
-                        Text("以原帧率直通重试")
+                        Text("原帧率直通重试")
                             .font(.subheadline.weight(.semibold))
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
@@ -1015,7 +1261,7 @@ struct LiquidGlassPlayerView: View {
                 Button {
                     showDiagnosticSheet = true
                 } label: {
-                    Text("查看诊断日志")
+                    Text("运行日志")
                         .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
@@ -1026,7 +1272,7 @@ struct LiquidGlassPlayerView: View {
                 Button {
                     coordinator.closeToHome()
                 } label: {
-                    Text("返回主界面")
+                    Text("返回")
                         .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
@@ -1071,7 +1317,7 @@ struct LiquidGlassPlayerView: View {
     }
 }
 
-// MARK: - Optical Flow Control Sheet
+// MARK: - Optical Flow & Playback Settings Sheet
 
 struct EnhancementControlSheet: View {
     @ObservedObject var coordinator: PlayerCoordinator
@@ -1086,26 +1332,30 @@ struct EnhancementControlSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("补帧模式（适配 iPhone 15 PM 120Hz）") {
-                    ForEach(InterpolationMode.allCases) { mode in
-                        Button {
-                            coordinator.setInterpolation(mode)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(mode.rawValue)
-                                        .foregroundStyle(.primary)
-                                    Text(interpolationHint(mode))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if coordinator.interpolationMode == mode {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(.cyan)
-                                }
-                            }
+                Section("光流补帧目标帧率（实时热切换）") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("当前模式")
+                            Spacer()
+                            Text(coordinator.interpolationMode == .vtOpticalFlow ? "光流 \(optical.targetSummaryBadge)" : "原帧率直通")
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .foregroundStyle(.cyan)
                         }
+
+                        FrameRatePillStrip(
+                            coordinator: coordinator,
+                            optical: optical,
+                            compact: false
+                        )
+
+                        Text("全档位优先 LowLatency (420v) 低功耗管线；点选 2×/60/72/96/120 或「原帧」立即切换生效，无需重建音频。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+
+                    if optical.activeBackendLabel != "--" {
+                        LabeledContent("运行后端", value: "\(optical.activeBackendLabel) (\(String(format: "%.1f", optical.actualOutputFPS)) fps)")
                     }
 
                     if let gatedReason = coordinator.superResolutionDisabledReason {
@@ -1115,79 +1365,40 @@ struct EnhancementControlSheet: View {
                     }
                 }
 
-                if coordinator.interpolationMode == .vtOpticalFlow {
-                    Section("ANE 目标帧率与 2× 硬件超分") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("ANE 目标帧率")
-                                Spacer()
-                                Text("当前 \(optical.targetSummaryBadge)")
-                                    .font(.caption.monospacedDigit().weight(.semibold))
-                                    .foregroundStyle(.cyan)
-                            }
+                Section("画质与播放开关") {
+                    Toggle("ANE 2× 空间超分（仅 2× 档位）", isOn: Binding(
+                        get: { coordinator.vtSpatial2x },
+                        set: { coordinator.setVTSpatial2x($0) }
+                    ))
+                    .disabled(
+                        coordinator.interpolationMode == .off
+                            || coordinator.isSuperResolutionDisabledBy4K
+                            || !coordinator.opticalFlowTargetFPS.allowsSpatial2x
+                    )
 
-                            Picker("ANE 目标帧率", selection: Binding(
-                                get: { coordinator.opticalFlowTargetFPS },
-                                set: { coordinator.setOpticalFlowTargetFPS($0) }
-                            )) {
-                                ForEach(OpticalFlowTargetFPS.allCases) { tier in
-                                    Text(tier.shortBadge).tag(tier)
-                                }
-                            }
-                            .pickerStyle(.segmented)
+                    Toggle("杜比视界 / HDR 峰值亮度 (EDR)", isOn: Binding(
+                        get: { coordinator.isEDREnabled },
+                        set: { coordinator.setEDREnabled($0) }
+                    ))
 
-                            Text("全档位优先 LowLatency (420v) 低功耗低内存管线；60/96/120fps 自动从 720p 起跑并按算力/温度阶梯降分辨率与目标帧率")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 2)
+                    Toggle("画面铺满全屏 (裁剪黑边)", isOn: Binding(
+                        get: { coordinator.isAspectFill },
+                        set: { coordinator.setAspectFill($0) }
+                    ))
 
-                        Toggle("同步开启 ANE 2× 硬件超分", isOn: Binding(
-                            get: { coordinator.vtSpatial2x },
-                            set: { coordinator.setVTSpatial2x($0) }
-                        ))
-                        .disabled(coordinator.isSuperResolutionDisabledBy4K || !coordinator.opticalFlowTargetFPS.allowsSpatial2x)
-
-                        if !coordinator.opticalFlowTargetFPS.allowsSpatial2x {
-                            Text("仅 2× 单相档位支持同步开启 ANE 2× 空间超分（\(coordinator.opticalFlowTargetFPS.shortBadge) 档位需多相补帧，已自动互斥关闭）")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                Section("关于与更新日志") {
-                    LabeledContent("当前版本", value: AppReleaseInfo.displayVersion)
-                    ForEach(AppReleaseInfo.changelog) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("\(entry.version) · \(entry.date)")
-                                .font(.caption.weight(.semibold))
-                            ForEach(entry.highlights, id: \.self) { item in
-                                Text("• \(item)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
+                    Toggle("播完自动循环重播", isOn: Binding(
+                        get: { coordinator.isLooping },
+                        set: { coordinator.setLooping($0) }
+                    ))
                 }
             }
-            .navigationTitle("ANE 光流控制台")
+            .navigationTitle("播控与画质设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
                 }
             }
-        }
-    }
-
-    private func interpolationHint(_ mode: InterpolationMode) -> String {
-        switch mode {
-        case .off:
-            return "关闭光流，按片源原生帧率硬解直通输出（最低功耗）"
-        case .vtOpticalFlow:
-            return "Apple VideoToolbox ANE 硬件光流真补帧（支持 2×/60/72/96/120fps 多档位与智能热/预算降档）"
         }
     }
 }
@@ -1227,7 +1438,6 @@ struct DiagnosticLogSheet: View {
     @ObservedObject private var optical: OpticalFlowPlayerController
     @Environment(\.dismiss) private var dismiss
     @State private var copiedFeedback: Bool = false
-    @State private var copiedSelfCheckFeedback: Bool = false
     @State private var exportedFeedback: Bool = false
     @State private var exportErrorMessage: String?
 
@@ -1239,31 +1449,7 @@ struct DiagnosticLogSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("真机 4 项体检") {
-                    Button {
-                        coordinator.runRealDeviceSelfCheck()
-                    } label: {
-                        Label("一键执行真机 4 项体检", systemImage: "stethoscope.circle.fill")
-                    }
-
-                    if !coordinator.selfCheckReport.isEmpty {
-                        Text(coordinator.selfCheckReport)
-                            .font(.caption2.monospaced())
-                            .textSelection(.enabled)
-
-                        Button {
-                            UIPasteboard.general.string = coordinator.selfCheckReport
-                            copiedSelfCheckFeedback = true
-                        } label: {
-                            Label(
-                                copiedSelfCheckFeedback ? "已复制体检报告" : "一键复制体检报告",
-                                systemImage: copiedSelfCheckFeedback ? "checkmark.circle.fill" : "doc.on.clipboard"
-                            )
-                        }
-                    }
-                }
-
-                Section("ANE 光流与播放状态") {
+                Section("核心运行状态") {
                     let activeW = coordinator.activeVideoWidth
                     let activeH = coordinator.activeVideoHeight
                     let activeState = optical.isPaused ? "已暂停" : "播放中"
@@ -1276,7 +1462,7 @@ struct DiagnosticLogSheet: View {
                         .font(.caption2)
                         .foregroundStyle(verdict.isEffective ? .green : .secondary)
                     LabeledContent("视频分辨率", value: activeW > 0 ? "\(activeW)×\(activeH)" : "暂无")
-                    LabeledContent("色深 / HDR", value: "\(optical.bitDepthLabel) · \(optical.hdrLabel)")
+                    LabeledContent("色深 / HDR", value: "\(optical.bitDepthLabel) · \(optical.hdrLabel) (EDR=\(coordinator.isEDREnabled ? "开" : "关"))")
                     LabeledContent("帧率 (源/输出)", value: "\(String(format: "%.1f", optical.sourceFPS)) / \(String(format: "%.1f", optical.actualOutputFPS)) fps")
                     LabeledContent("设备温度状态", value: ThermalLevel(state: coordinator.thermalState).rawValue)
                     LabeledContent(
@@ -1284,27 +1470,20 @@ struct DiagnosticLogSheet: View {
                         value: "\(optical.videoCodec.isEmpty ? "-" : optical.videoCodec) / \(optical.activeBackendLabel) (\(optical.clockSourceLabel))"
                     )
                     LabeledContent(
-                        "ANE 光流状态",
-                        value: "\(optical.capabilityDescription) (目标 \(optical.targetSummaryBadge) · 后端 \(optical.activeBackendLabel) · 时钟 \(optical.clockSourceLabel) · 补帧 \(optical.interpolatedFrameCount) / 追赶跳过 \(optical.skippedInterpolationCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount) / 耗时 \(String(format: "%.1f", optical.averageInterpolationMs))ms)"
+                        "ANE 光流计数",
+                        value: "目标 \(optical.targetSummaryBadge) · 补帧 \(optical.interpolatedFrameCount) / 跳过 \(optical.skippedInterpolationCount) / 失败 \(optical.failedInterpolationCount) / 送显 \(optical.presentedFrameCount) / \(String(format: "%.1f", optical.averageInterpolationMs))ms"
                     )
                     if let currentURL = coordinator.currentURL {
                         LabeledContent("当前片源", value: currentURL.lastPathComponent)
                     }
                     if let optErr = optical.errorMessage ?? optical.lastInterpolationError {
-                        Text("光流最近错误：\(optErr)")
+                        Text("最近异常：\(optErr)")
                             .font(.caption)
                             .foregroundStyle(.yellow)
                     }
                 }
 
-                Section("快捷排查动作") {
-                    Button {
-                        coordinator.playBuiltInSampleVideo()
-                        dismiss()
-                    } label: {
-                        Label("一键生成并播放内置 3 秒测试视频", systemImage: "play.circle.fill")
-                    }
-
+                Section("诊断操作") {
                     Button {
                         coordinator.retryWithoutInterpolation()
                         dismiss()
@@ -1317,7 +1496,7 @@ struct DiagnosticLogSheet: View {
                         copiedFeedback = true
                     } label: {
                         Label(
-                            copiedFeedback ? "已复制全部诊断日志" : "一键复制全部诊断日志",
+                            copiedFeedback ? "已复制完整运行日志" : "一键复制完整运行日志",
                             systemImage: copiedFeedback ? "checkmark.circle.fill" : "doc.on.doc"
                         )
                     }
@@ -1335,7 +1514,7 @@ struct DiagnosticLogSheet: View {
                         }
                     } label: {
                         Label(
-                            exportedFeedback ? "已生成 .txt 诊断日志文件" : "导出诊断日志 (.txt)",
+                            exportedFeedback ? "已生成 .txt 诊断日志" : "导出诊断日志 (.txt)",
                             systemImage: exportedFeedback ? "checkmark.circle.fill" : "square.and.arrow.up"
                         )
                     }
@@ -1392,7 +1571,7 @@ struct DiagnosticLogSheet: View {
             .onAppear {
                 coordinator.runRealDeviceSelfCheck()
             }
-            .navigationTitle("播放诊断中心")
+            .navigationTitle("运行日志中心")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
