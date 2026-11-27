@@ -8,13 +8,95 @@ struct RemoteSendablePixelBuffer: @unchecked Sendable {
     let buffer: CVPixelBuffer
 }
 
+enum RemoteOpticalFlowPayload: @unchecked Sendable {
+    case pixelBuffer(CVPixelBuffer)
+    case flowWarped(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: CVPixelBuffer,
+        backwardFlow: CVPixelBuffer,
+        phase: Float
+    )
+}
+
 struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
     let pts: Double
-    let buffer: CVPixelBuffer
+    let payload: RemoteOpticalFlowPayload
+
+    init(pts: Double, payload: RemoteOpticalFlowPayload) {
+        self.pts = pts
+        self.payload = payload
+    }
+
+    init(pts: Double, buffer: CVPixelBuffer) {
+        self.pts = pts
+        self.payload = .pixelBuffer(buffer)
+    }
+
+    var rawFallbackBuffer: CVPixelBuffer {
+        switch payload {
+        case .pixelBuffer(let buffer):
+            return buffer
+        case .flowWarped(_, let currBuffer, _, _, _):
+            return currBuffer
+        }
+    }
 }
 
 /// 跨平台云端流媒体光流预算与动态送显时钟规划器（可独立在模拟器单测）
 enum RemoteOpticalFlowBudgetPlanner: Sendable {
+    static func is8BitSDRBiPlanarFormat(_ pixelFormat: OSType) -> Bool {
+        pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    }
+
+    static func shouldUseHybridFlowWarp(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        targetFPS: OpticalFlowTargetFPS,
+        isHDR: Bool,
+        isDolbyVision: Bool,
+        is8BitSDRPixelFormat: Bool = true
+    ) -> Bool {
+        guard !isHDR, !isDolbyVision, is8BitSDRPixelFormat else {
+            return false
+        }
+        guard targetFPS != .x2 else {
+            return false
+        }
+        return max(sourceWidth, sourceHeight) >= 1280
+    }
+
+    static func flowResolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
+        if maxInterp <= 3 {
+            return [(854, 480), (640, 360)]
+        }
+        return [(640, 360), (512, 288)]
+    }
+
+    static func buildHybridFlowCandidates(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        maxInterpolatedFrames: Int
+    ) -> [(width: Int, height: Int)] {
+        let safeW = max(2, sourceWidth)
+        let safeH = max(2, sourceHeight)
+        let caps = flowResolutionCaps(forMaxInterpolatedFrames: max(1, maxInterpolatedFrames))
+        var result: [(width: Int, height: Int)] = []
+        for (longCap, shortCap) in caps {
+            let fitted = OpticalFlowResolutionPlanner.fitProportionally(
+                width: safeW,
+                height: safeH,
+                maxLongSide: longCap,
+                maxShortSide: shortCap
+            )
+            if !result.contains(where: { $0.width == fitted.width && $0.height == fitted.height }) {
+                result.append((width: fitted.width, height: fitted.height))
+            }
+        }
+        return result
+    }
+
     static func resolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
         if maxInterp <= 1 {
             return [(1920, 1080), (1280, 720)]
@@ -136,6 +218,17 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
 #if !targetEnvironment(simulator)
     private var processor: VTFrameProcessor?
     private var configuration: VTLowLatencyFrameInterpolationConfiguration?
+    private var isHybridFlowWarpActive: Bool = false
+    private var flowConfiguration: VTOpticalFlowConfiguration?
+    private var flowCandidates: [(width: Int, height: Int)] = []
+    private var flowCandidateIndex: Int = 0
+    private var flowPlanSignature: String = ""
+    private var activeFlowWidth: Int = 0
+    private var activeFlowHeight: Int = 0
+    private var activeFlowPixelFormat: OSType = kCVPixelFormatType_TwoComponent16Half
+    private var flowDestPool: CVPixelBufferPool?
+    private var flowWarpNeedsRandomSubmission: Bool = true
+    private var hybridFlowWarpFailedForSession: Bool = false
     private var activeCandidate: OpticalFlowCandidate?
     private var candidates: [OpticalFlowCandidate] = []
     private var candidateIndex: Int = 0
@@ -257,6 +350,11 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 candidateIndex = 0
                 candidates.removeAll(keepingCapacity: true)
                 candidatePlanSignature = ""
+                flowCandidateIndex = 0
+                flowCandidates.removeAll(keepingCapacity: true)
+                flowPlanSignature = ""
+                hybridFlowWarpFailedForSession = false
+                flowWarpNeedsRandomSubmission = true
                 teardownSession()
 #endif
             }
@@ -301,8 +399,194 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             if dt <= 0.008 || dt >= 0.35 {
                 previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
                 phaseScheduler.reset()
-                onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, activeCandidate?.displayLabel ?? "远程流直通")
+                flowWarpNeedsRandomSubmission = true
+                let passthroughLabel: String
+                if isHybridFlowWarpActive, activeFlowWidth > 0 {
+                    let prefix = max(srcW, srcH) >= 3000 ? "远程·4K光流变形" : "远程·原生光流变形"
+                    passthroughLabel = "\(prefix) \(activeFlowWidth)×\(activeFlowHeight)→\(srcW)×\(srcH)"
+                } else {
+                    passthroughLabel = activeCandidate?.displayLabel ?? "远程流直通"
+                }
+                onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, passthroughLabel)
                 return nil
+            }
+
+            let srcFmt = CVPixelBufferGetPixelFormatType(currBuffer)
+            if ensureHybridFlowWarpSession(
+                srcWidth: srcW,
+                srcHeight: srcH,
+                targetFPS: targetFPS,
+                sourceFPS: sourceFPS,
+                srcPixelFormat: srcFmt
+            ),
+               let processor,
+               let flowDestPool,
+               activeFlowWidth > 0,
+               activeFlowHeight > 0 {
+                let maxSlots = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
+                let step = phaseScheduler.planStep(previousPTS: prev.pts, currentPTS: currPTS, maxAllowedSlots: maxSlots)
+                let flowLabelPrefix = max(srcW, srcH) >= 3000 ? "远程·4K光流变形" : "远程·原生光流变形"
+                let emittedLabel = "\(flowLabelPrefix) \(activeFlowWidth)×\(activeFlowHeight)→\(srcW)×\(srcH)"
+
+                if step.interpolatedSlots.isEmpty {
+                    previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
+                    let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
+                    onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, emittedLabel)
+                    return nil
+                }
+
+                let pairStartHost = CACurrentMediaTime()
+                let reusedPrev: CVPixelBuffer? = (prev.preparedWidth == activeFlowWidth
+                    && prev.preparedHeight == activeFlowHeight
+                    && prev.preparedFormat == activePixelFormat)
+                    ? prev.preparedBuffer
+                    : nil
+
+                var fwdOpt: CVPixelBuffer?
+                var bwdOpt: CVPixelBuffer?
+                let fwdStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, flowDestPool, &fwdOpt)
+                let bwdStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, flowDestPool, &bwdOpt)
+
+                if fwdStatus == kCVReturnSuccess,
+                   bwdStatus == kCVReturnSuccess,
+                   let fwdBuf = fwdOpt,
+                   let bwdBuf = bwdOpt,
+                   let preparedPrev = reusedPrev ?? prepareSourceBuffer(
+                       prev.rawBuffer,
+                       targetWidth: activeFlowWidth,
+                       targetHeight: activeFlowHeight,
+                       targetFormat: activePixelFormat
+                   ),
+                   let preparedCurr = prepareSourceBuffer(
+                       currBuffer,
+                       targetWidth: activeFlowWidth,
+                       targetHeight: activeFlowHeight,
+                       targetFormat: activePixelFormat
+                   ),
+                   let prevFrame = VTFrameProcessorFrame(buffer: preparedPrev, presentationTimeStamp: CMTime(seconds: prev.pts, preferredTimescale: 600)),
+                   let currFrame = VTFrameProcessorFrame(buffer: preparedCurr, presentationTimeStamp: CMTime(seconds: currPTS, preferredTimescale: 600)),
+                   let opticalFlow = VTFrameProcessorOpticalFlow(forwardFlow: fwdBuf, backwardFlow: bwdBuf),
+                   let flowParams = VTOpticalFlowParameters(
+                       sourceFrame: prevFrame,
+                       nextFrame: currFrame,
+                       submissionMode: flowWarpNeedsRandomSubmission ? .random : .sequential,
+                       destinationOpticalFlow: opticalFlow
+                   ) {
+                    do {
+                        _ = try await processor.process(parameters: flowParams)
+                        flowWarpNeedsRandomSubmission = false
+                        guard readGeneration() == jobGeneration else { return nil }
+                        let elapsedMs = (CACurrentMediaTime() - pairStartHost) * 1000.0
+                        totalInterpolationMs += elapsedMs
+                        batchCount += 1
+                        let avgMs = totalInterpolationMs / Double(max(1, batchCount))
+
+                        var outFrames: [RemoteOpticalFlowOutputFrame] = []
+                        outFrames.reserveCapacity(step.interpolatedSlots.count + 1)
+                        for slot in step.interpolatedSlots {
+                            outFrames.append(
+                                RemoteOpticalFlowOutputFrame(
+                                    pts: slot.pts,
+                                    payload: .flowWarped(
+                                        prevBuffer: prev.rawBuffer,
+                                        currBuffer: currBuffer,
+                                        forwardFlow: fwdBuf,
+                                        backwardFlow: bwdBuf,
+                                        phase: slot.phase
+                                    )
+                                )
+                            )
+                        }
+                        if step.shouldEmitOriginalFrame || outFrames.isEmpty {
+                            outFrames.append(RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer))
+                        }
+
+                        previousFrame = (
+                            pts: currPTS,
+                            rawBuffer: currBuffer,
+                            preparedBuffer: preparedCurr,
+                            preparedWidth: activeFlowWidth,
+                            preparedHeight: activeFlowHeight,
+                            preparedFormat: activePixelFormat
+                        )
+                        onBatch(outFrames, step.interpolatedSlots.count, avgMs, emittedLabel)
+
+                        if warmupPairsRemaining > 0 {
+                            warmupPairsRemaining -= 1
+                            return nil
+                        }
+
+                        let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
+                        let canDowngradeRes = (flowCandidateIndex + 1) < flowCandidates.count
+                        let canDowngradeFPS = targetFPS.nextLowerTier != nil
+                        let catchUpOverload = RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                            skippedInputs: skippedInputs,
+                            processMs: elapsedMs,
+                            sourceIntervalMs: sourceIntervalMs
+                        )
+                        let action = budgetGuard.recordPair(
+                            processMs: elapsedMs,
+                            sourceIntervalMs: sourceIntervalMs,
+                            skippedForCatchUp: catchUpOverload,
+                            canDowngradeResolution: canDowngradeRes,
+                            canDowngradeTargetFPS: canDowngradeFPS
+                        )
+                        switch action {
+                        case .keep:
+                            return nil
+                        case .downgradeResolution:
+                            if flowCandidateIndex + 1 < flowCandidates.count {
+                                let prevFlowLabel = "\(activeFlowWidth)×\(activeFlowHeight)"
+                                flowCandidateIndex += 1
+                                let nextDims = flowCandidates[flowCandidateIndex]
+                                teardownSession()
+                                totalInterpolationMs = 0
+                                batchCount = 0
+                                onLog?("[remote][perf] 4K光流场超预算 (单对=\(String(format: "%.1f", elapsedMs))ms, 均值=\(String(format: "%.1f", avgMs))ms, 预算=\(String(format: "%.1f", sourceIntervalMs))ms)，光流场 \(prevFlowLabel) 自动降级 -> \(nextDims.width)×\(nextDims.height)（画面保持\(srcW)×\(srcH)原画无损）")
+                                return nil
+                            } else if let lower = targetFPS.nextLowerTier {
+                                updateWorkerTargetTier(lower)
+                                phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
+                                flowCandidateIndex = 0
+                                flowCandidates.removeAll(keepingCapacity: true)
+                                flowPlanSignature = ""
+                                candidateIndex = 0
+                                candidates.removeAll(keepingCapacity: true)
+                                candidatePlanSignature = ""
+                                teardownSession()
+                                totalInterpolationMs = 0
+                                batchCount = 0
+                                onTargetDowngrade?(lower, "4K原生光流场已触底，自动稳帧降档至 \(lower.shortBadge)")
+                                return lower
+                            }
+                        case .downgradeTargetFPS:
+                            if let lower = targetFPS.nextLowerTier {
+                                updateWorkerTargetTier(lower)
+                                phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
+                                flowCandidateIndex = 0
+                                flowCandidates.removeAll(keepingCapacity: true)
+                                flowPlanSignature = ""
+                                candidateIndex = 0
+                                candidates.removeAll(keepingCapacity: true)
+                                candidatePlanSignature = ""
+                                teardownSession()
+                                totalInterpolationMs = 0
+                                batchCount = 0
+                                onTargetDowngrade?(lower, "4K原生光流变形持续超预算或追帧跳过，自动稳帧至 \(lower.shortBadge)")
+                                return lower
+                            }
+                        }
+                        return nil
+                    } catch {
+                        let now = CACurrentMediaTime()
+                        if now - lastErrorLogTime > 2.0 {
+                            lastErrorLogTime = now
+                            onLog?("[remote][warn] 4K原生光流变形异常 (\(activeFlowWidth)×\(activeFlowHeight))，自动回退 LowLatency: \(error.localizedDescription)")
+                        }
+                        hybridFlowWarpFailedForSession = true
+                        teardownSession()
+                    }
+                }
             }
 
             if ensureSession(srcWidth: srcW, srcHeight: srcH, targetFPS: targetFPS, sourceFPS: sourceFPS),
@@ -482,6 +766,159 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     }
 
 #if !targetEnvironment(simulator)
+    private func ensureHybridFlowWarpSession(
+        srcWidth: Int,
+        srcHeight: Int,
+        targetFPS: OpticalFlowTargetFPS,
+        sourceFPS: Double,
+        srcPixelFormat: OSType
+    ) -> Bool {
+        guard !hybridFlowWarpFailedForSession,
+              VTOpticalFlowConfiguration.isSupported,
+              RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                  sourceWidth: srcWidth,
+                  sourceHeight: srcHeight,
+                  targetFPS: targetFPS,
+                  isHDR: false,
+                  isDolbyVision: false,
+                  is8BitSDRPixelFormat: RemoteOpticalFlowBudgetPlanner.is8BitSDRBiPlanarFormat(srcPixelFormat)
+              ) else {
+            return false
+        }
+
+        let maxInterp = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
+        let planSig = "flow:\(srcWidth)x\(srcHeight):\(maxInterp)"
+        if planSig != flowPlanSignature {
+            flowCandidates = RemoteOpticalFlowBudgetPlanner.buildHybridFlowCandidates(
+                sourceWidth: srcWidth,
+                sourceHeight: srcHeight,
+                maxInterpolatedFrames: maxInterp
+            )
+            flowPlanSignature = planSig
+            flowCandidateIndex = 0
+        }
+        guard flowCandidateIndex < flowCandidates.count else {
+            return false
+        }
+
+        let sig = "\(planSig):idx\(flowCandidateIndex)"
+        if sig == activeSignature, isHybridFlowWarpActive, processor != nil, flowDestPool != nil {
+            return true
+        }
+        teardownSession()
+
+        for index in flowCandidateIndex..<flowCandidates.count {
+            let flowDims = flowCandidates[index]
+            guard let config = VTOpticalFlowConfiguration(
+                frameWidth: flowDims.width,
+                frameHeight: flowDims.height,
+                qualityPrioritization: .normal,
+                revision: VTOpticalFlowConfiguration.defaultRevision
+            ) else {
+                continue
+            }
+
+            let proc = VTFrameProcessor()
+            do {
+                try proc.startSession(configuration: config)
+            } catch {
+                proc.endSession()
+                continue
+            }
+
+            let supportedSourceFormats = Self.extractPixelFormatTypes(from: config.sourcePixelBufferAttributes)
+            let chosenSourceFormat: OSType = supportedSourceFormats.isEmpty
+                ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                : OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: supportedSourceFormats, prefer10Bit: false)
+
+            let supportedFlowFormats = Self.extractPixelFormatTypes(from: config.destinationPixelBufferAttributes)
+            let chosenFlowFormat: OSType
+            if supportedFlowFormats.contains(kCVPixelFormatType_TwoComponent16Half) {
+                chosenFlowFormat = kCVPixelFormatType_TwoComponent16Half
+            } else if supportedFlowFormats.contains(kCVPixelFormatType_TwoComponent32Float) {
+                chosenFlowFormat = kCVPixelFormatType_TwoComponent32Float
+            } else if let first = supportedFlowFormats.first {
+                chosenFlowFormat = first
+            } else {
+                chosenFlowFormat = kCVPixelFormatType_TwoComponent16Half
+            }
+
+            let srcPoolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 6]
+            var srcNormAttrs: [String: Any] = [:]
+            for (k, v) in config.sourcePixelBufferAttributes {
+                srcNormAttrs[k] = v
+            }
+            srcNormAttrs[kCVPixelBufferWidthKey as String] = flowDims.width
+            srcNormAttrs[kCVPixelBufferHeightKey as String] = flowDims.height
+            srcNormAttrs[kCVPixelBufferPixelFormatTypeKey as String] = NSNumber(value: chosenSourceFormat)
+            if srcNormAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+                srcNormAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            }
+            if srcNormAttrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+                srcNormAttrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+            }
+            var normPool: CVPixelBufferPool?
+            let srcStatus = CVPixelBufferPoolCreate(kCFAllocatorDefault, srcPoolAttrs as CFDictionary, srcNormAttrs as CFDictionary, &normPool)
+            guard srcStatus == kCVReturnSuccess, let normPool else {
+                proc.endSession()
+                continue
+            }
+
+            let flowPoolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 16]
+            var flowDstAttrs: [String: Any] = [:]
+            for (k, v) in config.destinationPixelBufferAttributes {
+                flowDstAttrs[k] = v
+            }
+            flowDstAttrs[kCVPixelBufferWidthKey as String] = flowDims.width
+            flowDstAttrs[kCVPixelBufferHeightKey as String] = flowDims.height
+            flowDstAttrs[kCVPixelBufferPixelFormatTypeKey as String] = NSNumber(value: chosenFlowFormat)
+            if flowDstAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] == nil {
+                flowDstAttrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:]
+            }
+            if flowDstAttrs[kCVPixelBufferMetalCompatibilityKey as String] == nil {
+                flowDstAttrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+            }
+            var flowPool: CVPixelBufferPool?
+            let dstStatus = CVPixelBufferPoolCreate(kCFAllocatorDefault, flowPoolAttrs as CFDictionary, flowDstAttrs as CFDictionary, &flowPool)
+            guard dstStatus == kCVReturnSuccess, let flowPool else {
+                proc.endSession()
+                continue
+            }
+
+            var xfer: VTPixelTransferSession?
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &xfer)
+
+            self.processor = proc
+            self.flowConfiguration = config
+            self.isHybridFlowWarpActive = true
+            self.flowCandidateIndex = index
+            self.activeFlowWidth = flowDims.width
+            self.activeFlowHeight = flowDims.height
+            self.activePixelFormat = chosenSourceFormat
+            self.activeFlowPixelFormat = chosenFlowFormat
+            self.sourceNormPool = normPool
+            self.sourceTransferSession = xfer
+            self.flowDestPool = flowPool
+            self.flowWarpNeedsRandomSubmission = true
+            self.activeSignature = "\(planSig):idx\(index)"
+            self.warmupPairsRemaining = 8
+            onLog?("[remote][ane] 已激活4K原生光流变形会话: FlowWarp \(flowDims.width)×\(flowDims.height) -> \(srcWidth)×\(srcHeight) (flowFmt=\(HEVCFormatNormalizer.fourCCString(chosenFlowFormat)), srcFmt=\(HEVCFormatNormalizer.fourCCString(chosenSourceFormat)))")
+            return true
+        }
+        return false
+    }
+
+    private static func extractPixelFormatTypes(from attributes: [String: Any]) -> [OSType] {
+        let key = kCVPixelBufferPixelFormatTypeKey as String
+        if let list = attributes[key] as? [NSNumber] {
+            return list.map(\.uint32Value)
+        }
+        if let single = attributes[key] as? NSNumber {
+            return [single.uint32Value]
+        }
+        return []
+    }
+
     private func ensureSession(
         srcWidth: Int,
         srcHeight: Int,
@@ -620,6 +1057,12 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         processor?.endSession()
         processor = nil
         configuration = nil
+        flowConfiguration = nil
+        isHybridFlowWarpActive = false
+        activeFlowWidth = 0
+        activeFlowHeight = 0
+        flowDestPool = nil
+        flowWarpNeedsRandomSubmission = true
         activeCandidate = nil
         sourceNormPool = nil
         destPool = nil

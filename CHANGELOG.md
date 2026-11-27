@@ -2,6 +2,14 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.11] - 2026-11-28
+
+### 重大架构升级 (Major Upgrade)
+- **全新混合 4K 原生光流变形引擎 (`RemoteStreamOpticalFlowWorker` + `MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - **彻底告别 60/96/120fps 降分辨率发糊与 120fps 撞墙跌 96fps**：针对 SDR 8-bit 多倍高刷流，借鉴 `MetalDuck` / `Practical-RIFE --UHD` 业界方案与 iOS 26 原生 `VTOpticalFlowConfiguration` + `VTOpticalFlowParameters` + `VTFrameProcessorOpticalFlow`，ANE 每对源码帧仅运行 **1 次**轻量级双向光流估计（`640×360` / `854×480`），耗时与目标帧率解耦，彻底避开 `VTLowLatencyFrameInterpolation` $2^x - 1$ 全像素合成在 120fps 撞 `40.0ms` 天花板的问题。
+  - **真 4K 原生纹理 GPU 变形直绘 (`displayFlowWarpYUVFragment`)**：GPU 片段着色器以 1 步中点细化、前向/后向一致性权重与转场防撕裂护栏直接采样原始 `3840×2160` 前后帧 YUV 纹理即时生成中间帧，零中间 4K 像素池分配、原帧与补帧共享真 4K 锐度，并统一解锁 `2560px` 全屏 Retina 渲染。
+  - **智能分层与安全回退**：`2×` 保持已实机验证无损的 `LowLatency 1080p + MetalFX 1440p`；HDR / Dolby Vision 继续安全直通或 `LowLatency`；若硬件不支持或异常自动回退 `LowLatency`。
+
 ## [v0.1.0-beta.10] - 2026-11-27
 
 ### 修复与增强 (Fixed & Improved)

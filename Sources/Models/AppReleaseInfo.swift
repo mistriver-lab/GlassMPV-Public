@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.10"
+    static let releaseTag = "0.1.0-beta.11"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.11",
+            date: "2026-11-28",
+            highlights: [
+                "全新混合 4K 原生光流变形架构 (Hybrid 4K Flow-Warp)：彻底根治「60/96/120fps 4K 发糊」与「120fps 自动跌档 96fps」——针对 >1080p SDR 多倍补帧流，ANE 使用 iOS 26 VTOpticalFlowConfiguration 每次仅计算 1 次轻量级双向光流场 (640×360/854×480)，不再受 2^x-1 全像素合成 40ms 算力天花板掣肘",
+                "全分辨率 4K 双向遮挡感知 Metal Warp Shader (displayFlowWarpYUVFragment)：GPU 直接以零拷贝采样前后两帧原始 3840×2160 YUV 纹理生成任意中间相位帧（原帧与插帧同为真 4K 原生输出、零降采样糊化），内置前向/后向一致性校验与转场瞬间保护机制防止撕裂重影",
+                "保留已被实机验证无损的 2× (LowLatency 1080p + MetalFX 1440p) 及 HDR/Dolby Vision 安全回退通道，并对 4K 原始帧一并解锁 2560px 全屏 Retina 绘制上限"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.10",
             date: "2026-11-27",

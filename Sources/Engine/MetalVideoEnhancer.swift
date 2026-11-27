@@ -25,6 +25,21 @@ private struct MetalDisplayVertexUniforms {
     var scaleY: Float
 }
 
+private struct MetalFlowWarpUniforms {
+    var phase: Float
+    var invFlowWidth: Float
+    var invFlowHeight: Float
+    var deblurStrength: Float
+    var casStrength: Float
+    var lineDarken: Float
+    var clarityStrength: Float
+    var noiseDeadzone: Float
+    var isVideoRange: UInt32
+    var isBT601: UInt32
+    var compareMode: UInt32
+    var splitX: Float
+}
+
 enum MetalDirectRenderResult: Equatable, Sendable {
     case rendered
     case skippedBusy
@@ -113,6 +128,7 @@ final class MetalVideoEnhancer {
 
     private var displayYUVRenderPipeline: MTLRenderPipelineState?
     private var displayBGRARenderPipeline: MTLRenderPipelineState?
+    private var displayFlowWarpYUVRenderPipeline: MTLRenderPipelineState?
 
     private var outputPool: CVPixelBufferPool?
     private var outputPoolSignature: String = ""
@@ -145,6 +161,21 @@ final class MetalVideoEnhancer {
     struct DisplayVertexUniforms {
         float scaleX;
         float scaleY;
+    };
+
+    struct FlowWarpUniforms {
+        float phase;
+        float invFlowWidth;
+        float invFlowHeight;
+        float deblurStrength;
+        float casStrength;
+        float lineDarken;
+        float clarityStrength;
+        float noiseDeadzone;
+        uint isVideoRange;
+        uint isBT601;
+        uint compareMode;
+        float splitX;
     };
 
     struct QuadVaryings {
@@ -423,6 +454,124 @@ final class MetalVideoEnhancer {
         return half4(finalRGB, centerRGBA.a);
     }
 
+    fragment half4 displayFlowWarpYUVFragment(
+        QuadVaryings in [[stage_in]],
+        texture2d<half, access::sample> inPrevY [[texture(0)]],
+        texture2d<half, access::sample> inPrevUV [[texture(1)]],
+        texture2d<half, access::sample> inCurrY [[texture(2)]],
+        texture2d<half, access::sample> inCurrUV [[texture(3)]],
+        texture2d<float, access::sample> inForwardFlow [[texture(4)]],
+        texture2d<float, access::sample> inBackwardFlow [[texture(5)]],
+        constant FlowWarpUniforms& u [[buffer(0)]]
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float2 uv = in.uv;
+        float t = clamp(u.phase, 0.0f, 1.0f);
+
+        half nearestY = (t < 0.5f)
+            ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
+            : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+        half2 nearestUV = (t < 0.5f)
+            ? inPrevUV.sample(linearSampler, uv).rg
+            : inCurrUV.sample(linearSampler, uv).rg;
+
+        if (u.compareMode == 2u) {
+            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+        }
+        float invWidth = 1.0f / max(1.0f, float(inCurrY.get_width()));
+        float invHeight = 1.0f / max(1.0f, float(inCurrY.get_height()));
+        float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
+        if (u.compareMode == 1u) {
+            if (abs(uv.x - splitRatio) <= max(0.0022f, invWidth * 1.5f)) {
+                return half4(half(0.25h), half(0.96h), half(0.98h), half(1.0h));
+            }
+            if (uv.x < splitRatio) {
+                return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+            }
+        }
+
+        float2 invFlow = float2(u.invFlowWidth, u.invFlowHeight);
+        float2 f0 = inForwardFlow.sample(linearSampler, uv).rg * invFlow;
+        float2 b0 = inBackwardFlow.sample(linearSampler, uv).rg * invFlow;
+        if (!all(isfinite(f0))) { f0 = float2(0.0f); }
+        if (!all(isfinite(b0))) { b0 = float2(0.0f); }
+
+        float2 uv0Rough = clamp(uv - t * f0, float2(0.0f), float2(1.0f));
+        float2 uv1Rough = clamp(uv - (1.0f - t) * b0, float2(0.0f), float2(1.0f));
+        float2 fRef = inForwardFlow.sample(linearSampler, uv0Rough).rg * invFlow;
+        float2 bRef = inBackwardFlow.sample(linearSampler, uv1Rough).rg * invFlow;
+        if (!all(isfinite(fRef))) { fRef = f0; }
+        if (!all(isfinite(bRef))) { bRef = b0; }
+
+        float2 flow = 0.5f * (fRef - bRef);
+        float fbErr = length(fRef + bRef);
+        float flowMag = length(flow);
+
+        // 转场/极端运动保护：避免整帧撕裂重影，直接输出最近原生高分辨率参考帧
+        if (flowMag > 0.18f || fbErr > 0.045f) {
+            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+        }
+
+        float2 uv0Raw = uv - t * flow;
+        float2 uv1Raw = uv + (1.0f - t) * flow;
+        bool oob0 = any(uv0Raw < float2(0.0f)) || any(uv0Raw > float2(1.0f));
+        bool oob1 = any(uv1Raw < float2(0.0f)) || any(uv1Raw > float2(1.0f));
+        float2 uv0 = clamp(uv0Raw, float2(0.0f), float2(1.0f));
+        float2 uv1 = clamp(uv1Raw, float2(0.0f), float2(1.0f));
+
+        half y0 = toUnitLumaH(inPrevY.sample(linearSampler, uv0).r, u.isVideoRange);
+        half2 c0 = inPrevUV.sample(linearSampler, uv0).rg;
+        half y1 = toUnitLumaH(inCurrY.sample(linearSampler, uv1).r, u.isVideoRange);
+        half2 c1 = inCurrUV.sample(linearSampler, uv1).rg;
+
+        float lumaDiff = abs(float(y0) - float(y1));
+        float occConf = smoothstep(0.008f, 0.032f, fbErr) * 0.65f + smoothstep(0.09f, 0.24f, lumaDiff) * 0.65f;
+        occConf = clamp(occConf, 0.0f, 1.0f);
+
+        float w1 = t;
+        if (oob0 && !oob1) {
+            w1 = 1.0f;
+        } else if (oob1 && !oob0) {
+            w1 = 0.0f;
+        } else {
+            float hardPick = (t < 0.5f) ? 0.0f : 1.0f;
+            w1 = mix(t, hardPick, occConf);
+        }
+
+        half hw1 = half(w1);
+        half hw0 = half(1.0h) - hw1;
+        half yWarp = y0 * hw0 + y1 * hw1;
+        half2 cWarp = c0 * hw0 + c1 * hw1;
+
+        if (u.deblurStrength > 0.001f || u.casStrength > 0.001f || u.lineDarken > 0.001f || u.clarityStrength > 0.001f) {
+            float2 dx = float2(invWidth, 0.0f);
+            float2 dy = float2(0.0f, invHeight);
+            half yN = toUnitLumaH(inPrevY.sample(linearSampler, clamp(uv0 - dy, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw0
+                + toUnitLumaH(inCurrY.sample(linearSampler, clamp(uv1 - dy, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw1;
+            half yS = toUnitLumaH(inPrevY.sample(linearSampler, clamp(uv0 + dy, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw0
+                + toUnitLumaH(inCurrY.sample(linearSampler, clamp(uv1 + dy, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw1;
+            half yW = toUnitLumaH(inPrevY.sample(linearSampler, clamp(uv0 - dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw0
+                + toUnitLumaH(inCurrY.sample(linearSampler, clamp(uv1 - dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw1;
+            half yE = toUnitLumaH(inPrevY.sample(linearSampler, clamp(uv0 + dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw0
+                + toUnitLumaH(inCurrY.sample(linearSampler, clamp(uv1 + dx, float2(0.0f), float2(1.0f))).r, u.isVideoRange) * hw1;
+
+            EnhanceUniforms eu;
+            eu.deblurStrength = u.deblurStrength;
+            eu.casStrength = u.casStrength;
+            eu.lineDarken = u.lineDarken;
+            eu.clarityStrength = u.clarityStrength;
+            eu.noiseDeadzone = u.noiseDeadzone;
+            eu.isVideoRange = u.isVideoRange;
+            eu.isBT601 = u.isBT601;
+            eu.compareMode = 0u;
+            eu.splitX = u.splitX;
+            eu.padding = 0u;
+            yWarp = computeEnhancedLumaFastH(yWarp, yN, yS, yW, yE, yN, yS, yW, yE, eu);
+        }
+
+        return half4(yuvSampleToRGBH(yWarp, cWarp, u.isVideoRange, u.isBT601), half(1.0h));
+    }
+
     kernel void enhanceLuma(
         texture2d<half, access::sample> inY [[texture(0)]],
         texture2d<half, access::write> outY [[texture(1)]],
@@ -649,6 +798,13 @@ final class MetalVideoEnhancer {
                         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
                         self.displayBGRARenderPipeline = try dev.makeRenderPipelineState(descriptor: desc)
                     }
+                    if let warpFrag = library.makeFunction(name: "displayFlowWarpYUVFragment") {
+                        let desc = MTLRenderPipelineDescriptor()
+                        desc.vertexFunction = vertexFn
+                        desc.fragmentFunction = warpFrag
+                        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+                        self.displayFlowWarpYUVRenderPipeline = try dev.makeRenderPipelineState(descriptor: desc)
+                    }
                 }
             } catch {
                 self.enhanceLumaPipeline = nil
@@ -658,6 +814,7 @@ final class MetalVideoEnhancer {
                 self.bicubicBGRAPipeline = nil
                 self.displayYUVRenderPipeline = nil
                 self.displayBGRARenderPipeline = nil
+                self.displayFlowWarpYUVRenderPipeline = nil
             }
         }
     }
@@ -735,6 +892,165 @@ final class MetalVideoEnhancer {
             deblurStrength: 0.30,
             noiseDeadzone: 0.018
         )
+    }
+
+    nonisolated static func flowMetalPixelFormat(for pixelFormat: OSType) -> MTLPixelFormat? {
+        switch pixelFormat {
+        case kCVPixelFormatType_TwoComponent16Half:
+            return .rg16Float
+        case kCVPixelFormatType_TwoComponent32Float:
+            return .rg32Float
+        default:
+            return nil
+        }
+    }
+
+    /// 零拷贝原生全分辨率双向遮挡感知光流变形直绘：
+    /// 使用 ANE 生成的低分辨率双向位移场直接在 GPU 采样前后两帧原始 4K YUV 纹理，零降采样模糊、零中间 4K 分配。
+    func renderFlowWarpedToLayerStatus(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: CVPixelBuffer,
+        backwardFlow: CVPixelBuffer,
+        phase: Float,
+        on metalLayer: CAMetalLayer,
+        preset: VideoEnhancementPreset,
+        strength: VideoEnhancementStrength,
+        aspectFill: Bool,
+        compareMode: VideoEnhancementCompareMode = .off,
+        outputFPS: Double = 120.0,
+        thermalState: ProcessInfo.ThermalState = .nominal
+    ) -> MetalDirectRenderResult {
+        guard let commandQueue,
+              let textureCache,
+              let displayFlowWarpYUVRenderPipeline else {
+            return .unavailable
+        }
+
+        let prevFmt = CVPixelBufferGetPixelFormatType(prevBuffer)
+        let currFmt = CVPixelBufferGetPixelFormatType(currBuffer)
+        let isPrev8Bit = (prevFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || prevFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let isCurr8Bit = (currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        guard isPrev8Bit, isCurr8Bit else {
+            return .unavailable
+        }
+
+        guard let fwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(forwardFlow)),
+              let bwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(backwardFlow)) else {
+            return .unavailable
+        }
+
+        let srcW = CVPixelBufferGetWidth(currBuffer)
+        let srcH = CVPixelBufferGetHeight(currBuffer)
+        let flowW = CVPixelBufferGetWidth(forwardFlow)
+        let flowH = CVPixelBufferGetHeight(forwardFlow)
+        guard srcW >= 2, srcH >= 2, flowW >= 2, flowH >= 2 else {
+            return .unavailable
+        }
+
+        guard inFlightCounter.tryAcquire(maxInFlight: 3) else {
+            return .skippedBusy
+        }
+        var didCommit = false
+        defer {
+            if !didCommit {
+                inFlightCounter.release()
+            }
+        }
+
+        guard let drawable = metalLayer.nextDrawable() else {
+            return .skippedBusy
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return .unavailable
+        }
+
+        guard let prevY = makeTexture(from: prevBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+              let prevUV = makeTexture(from: prevBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+              let currY = makeTexture(from: currBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+              let currUV = makeTexture(from: currBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+              let fwdTex = makeTexture(from: forwardFlow, pixelFormat: fwdMetalFmt, plane: 0, cache: textureCache),
+              let bwdTex = makeTexture(from: backwardFlow, pixelFormat: bwdMetalFmt, plane: 0, cache: textureCache) else {
+            return .unavailable
+        }
+
+        let params = (preset != .off && compareMode != .original)
+            ? VideoEnhancementPlanner.parameters(for: preset, strength: strength)
+            : VideoEnhancementPlanner.parameters(for: .off, strength: strength)
+        let isVideoRange: UInt32 = (currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
+        let isBT601: UInt32 = Self.isBT601Matrix(on: currBuffer) ? 1 : 0
+        var warpUniforms = MetalFlowWarpUniforms(
+            phase: max(0.0, min(1.0, phase)),
+            invFlowWidth: 1.0 / Float(max(1, flowW)),
+            invFlowHeight: 1.0 / Float(max(1, flowH)),
+            deblurStrength: params.deblurStrength,
+            casStrength: params.casStrength,
+            lineDarken: params.lineDarken,
+            clarityStrength: params.clarityStrength,
+            noiseDeadzone: params.noiseDeadzone,
+            isVideoRange: isVideoRange,
+            isBT601: isBT601,
+            compareMode: compareMode.uniformValue,
+            splitX: 0.5
+        )
+
+        let scaleVec = Self.aspectVertexScale(
+            videoWidth: srcW,
+            videoHeight: srcH,
+            drawableWidth: drawable.texture.width,
+            drawableHeight: drawable.texture.height,
+            aspectFill: aspectFill
+        )
+        var vertexUniforms = MetalDisplayVertexUniforms(scaleX: scaleVec.x, scaleY: scaleVec.y)
+
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = drawable.texture
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        rpd.colorAttachments[0].storeAction = .store
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else {
+            return .unavailable
+        }
+
+        renderEncoder.setRenderPipelineState(displayFlowWarpYUVRenderPipeline)
+        renderEncoder.setVertexBytes(&vertexUniforms, length: MemoryLayout<MetalDisplayVertexUniforms>.size, index: 0)
+        renderEncoder.setFragmentTexture(prevY, index: 0)
+        renderEncoder.setFragmentTexture(prevUV, index: 1)
+        renderEncoder.setFragmentTexture(currY, index: 2)
+        renderEncoder.setFragmentTexture(currUV, index: 3)
+        renderEncoder.setFragmentTexture(fwdTex, index: 4)
+        renderEncoder.setFragmentTexture(bwdTex, index: 5)
+        renderEncoder.setFragmentBytes(&warpUniforms, length: MemoryLayout<MetalFlowWarpUniforms>.size, index: 0)
+        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        renderEncoder.endEncoding()
+
+        let commitHost = CACurrentMediaTime()
+        let tracker = gpuTimingTracker
+        let counter = inFlightCounter
+        commandBuffer.addCompletedHandler { cb in
+            counter.release()
+            tracker.record(gpuStart: cb.gpuStartTime, gpuEnd: cb.gpuEndTime, fallbackStart: commitHost)
+        }
+        commandBuffer.present(drawable)
+        didCommit = true
+        commandBuffer.commit()
+
+        let prefix = max(srcW, srcH) >= 3000 ? "4K原生光流变形" : "原生光流变形"
+        activePipelineLabel = preset != .off && compareMode != .original
+            ? "\(prefix)·\(preset.rawValue) \(srcW)×\(srcH)"
+            : "\(prefix) \(srcW)×\(srcH)"
+        enhancedFrameCount += 1
+        let snapMs = gpuTimingTracker.snapshotAverageMs()
+        if snapMs > 0 {
+            averageProcessMs = snapMs
+        }
+        if enhancedFrameCount % 60 == 0 {
+            CVMetalTextureCacheFlush(textureCache, 0)
+        }
+        return .rendered
     }
 
     /// 零拷贝全异步 FP16 直绘路径：直接由 Fragment Shader 采样解码帧输出至 CAMetalLayer，消除 waitUntilCompleted 与中间像素池拷贝

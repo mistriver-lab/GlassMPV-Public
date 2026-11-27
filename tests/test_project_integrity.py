@@ -233,6 +233,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "sampleLumaNeutralCubicH" in metal_enhancer_src
     assert "shouldAutoMetalFXUpscaleOpticalFlow" in metal_enhancer_src
     assert "opticalFlowDownsampleRestoreParameters" in metal_enhancer_src
+    assert "displayFlowWarpYUVFragment" in metal_enhancer_src
+    assert "renderFlowWarpedToLayerStatus" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -281,6 +283,11 @@ def test_swift_sources_non_empty_and_balanced():
     assert "shouldEmitPreparedOriginalFrame" in remote_worker_src
     assert "warmupPairsRemaining" in remote_worker_src
     assert "isCatchUpOverload" in remote_worker_src
+    assert "VTOpticalFlowConfiguration" in remote_worker_src
+    assert "VTOpticalFlowParameters" in remote_worker_src
+    assert "VTFrameProcessorOpticalFlow" in remote_worker_src
+    assert "shouldUseHybridFlowWarp" in remote_worker_src
+    assert "flowResolutionCaps" in remote_worker_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src
@@ -448,11 +455,13 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testMP4HEV1StreamPatcherBoxAwareMdatSkipAndTailMoov" in swift_test_src
     assert "testAutoMetalFXUpscaleOpticalFlowDecision" in swift_test_src
     assert "testLocalHTTPStreamProxyParallelChunkedRangeAndCacheReuse" in swift_test_src
+    assert "testHybrid4KFlowWarpPlannerAndMetalRender" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src
     assert "setRemoteInterpolationEnabled" in engine_src
     assert "preferredForwardBufferDuration" in engine_src
+    assert "presentFlowWarpedFrame" in engine_src
     player_view_src = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "reResolveCurrentCloudStream" in player_view_src
 

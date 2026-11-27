@@ -2600,4 +2600,190 @@ final class GlassMPVTests: XCTestCase {
         let chunkSizes = mockServer.snapshotRanges().map { $0.end - $0.start + 1 }
         XCTAssertTrue(chunkSizes.allSatisfy { $0 <= Int64(2 * 1024 * 1024) }, "所有上游分块请求不得超过 2MB")
     }
+
+    @MainActor
+    func testHybrid4KFlowWarpPlannerAndMetalRender() throws {
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps120,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps96,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps60,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .x2,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps120,
+                isHDR: true,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps120,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: false
+            )
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 960,
+                sourceHeight: 540,
+                targetFPS: .fps120,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            )
+        )
+
+        let flowCaps120 = RemoteOpticalFlowBudgetPlanner.flowResolutionCaps(forMaxInterpolatedFrames: 5)
+        XCTAssertEqual(flowCaps120.first?.0, 640)
+        XCTAssertEqual(flowCaps120.first?.1, 360)
+        let flowPlan120 = RemoteOpticalFlowBudgetPlanner.buildHybridFlowCandidates(
+            sourceWidth: 3840,
+            sourceHeight: 2160,
+            maxInterpolatedFrames: 5
+        )
+        XCTAssertEqual(flowPlan120.count, 2)
+        XCTAssertEqual(flowPlan120[0].width, 640)
+        XCTAssertEqual(flowPlan120[0].height, 360)
+        XCTAssertEqual(flowPlan120[1].width, 512)
+        XCTAssertEqual(flowPlan120[1].height, 288)
+
+        XCTAssertEqual(
+            MetalVideoEnhancer.flowMetalPixelFormat(for: kCVPixelFormatType_TwoComponent16Half),
+            .rg16Float
+        )
+        XCTAssertEqual(
+            MetalVideoEnhancer.flowMetalPixelFormat(for: kCVPixelFormatType_TwoComponent32Float),
+            .rg32Float
+        )
+        XCTAssertNil(
+            MetalVideoEnhancer.flowMetalPixelFormat(for: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        )
+
+        let enhancer = MetalVideoEnhancer()
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.drawableSize = CGSize(width: 256, height: 144)
+
+        let ioAttrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+        var prevOpt: CVPixelBuffer?
+        var currOpt: CVPixelBuffer?
+        var fwdOpt: CVPixelBuffer?
+        var bwdOpt: CVPixelBuffer?
+
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                128,
+                72,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                ioAttrs as CFDictionary,
+                &prevOpt
+            ),
+            kCVReturnSuccess
+        )
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                128,
+                72,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                ioAttrs as CFDictionary,
+                &currOpt
+            ),
+            kCVReturnSuccess
+        )
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                64,
+                36,
+                kCVPixelFormatType_TwoComponent16Half,
+                ioAttrs as CFDictionary,
+                &fwdOpt
+            ),
+            kCVReturnSuccess
+        )
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                64,
+                36,
+                kCVPixelFormatType_TwoComponent16Half,
+                ioAttrs as CFDictionary,
+                &bwdOpt
+            ),
+            kCVReturnSuccess
+        )
+
+        let prevBuf = try XCTUnwrap(prevOpt)
+        let currBuf = try XCTUnwrap(currOpt)
+        let fwdBuf = try XCTUnwrap(fwdOpt)
+        let bwdBuf = try XCTUnwrap(bwdOpt)
+
+        let status = enhancer.renderFlowWarpedToLayerStatus(
+            prevBuffer: prevBuf,
+            currBuffer: currBuf,
+            forwardFlow: fwdBuf,
+            backwardFlow: bwdBuf,
+            phase: 0.4,
+            on: metalLayer,
+            preset: .off,
+            strength: .standard,
+            aspectFill: false,
+            compareMode: .off,
+            outputFPS: 120.0,
+            thermalState: .nominal
+        )
+        if MTLCreateSystemDefaultDevice() != nil {
+            XCTAssertEqual(status, .rendered)
+            XCTAssertTrue(enhancer.activePipelineLabel.contains("光流变形"))
+        } else {
+            XCTAssertEqual(status, .unavailable)
+        }
+    }
 }

@@ -1873,6 +1873,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var pendingUserSwitch: (target: OpticalFlowTargetFPS, spatial2x: Bool)?
     private var didInspectFirstDecodedColor: Bool = false
     private var frameQueue: [(pts: Double, buffer: CVPixelBuffer)] = []
+    private var remoteFrameQueue: [(pts: Double, buffer: RemoteOpticalFlowPayload)] = []
     private var pendingFirstFrame: (pts: Double, buffer: CVPixelBuffer)?
     private var didAttachDisplayLayer: Bool = false
     private var isReaderEOF: Bool = false
@@ -2315,10 +2316,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         guard isTokenValid(token) else { return }
         bufferLock.lock()
         for item in frames {
-            if frameQueue.count >= maxQueuedFrames {
-                frameQueue.removeFirst()
+            if remoteFrameQueue.count >= maxQueuedFrames {
+                remoteFrameQueue.removeFirst()
             }
-            frameQueue.append((pts: item.pts, buffer: item.buffer))
+            remoteFrameQueue.append((pts: item.pts, buffer: item.payload))
             if item.pts > lastEnqueuedPTS {
                 lastEnqueuedPTS = item.pts
             }
@@ -3056,6 +3057,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private func clearBufferedFrames() {
         bufferLock.lock()
         frameQueue.removeAll()
+        remoteFrameQueue.removeAll()
         pendingFirstFrame = nil
         pendingUserSwitch = nil
         didInspectFirstDecodedColor = false
@@ -4254,14 +4256,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         var skippedStaleBurst = false
         bufferLock.lock()
-        if frameQueue.count > 2, pacerNow - frameQueue[0].pts > 0.40 {
-            while frameQueue.count > 2, frameQueue[0].pts < pacerNow - 0.06 {
-                frameQueue.removeFirst()
+        if remoteFrameQueue.count > 2, pacerNow - remoteFrameQueue[0].pts > 0.40 {
+            while remoteFrameQueue.count > 2, remoteFrameQueue[0].pts < pacerNow - 0.06 {
+                remoteFrameQueue.removeFirst()
                 skippedStaleBurst = true
             }
         }
         let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
-            from: &frameQueue,
+            from: &remoteFrameQueue,
             now: pacerNow,
             isInterpolationEnabled: true,
             maxLateGraceSeconds: 0.120
@@ -4273,9 +4275,22 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 rawDroppedFrames += Int64(paceResult.droppedCount)
             }
         }
-        if let buffer = paceResult.frame {
+        if let payload = paceResult.frame {
             lastRemotePresentedHostTime = hostTime
-            presentFrame(buffer, ptsSeconds: hostTime, on: layer)
+            switch payload {
+            case .pixelBuffer(let buffer):
+                presentFrame(buffer, ptsSeconds: hostTime, on: layer)
+            case .flowWarped(let prevBuffer, let currBuffer, let forwardFlow, let backwardFlow, let phase):
+                presentFlowWarpedFrame(
+                    prevBuffer: prevBuffer,
+                    currBuffer: currBuffer,
+                    forwardFlow: forwardFlow,
+                    backwardFlow: backwardFlow,
+                    phase: phase,
+                    ptsSeconds: hostTime,
+                    on: layer
+                )
+            }
         } else if let pb = pulledBuffer,
                   (rawInterpolatedFrameCount == 0 || (hostTime - lastRemotePresentedHostTime) > 0.25) {
             lastRemotePresentedHostTime = hostTime
@@ -4308,6 +4323,71 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             }
         }
         flushPublishedTelemetryIfNeeded(force: wasFirstFrame)
+    }
+
+    @MainActor
+    private func presentFlowWarpedFrame(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: CVPixelBuffer,
+        backwardFlow: CVPixelBuffer,
+        phase: Float,
+        ptsSeconds: Double,
+        on layer: AVSampleBufferDisplayLayer
+    ) {
+        lastRawPresentedBuffer = currBuffer
+        lastRawPresentedPTS = ptsSeconds
+
+        let activeCompareMode: VideoEnhancementCompareMode
+        if isComparingOriginalQuality || qualityCompareMode == .original {
+            activeCompareMode = .original
+        } else {
+            activeCompareMode = qualityCompareMode
+        }
+
+        if !isDolbyVisionContent,
+           !isHDRContent,
+           let container = displayContainer {
+            let liveOutputFPS = max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 60.0)
+            let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
+                outputFPS: liveOutputFPS,
+                allowSpatialUpscale: true
+            )
+            container.updateMetalMaxLongSide(metalCap)
+            let status = metalEnhancer.renderFlowWarpedToLayerStatus(
+                prevBuffer: prevBuffer,
+                currBuffer: currBuffer,
+                forwardFlow: forwardFlow,
+                backwardFlow: backwardFlow,
+                phase: phase,
+                on: container.metalLayer,
+                preset: videoEnhancementPreset,
+                strength: videoEnhancementStrength,
+                aspectFill: isAspectFill,
+                compareMode: activeCompareMode,
+                outputFPS: liveOutputFPS,
+                thermalState: ProcessInfo.processInfo.thermalState
+            )
+            switch status {
+            case .rendered:
+                container.setMetalOverlayActive(true)
+                if activeQualityPipelineLabel != metalEnhancer.activePipelineLabel {
+                    activeQualityPipelineLabel = metalEnhancer.activePipelineLabel
+                }
+                let reportedEnhanceMs = (videoEnhancementPreset == .off || activeCompareMode == .original)
+                    ? 0
+                    : metalEnhancer.averageProcessMs
+                updatePresentedFrameMetrics(isRefresh: false, enhanceMs: reportedEnhanceMs)
+                return
+            case .skippedBusy:
+                container.setMetalOverlayActive(true)
+                return
+            case .unavailable:
+                break
+            }
+        }
+
+        presentFrame(currBuffer, ptsSeconds: ptsSeconds, on: layer)
     }
 
     @MainActor
@@ -4348,7 +4428,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                (activeCompareMode != .original || wantsHighFPSMetalPassthrough),
                let container = displayContainer {
                 let allowMetalCapRaise = (videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale)
-                    || (videoEnhancementPreset == .off && isDownsampledOpticalFlow)
+                    || (videoEnhancementPreset == .off && (isDownsampledOpticalFlow || (isInterpolationEnabled && origLong > 1920)))
                 let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
                     outputFPS: liveOutputFPS,
                     allowSpatialUpscale: allowMetalCapRaise
@@ -4461,7 +4541,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     private func queuedCount() -> Int {
         bufferLock.lock()
-        let count = frameQueue.count
+        let count = frameQueue.count + remoteFrameQueue.count
         bufferLock.unlock()
         return count
     }
@@ -4534,6 +4614,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private func pruneExpiredFrames(before minPTS: Double) {
         bufferLock.lock()
         frameQueue.removeAll { $0.pts < minPTS }
+        remoteFrameQueue.removeAll { $0.pts < minPTS }
         bufferLock.unlock()
     }
 
