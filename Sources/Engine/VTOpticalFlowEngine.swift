@@ -1685,13 +1685,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isRemoteStream: Bool = false
     @MainActor private var rawHDRTransferName: String? = nil
     @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
-    @MainActor private var lastRawPresentedBuffer: CVPixelBuffer? = nil
-    @MainActor private var lastRawPresentedPTS: Double = 0
-    @MainActor private var currentHTTPHeaders: [String: String] = [:]
-    @MainActor private var remoteVideoOutput: AVPlayerItemVideoOutput? = nil
-    @MainActor private var remoteFlowWorker: RemoteStreamOpticalFlowWorker? = nil
-    @MainActor private var lastRemoteSamplePTS: Double = -1
-    @MainActor private var remoteStatusObserver: NSKeyValueObservation? = nil
+    private var lastRawPresentedBuffer: CVPixelBuffer?
+    private var lastRawPresentedPTS: Double = 0
+    private var currentHTTPHeaders: [String: String] = [:]
+    private var remoteVideoOutput: AVPlayerItemVideoOutput?
+    private var remoteFlowWorker: RemoteStreamOpticalFlowWorker?
+    private var lastRemoteSamplePTS: Double = -1
+    private var remoteStatusObserver: NSKeyValueObservation?
 
     @MainActor
     private var metalEnhancer: MetalVideoEnhancer {
