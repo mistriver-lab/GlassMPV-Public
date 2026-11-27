@@ -2,21 +2,18 @@
 > 🚨 **反重力智能体铁律**：每次开启新会话首轮静默读取本文件，并在回复开头输出 <50 字【现场复原快照】。
 
 ## 📌 项目基本元数据
-- **工程名称**：`ipa开发`（私有主线 `mistriver-lab/GlassMPV` @ `399bd85` / 公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `08be28d` | 最新交付 IPA `dist/GlassMPV-0.1.0-beta.1-b18-unsigned.ipa`）
-- **当前阶段**：`已完成 v0.1.0-beta.1 三合一升级：切换初始 Beta 版本体系（0.1.0 / Build 18）、零拷贝异步 FP16 CAMetalLayer 直绘与 48/60fps 解除 .latencyCritical 温控减负、纯原生 NWListener 127.0.0.1 本地 HTTP 代理根治夸克 403 与 __puus 续期；CI Run 45965239531 全绿（31/31），IPA 已校验并投递微信「文件传输助手」`
-- **最后活跃时间**：`2026-11-27 16:32:00` | **最近安全快照**：`08be28d`（CI Run `45965239531` 绿灯出包，`399bd85` 为私有主线代码与单测同步点）
+- **工程名称**：`ipa开发`（私有主线 `mistriver-lab/GlassMPV` @ `272d7d4` / 公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `eee3404` | 最新交付 IPA `dist/GlassMPV-0.1.0-beta.2-b20-unsigned.ipa`）
+- **当前阶段**：`已完成 v0.1.0-beta.2 (Build 20)：针对 164451 实机日志与反馈彻底修复展开控制栏 120Hz 掉帧（4Hz 遥测节流 + layoutDisplayLayer 幂等 + 1600px 高刷上限 + renderToLayerStatus 背压 + 去嵌套轻量化 HUD）并上线夸克单机扫码通道（uop.quark.cn CAS 二维码保存相册直跳 quark:// + .mobile 网页与 __puus 补全）；CI Run 45970694843 全绿（33/33），IPA 已校验并投递微信「文件传输助手」`
+- **最后活跃时间**：`2026-11-27 17:18:00` | **最近安全快照**：`eee3404`（CI Run `45970694843` 绿灯出包，`272d7d4` 为私有主线代码与单测同步点）
 - **运行环境**：`Swift 6.0 / iOS 26+ / XcodeGen + GitHub Actions macOS CI (无本地 Xcode)`
 
 ---
 
 ## 🎯 当前核心推进焦点 (Active Focus)
-`已完成 v0.1.0-beta.1 (Build 18)：零拷贝 FP16 CAMetalLayer 直绘降耗 + 夸克 127.0.0.1 本地代理与 __puus 续期 + 初始 Beta 版本号，CI Run 45965239531 全绿 31/31 并已投递微信「文件传输助手」；等待用户实机验收温度控制与夸克/Emby 播放表现`
+`已完成 v0.1.0-beta.2 (Build 20)：120Hz 展开控制栏零掉帧重塑 + 夸克单机扫码与 __puus 补全，CI Run 45970694843 全绿 33/33 并已投递微信「文件传输助手」；等待用户实机验收控制栏满帧与夸克扫码/播放表现`
 - 最近交付闭环（更早的历史里程碑已归档至 [CHANGELOG.md](CHANGELOG.md)）：
-  * [x] 响应 `153158` 实机日志专项优化 + Phase 2 云端片源库上线（`a956a5c` / 公开镜像 `00fae3e`）：重构多尺度 Luma 去糊、`.serious` 降档至 `2×(48fps)`、可点选「分屏对比 / 对比原画」暂停即时刷新及 夸克/Emby/WebDAV 云端片源（CI Run `45961120348`，28/28 PASS）。
-  * [x] `v0.1.0-beta.1 (Build 18)` 性能温控与夸克代理架构重构（`399bd85` / 公开镜像 `08be28d`）：
-    - **零拷贝异步 FP16 直绘与温控减负**：针对 `160642` 日志暴露的 `waitUntilCompleted()` 与 `+36MB` 冗余拷贝，新增 `CAMetalLayer` 全异步 Fragment Shader（16-bit `half` 5 点硬件双线性采样、零 `copyChroma`、零中间缓冲池、`addCompletedHandler` 非阻塞统计 GPU 耗时）；`48/60fps` 释放 `.latencyCritical`。
-    - **夸克直连彻底加固**：新增 `LocalHTTPStreamProxy.swift`（`NWListener` 绑定 `127.0.0.1`），跨 302 重定向与 `.m3u8` 分片全程注入 `Cookie / Referer / User-Agent` 根治 403，捕获 `Set-Cookie` 自动回写 `__puus` 至 Keychain；夸克内置登录页切换至 `.desktop` 桌面模式并强校验 `__puus`/`__pus`。
-    - **Beta 版本切换**：`VERSION` 改为 `0.1.0-beta.1`、`project.yml` `MARKETING_VERSION` 设为 `0.1.0`、CI Run `45965239531`（`7m22s`）`GlassMPVTests` 31/31 全绿交付 `3,214,453` bytes IPA。
+    - **展开控制栏 120Hz 掉帧根治**：`164451` 日志确认 `therm=正常` 下 120fps 开启 HUD 后滑落至 ~81fps/46.5fps。现将帧率/丢帧/avDelta/耗时收口至内部 `raw*` 按 4Hz 节流发布、修复 `applyVideoTransform`/`layoutDisplayLayer` 120×/s 无效重算、96/120fps 非超分直绘封顶 `1600px` 并接入 `MetalInFlightCounter` 3 缓冲背压（`renderToLayerStatus`），同时剥离底栏 9 处嵌套 `.glassEffect`，高刷期改用低开销半透明描边 HUD。
+    - **夸克单机扫码与 Cookie 闭环**：新增 `QuarkDriveClient.requestQRLoginToken`/`pollQRLoginTicket`/`exchangeServiceTicketForCookie`/`bootstrapSessionCookie` 原生 CAS 扫码通道，支持 CoreImage 二维码保存相册 + 一键拉起 `quark://` App 扫相册确认；网页登录默认 `.mobile` 并补齐 `WKUIDelegate`/`WKNavigationDelegate` 外链拉起。
 
 ---
 
@@ -29,17 +26,17 @@
 
 ## 🧪 最近一次自动化门禁状态 (Latest Verification Gate)
 <!-- AGY:REGRESSION:START -->
-> 🟢 **[PASS]** `GlassMPV v0.1.0-beta.1`（公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `08be28d`，CI Run `45965239531`，耗时 `7m22s`）iOS 模拟器 `GlassMPVTests` 31/31 通过（`Executed 31 tests, with 0 failures (0 unexpected) in 55.764 (56.185) seconds`）且 Release `iphoneos` 打包全绿，交付 `dist/GlassMPV-0.1.0-beta.1-b18-unsigned.ipa`（`3,214,453` bytes，纯原生系统框架 + `Assets.car`，0 个 `.glsl` 着色器，已启用 `NSAppTransportSecurity`）；主仓本地 `pytest tests/test_project_integrity.py -v`（`6 passed in 0.32s`）PASS
+> 🟢 **[PASS]** `GlassMPV v0.1.0-beta.2`（公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `eee3404`，CI Run `45970694843`，耗时 `10m51s`）iOS 模拟器 `GlassMPVTests` 33/33 通过（`Executed 33 tests, with 0 failures (0 unexpected) in 19.653 (20.255) seconds`）且 Release `iphoneos` 打包全绿，交付 `dist/GlassMPV-0.1.0-beta.2-b20-unsigned.ipa`（`3,310,527` bytes，纯原生系统框架 + `Assets.car`，0 个 `.glsl` 着色器，已启用 `NSAppTransportSecurity`、`NSPhotoLibraryAddUsageDescription` 与 `LSApplicationQueriesSchemes`）；主仓本地 `pytest tests/test_project_integrity.py -v`（`6 passed in 0.61s`）PASS
 <!-- AGY:REGRESSION:END -->
-- **门禁评级**：🟢 [PASS]（本地 `pytest 6/6`、远程 `GlassMPVTests 31/31` 与 Release Beta IPA 交付均已绿灯）
+- **门禁评级**：🟢 [PASS]（本地 `pytest 6/6`、远程 `GlassMPVTests 33/33` 与 Release Beta IPA 交付均已绿灯）
 - **交付与工作区归档**：
-  - 最新交付 IPA：`dist/GlassMPV-0.1.0-beta.1-b18-unsigned.ipa`（`3,214,453` bytes；`Info.plist` 校验 `CFBundleIdentifier=com.glassmpv.player`、`CFBundleShortVersionString=0.1.0`、`CFBundleVersion=18`，含 `Assets.car`，0 个 `.glsl` 着色器，`NSAllowsArbitraryLoads=true`）。
-  - 最新实机闭环日志：`GlassMPV-Log-20261127-160642.txt`（`Build 202611271557`，定位 `waitUntilCompleted()` `5.55ms` 同步等待、`+36MB` 拷贝与 `.latencyCritical` 锁频导致过热，已在本版重构为零拷贝 `CAMetalLayer` 直绘）。
+  - 最新交付 IPA：`dist/GlassMPV-0.1.0-beta.2-b20-unsigned.ipa`（`3,310,527` bytes；`Info.plist` 校验 `CFBundleIdentifier=com.glassmpv.player`、`CFBundleShortVersionString=0.1.0`、`CFBundleVersion=20`，含 `Assets.car`，0 个 `.glsl` 着色器，`NSAllowsArbitraryLoads=true`、`NSPhotoLibraryAddUsageDescription`、`LSApplicationQueriesSchemes=[quark, weixin]`）。
+  - 最新实机闭环日志：`GlassMPV-Log-20261127-164451.txt`（`v0.1.0-beta.1 Build 18`，证实零拷贝直绘已将温度控制为 `正常`，并精确定位展开 HUD 后 120fps 掉帧源于高频 `@Published` 重排 + 嵌套 `.glassEffect` + 2560px 无背压直绘，及夸克桌面页单机不可扫问题，已在 `beta.2` 彻底修复）。
   - **已定因根因与本轮已核验架构约束**：
-    1. **本地 HTTP 反向代理与 `__puus` 持久化**：`LocalHTTPStreamProxy` 通过 `NWListener` + `URLSessionDataDelegate` 流式转发，302 与 `.m3u8` 重写不丢 `Cookie / Referer / UA`，并在响应 `Set-Cookie` 时触发 `onCookieUpdate` 同步写入 `MediaSourceStore`。
-    2. **零拷贝异步 `CAMetalLayer` 与 Activity 降耗**：非 HDR/杜比视界画质增强直接由 Fragment Shader（FP16 5 点线性多尺度）上屏，禁止在热渲染路径调用 `waitUntilCompleted()`；仅 `96/120fps` 申请 `.latencyCritical`。
-    3. **Swift 6 与门禁红线**：测试异步桩锁操作封装于 `@unchecked Sendable` 同步方法；`OpticalFlowPlayerController` 保持 `nonisolated init()`；`tests/GlassMPVTests.swift` 禁止含未转义引号的 `"""` 多行字符串；`VTOpticalFlowEngine.swift` 的 `runOpticalFlowTask..#endif` 区间内严禁直接出现 `.lock()`/`.unlock()`。
+    1. **4Hz 遥测与高刷直绘背压**：`OpticalFlowPlayerController` 所有帧级统计均先写入 `raw*` 再按 `0.25s` 节流同步至 `@Published`（首帧/暂停/采样除外），`SampleBufferDisplayContainerView.layoutDisplayLayer` 具备全字段幂等保护与 `96/120fps` 1600px 长边上限，`MetalVideoEnhancer.renderToLayerStatus` 限流 3 帧并发在途。
+    2. **夸克单机扫码与 `__puus` 兜底**：优先采用 `uop.quark.cn` 原生 CAS 二维码（存相册 + `quark://` 跳转）与 2s 自动轮询，并通过 `/account/info?st=...` + `bootstrapSessionCookie` 首访根目录确保 `__puus` 落库。
+    3. **Swift 6 与门禁红线**：`QuarkPhotoSaver` 延迟初始化避开非隔离 memberwise `init`；`WKNavigationDelegate` `decidePolicyFor async` 内部使用 `_ = await UIApplication.shared.open(...)`；`VTOpticalFlowEngine.swift` 的 `runOpticalFlowTask..#endif` 区间内严禁 `.lock()`/`.unlock()`；`tests/GlassMPVTests.swift` 禁止含未转义引号的 `"""`。
 - **待办清单**：
-  - [x] 完成 `v0.1.0-beta.1 (Build 18)` 零拷贝 FP16 直绘、`.latencyCritical` 温控降压与 `LocalHTTPStreamProxy` 上线（CI Run `45965239531`，31/31 PASS，`7m22s`）。
-  - [x] 下载校验 `dist/GlassMPV-0.1.0-beta.1-b18-unsigned.ipa`（`3,214,453` bytes）并投递微信「文件传输助手」。
-  - [ ] 用户真机实测 `v0.1.0-beta.1`：对比 `48fps + 老片去糊` 机身发热改善，以及夸克网盘桌面扫码挂载与 `127.0.0.1` 代理播放稳定性。
+  - [x] 完成 `v0.1.0-beta.2 (Build 20)` 控制栏 120Hz 掉帧根治与夸克单机扫码通道上线（CI Run `45970694843`，33/33 PASS，`10m51s`）。
+  - [x] 下载校验 `dist/GlassMPV-0.1.0-beta.2-b20-unsigned.ipa`（`3,310,527` bytes）并投递微信「文件传输助手」。
+  - [ ] 用户真机实测 `v0.1.0-beta.2`：确认开启 120fps + 展开控制栏与超分弹窗不掉帧，并验证夸克「保存二维码并打开夸克 App」单机扫码登录与视频流播放体验。
