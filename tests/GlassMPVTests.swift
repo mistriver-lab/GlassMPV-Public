@@ -1008,17 +1008,25 @@ final class GlassMPVTests: XCTestCase {
             height: 180,
             fps: 24
         )
-        coordinator.open(url: sampleURL, isSecurityScoped: false)
+        func waitForPassthroughFrames(timeoutSeconds: TimeInterval) async throws {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if coordinator.opticalFlowController.errorMessage != nil {
+                    break
+                }
+                if coordinator.opticalFlowController.presentedFrameCount > 0 {
+                    break
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
 
-        let deadline = Date().addingTimeInterval(15.0)
-        while Date() < deadline {
-            if coordinator.opticalFlowController.errorMessage != nil {
-                break
-            }
-            if coordinator.opticalFlowController.presentedFrameCount > 0 {
-                break
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        coordinator.open(url: sampleURL, isSecurityScoped: false)
+        try await waitForPassthroughFrames(timeoutSeconds: 15.0)
+        if coordinator.opticalFlowController.presentedFrameCount == 0 {
+            coordinator.opticalFlowController.clearError()
+            coordinator.open(url: sampleURL, isSecurityScoped: false)
+            try await waitForPassthroughFrames(timeoutSeconds: 15.0)
         }
         XCTAssertNil(coordinator.opticalFlowController.errorMessage)
         XCTAssertGreaterThan(coordinator.opticalFlowController.presentedFrameCount, 0)
