@@ -1737,7 +1737,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var presentedTimestamps: [CFTimeInterval] = []
     private var lastFPSPublishTimestamp: CFTimeInterval = 0
     @MainActor private var lastDisplayTickHostTime: CFTimeInterval = 0
-    @MainActor private var playbackActivityToken: NSObjectProtocol?
+    private final class PlaybackActivityTokenHolder: @unchecked Sendable {
+        var token: (any NSObjectProtocol)?
+    }
+    private let playbackActivityHolder = PlaybackActivityTokenHolder()
 
     @MainActor
     func attach(to container: SampleBufferDisplayContainerView) {
@@ -2309,15 +2312,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor
     private func updatePlaybackActivity(isActive: Bool) {
         if isActive {
-            if playbackActivityToken == nil {
-                playbackActivityToken = ProcessInfo.processInfo.beginActivity(
+            if playbackActivityHolder.token == nil {
+                playbackActivityHolder.token = ProcessInfo.processInfo.beginActivity(
                     options: [.userInitiated, .latencyCritical, .idleDisplaySleepDisabled],
                     reason: "GlassMPV Real-Time ANE Optical Flow"
                 )
             }
-        } else if let token = playbackActivityToken {
+        } else if let token = playbackActivityHolder.token {
             ProcessInfo.processInfo.endActivity(token)
-            playbackActivityToken = nil
+            playbackActivityHolder.token = nil
         }
     }
 
