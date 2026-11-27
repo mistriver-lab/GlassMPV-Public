@@ -755,7 +755,8 @@ struct CloudSourceBrowserSheet: View {
     @Environment(\.dismiss) private var dismiss
     let account: MediaSourceAccount
     @ObservedObject var store: MediaSourceStore
-    let onPlay: (PlaybackMediaRequest) -> Void
+    @ObservedObject var watchHistoryStore: WatchHistoryStore
+    let onPlay: (PlaybackMediaRequest, Double) -> Void
     let onDownloadLocal: (URL) -> Void
 
     @State private var crumbs: [CloudFolderCrumb]
@@ -768,11 +769,13 @@ struct CloudSourceBrowserSheet: View {
     init(
         account: MediaSourceAccount,
         store: MediaSourceStore,
-        onPlay: @escaping (PlaybackMediaRequest) -> Void,
+        watchHistoryStore: WatchHistoryStore,
+        onPlay: @escaping (PlaybackMediaRequest, Double) -> Void,
         onDownloadLocal: @escaping (URL) -> Void
     ) {
         self.account = account
         self.store = store
+        self.watchHistoryStore = watchHistoryStore
         self.onPlay = onPlay
         self.onDownloadLocal = onDownloadLocal
 
@@ -789,10 +792,15 @@ struct CloudSourceBrowserSheet: View {
         crumbs.last ?? CloudFolderCrumb(id: "root", title: account.name, folderKey: "")
     }
 
+    private var directorySubtitleItems: [CloudMediaItem] {
+        items.filter(\.isSubtitle)
+    }
+
     private var filteredItems: [CloudMediaItem] {
+        let base = items.filter { !$0.isSubtitle }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return items }
-        return items.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return base }
+        return base.filter { $0.name.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -840,6 +848,14 @@ struct CloudSourceBrowserSheet: View {
                         }
                     }
 
+                    if !directorySubtitleItems.isEmpty {
+                        Section {
+                            Label("当前目录已自动发现 \(directorySubtitleItems.count) 个外挂字幕，播放影片将自动匹配加载", systemImage: "captions.bubble.fill")
+                                .font(.caption)
+                                .foregroundStyle(.cyan)
+                        }
+                    }
+
                     if filteredItems.isEmpty && !isLoading && errorMessage == nil {
                         ContentUnavailableView(
                             searchText.isEmpty ? "当前目录暂无支持视频" : "无匹配结果",
@@ -848,10 +864,29 @@ struct CloudSourceBrowserSheet: View {
                         )
                     } else {
                         ForEach(filteredItems) { item in
+                            let history = item.isDirectory ? nil : watchHistoryStore.entry(forCloudItemID: item.id, accountID: account.id)
                             CloudMediaRowView(
                                 item: item,
-                                onTap: { handleItemTap(item) },
-                                onPlayPreferringAlt: { handleItemTap(item, preferAlternate: true) },
+                                historyEntry: history,
+                                onTap: {
+                                    let seekPos: Double
+                                    if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
+                                        seekPos = max(0, history.positionSeconds - 2.0)
+                                    } else {
+                                        seekPos = 0
+                                    }
+                                    handleItemTap(item, seekTo: seekPos)
+                                },
+                                onPlayFromBeginning: { handleItemTap(item, seekTo: 0) },
+                                onPlayPreferringAlt: {
+                                    let seekPos: Double
+                                    if let history, !history.isCompleted, history.positionSeconds >= 5.0 {
+                                        seekPos = max(0, history.positionSeconds - 2.0)
+                                    } else {
+                                        seekPos = 0
+                                    }
+                                    handleItemTap(item, preferAlternate: true, seekTo: seekPos)
+                                },
                                 onCacheOffline: { cacheItemOffline(item) }
                             )
                         }
@@ -945,7 +980,62 @@ struct CloudSourceBrowserSheet: View {
         isLoading = false
     }
 
-    private func handleItemTap(_ item: CloudMediaItem, preferAlternate: Bool = false) {
+    private func buildSubtitleCandidates(for videoItem: CloudMediaItem, secret: String) -> [CloudSubtitleCandidate] {
+        var result: [CloudSubtitleCandidate] = videoItem.embeddedSubtitleCandidates.map {
+            CloudSubtitleCandidate(
+                id: $0.id,
+                name: $0.name,
+                fileExtension: $0.fileExtension,
+                sourceKind: $0.sourceKind,
+                accountID: account.id,
+                directURL: $0.directURL,
+                headers: $0.headers,
+                embySubtitleStreamIndex: $0.embySubtitleStreamIndex,
+                mediaSourceId: $0.mediaSourceId,
+                itemId: $0.itemId
+            )
+        }
+        let videoStem = (videoItem.name as NSString).deletingPathExtension.lowercased()
+        let authHeaders: [String: String]
+        switch account.kind {
+        case .quark:
+            authHeaders = QuarkDriveClient.requestHeaders(cookie: secret)
+        case .emby:
+            authHeaders = EmbyClient.requestHeaders(token: secret)
+        case .webdav:
+            if let auth = WebDAVClient.basicAuthHeader(username: account.username, password: secret) {
+                authHeaders = ["Authorization": auth]
+            } else {
+                authHeaders = [:]
+            }
+        }
+        let sortedSubs = directorySubtitleItems.sorted { lhs, rhs in
+            let lStem = (lhs.name as NSString).deletingPathExtension.lowercased()
+            let rStem = (rhs.name as NSString).deletingPathExtension.lowercased()
+            let lMatch = !videoStem.isEmpty && (lStem == videoStem || lStem.hasPrefix(videoStem) || videoStem.hasPrefix(lStem))
+            let rMatch = !videoStem.isEmpty && (rStem == videoStem || rStem.hasPrefix(videoStem) || videoStem.hasPrefix(rStem))
+            if lMatch != rMatch {
+                return lMatch && !rMatch
+            }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+        for sub in sortedSubs {
+            result.append(
+                CloudSubtitleCandidate(
+                    id: sub.id,
+                    name: sub.name,
+                    fileExtension: sub.fileExtension,
+                    sourceKind: account.kind,
+                    accountID: account.id,
+                    directURL: sub.directURL,
+                    headers: authHeaders
+                )
+            )
+        }
+        return result
+    }
+
+    private func handleItemTap(_ item: CloudMediaItem, preferAlternate: Bool = false, seekTo: Double = 0) {
         if item.isDirectory {
             let nextKey = item.id
             guard crumbs.last?.folderKey != nextKey else { return }
@@ -956,6 +1046,7 @@ struct CloudSourceBrowserSheet: View {
         busyMessage = "正在解析播放直链..."
         errorMessage = nil
         let secret = store.secret(for: account.id)
+        let subCandidates = buildSubtitleCandidates(for: item, secret: secret)
 
         Task { @MainActor in
             do {
@@ -967,11 +1058,13 @@ struct CloudSourceBrowserSheet: View {
                     sourceLabel: "\(account.kind.shortBadge) · \(resolved.qualityLabel)",
                     isHLS: resolved.isHLS,
                     alternatives: resolved.alternatives,
-                    accountID: account.id
+                    accountID: account.id,
+                    cloudItem: item,
+                    subtitleCandidates: subCandidates
                 )
                 busyMessage = nil
                 dismiss()
-                onPlay(request)
+                onPlay(request, seekTo)
             } catch {
                 busyMessage = nil
                 errorMessage = error.localizedDescription
@@ -1056,7 +1149,9 @@ struct CloudSourceBrowserSheet: View {
 
 private struct CloudMediaRowView: View {
     let item: CloudMediaItem
+    let historyEntry: WatchHistoryEntry?
     let onTap: () -> Void
+    let onPlayFromBeginning: () -> Void
     let onPlayPreferringAlt: () -> Void
     let onCacheOffline: () -> Void
 
@@ -1064,7 +1159,7 @@ private struct CloudMediaRowView: View {
         HStack(spacing: 12) {
             thumbnailView
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(item.name)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(2)
@@ -1082,6 +1177,40 @@ private struct CloudMediaRowView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+
+                if let historyEntry {
+                    if historyEntry.isCompleted {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption2)
+                            Text("已看完")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundStyle(.green)
+                    } else if historyEntry.positionSeconds >= 3.0 {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text("续播 \(WatchHistoryEntry.formatClock(historyEntry.positionSeconds))")
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.cyan)
+                                Text(historyEntry.remainingText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if historyEntry.durationSeconds > 1.0 {
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule().fill(Color.white.opacity(0.14))
+                                        Capsule()
+                                            .fill(Color.cyan)
+                                            .frame(width: max(4, geo.size.width * historyEntry.progress))
+                                    }
+                                }
+                                .frame(height: 3)
+                            }
+                        }
+                    }
+                }
             }
 
             Spacer(minLength: 4)
@@ -1095,7 +1224,19 @@ private struct CloudMediaRowView: View {
                     Button {
                         onTap()
                     } label: {
-                        Label("智能默认流播放", systemImage: "play.fill")
+                        Label(
+                            (historyEntry != nil && historyEntry?.isCompleted == false && (historyEntry?.positionSeconds ?? 0) >= 5.0)
+                                ? "断点续播 (\(WatchHistoryEntry.formatClock(historyEntry?.positionSeconds ?? 0)))"
+                                : "智能默认流播放",
+                            systemImage: "play.fill"
+                        )
+                    }
+                    if historyEntry != nil {
+                        Button {
+                            onPlayFromBeginning()
+                        } label: {
+                            Label("从头开始播放", systemImage: "backward.end.fill")
+                        }
                     }
                     Button {
                         onPlayPreferringAlt()

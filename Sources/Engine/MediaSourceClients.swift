@@ -456,7 +456,9 @@ enum QuarkDriveClient: Sendable {
             }
             let isDir = (entry["dir"] as? Bool) ?? ((entry["file_type"] as? Int) == 0)
             let ext = (fileName as NSString).pathExtension.lowercased()
-            if !isDir && !CloudMediaItem.supportedVideoExtensions.contains(ext) {
+            let isSupportedFile = CloudMediaItem.supportedVideoExtensions.contains(ext)
+                || CloudMediaItem.supportedSubtitleExtensions.contains(ext)
+            if !isDir && !isSupportedFile {
                 continue
             }
             let sizeBytes: Int64?
@@ -636,6 +638,21 @@ enum QuarkDriveClient: Sendable {
             )
         }
         throw MediaSourceClientError.emptyStream("未能获取《\(item.name)》的可播放地址，请检查 Cookie 是否过期。")
+    }
+
+    static func fetchDownloadURL(
+        fid: String,
+        cookie: String,
+        session: URLSession = .shared,
+        onCookieRefresh: (@Sendable (String) -> Void)? = nil
+    ) async throws -> URL {
+        let headers = requestHeaders(cookie: cookie)
+        return try await fetchDownloadURL(
+            fid: fid,
+            headers: headers,
+            session: session,
+            onCookieRefresh: onCookieRefresh
+        )
     }
 
     private static func fetchDownloadURL(
@@ -894,6 +911,45 @@ enum EmbyClient: Sendable {
                 URLQueryItem(name: "api_key", value: token)
             ]
 
+            var embySubCandidates: [CloudSubtitleCandidate] = []
+            if let mediaStreams = firstSource?["MediaStreams"] as? [[String: Any]] {
+                for stream in mediaStreams {
+                    let sType = (stream["Type"] as? String) ?? ""
+                    guard sType.caseInsensitiveCompare("Subtitle") == .orderedSame,
+                          let streamIndex = stream["Index"] as? Int else {
+                        continue
+                    }
+                    let isText = (stream["IsTextSubtitleStream"] as? Bool) ?? true
+                    guard isText else { continue }
+                    let lang = (stream["Language"] as? String) ?? ""
+                    let displayTitle = (stream["DisplayTitle"] as? String)
+                        ?? (stream["Title"] as? String)
+                        ?? (lang.isEmpty ? "字幕 #\(streamIndex)" : lang.uppercased())
+                    var subComps = URLComponents(
+                        url: baseURL.appendingPathComponent("emby/Videos/\(id)/\(msId)/Subtitles/\(streamIndex)/Stream.vtt"),
+                        resolvingAgainstBaseURL: false
+                    )
+                    subComps?.queryItems = [
+                        URLQueryItem(name: "api_key", value: token)
+                    ]
+                    if let subURL = subComps?.url {
+                        embySubCandidates.append(
+                            CloudSubtitleCandidate(
+                                id: "emby-\(id)-\(msId)-\(streamIndex)",
+                                name: displayTitle,
+                                fileExtension: "vtt",
+                                sourceKind: .emby,
+                                directURL: subURL,
+                                headers: requestHeaders(token: token),
+                                embySubtitleStreamIndex: streamIndex,
+                                mediaSourceId: msId,
+                                itemId: id
+                            )
+                        )
+                    }
+                }
+            }
+
             parsed.append(CloudMediaItem(
                 id: id,
                 name: name,
@@ -907,7 +963,8 @@ enum EmbyClient: Sendable {
                 sourceKind: .emby,
                 embyItemType: itemType,
                 mediaSourceId: msId,
-                container: container
+                container: container,
+                embeddedSubtitleCandidates: embySubCandidates
             ))
         }
         return parsed
@@ -1048,7 +1105,9 @@ enum WebDAVClient: Sendable {
 
             let ext = (decodedName as NSString).pathExtension.lowercased()
             let isDir = entry.isCollection || entry.href.hasSuffix("/")
-            if !isDir && !CloudMediaItem.supportedVideoExtensions.contains(ext) {
+            let isSupportedFile = CloudMediaItem.supportedVideoExtensions.contains(ext)
+                || CloudMediaItem.supportedSubtitleExtensions.contains(ext)
+            if !isDir && !isSupportedFile {
                 continue
             }
             let tempItem = CloudMediaItem(

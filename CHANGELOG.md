@@ -2,6 +2,19 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.4] - 2026-11-27
+
+### 新增与修复 (Added & Fixed)
+- **根治 `184353` 实机日志定位的在线视频高刷补帧失效 (`RemoteStreamOpticalFlowWorker` + `VTOpticalFlowEngine`)**：
+  - **分级远程分辨率规划 (`RemoteOpticalFlowBudgetPlanner`)**：`2×` 保持 720p 起步；`60fps / 96fps` 收敛至 `540p → 480p → 360p`；`120fps` 收敛至 `480p → 360p → 288p`，并接入 `OpticalFlowBudgetGuard` 在推理超源帧间隔时自动降分辨率或降档稳帧，防止 `58~61ms` 推理打穿 `41.7ms` 帧预算。
+  - **有界双帧输入队列 + 动态 Pacer 时钟滞后 + 切档扩容**：将单槽覆盖升级为 2 帧 FIFO；在 `enqueueRemoteInterpolatedFrames` 根据实测 `avgMs` 平滑调节 `remotePacerLagSeconds`（`0.095~0.195s`）并放宽 `OpticalFlowFramePacer` 宽限窗至 `75ms`，同步在在线切换档位时重算 `maxQueuedFrames`，彻底消除成批丢帧与帧率坍缩。
+- **新增纯原生字幕系统 (`SubtitleModels` + `SubtitleManager` + `LiquidGlassPlayerView` + `MediaSourceClients`)**：
+  - 支持 UTF-8 / UTF-16 / GB18030 自动解码与 `.srt` / `.vtt` / `.ass` / `.ssa` 完整解析、二分检索区间匹配；支持视频内嵌 `legible` 软字幕（远程 `AVPlayerItemLegibleOutput` + 本地 `AVAssetReader`）、云盘同目录字幕自动发现（夸克 / WebDAV / Emby）及外挂文件导入。
+  - 播放底栏新增「字幕」面板，支持开关、轨道切换及字号/底边距/颜色/背景不透明度/时间偏移（±0.25s）实时调节。
+- **新增 Infuse 风格直观观看记录 (`WatchHistoryStore` + `LiquidGlassPlayerView` + `CloudMediaLibraryView`)**：
+  - 首页新增「继续观看」横向 16:9 剧照卡片墙（显示片源标签、剩余时长、进度条与上下文菜单）及「全部记录」管理面板；云盘目录行内置进度条与「续播 MM:SS / ✓ 已看完」标记。
+  - 自动截取播放画面剧照、每 6 秒及暂停/切后台/退出时实时落盘 `watch_history.json`，支持点击一键断点续播或从头播放。
+
 ## [v0.1.0-beta.3] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)

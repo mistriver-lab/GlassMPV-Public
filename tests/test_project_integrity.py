@@ -241,11 +241,30 @@ def test_swift_sources_non_empty_and_balanced():
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
+        ROOT / "Sources" / "Models" / "SubtitleModels.swift",
+        ROOT / "Sources" / "Models" / "WatchHistoryStore.swift",
         ROOT / "Sources" / "Engine" / "MediaSourceClients.swift",
         ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift",
+        ROOT / "Sources" / "Engine" / "SubtitleManager.swift",
         ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
     ):
         assert required_cloud_file.is_file(), f"Missing {required_cloud_file}"
+
+    remote_worker_src = (ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift").read_text(encoding="utf-8")
+    assert "RemoteOpticalFlowBudgetPlanner" in remote_worker_src
+    assert "OpticalFlowBudgetGuard" in remote_worker_src
+
+    sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
+    assert "SubtitleParser" in sub_models_src
+    assert "SubtitleCue" in sub_models_src
+
+    sub_mgr_src = (ROOT / "Sources" / "Engine" / "SubtitleManager.swift").read_text(encoding="utf-8")
+    assert "final class SubtitleManager" in sub_mgr_src
+    assert "AVPlayerItemLegibleOutput" in sub_mgr_src
+
+    history_src = (ROOT / "Sources" / "Models" / "WatchHistoryStore.swift").read_text(encoding="utf-8")
+    assert "final class WatchHistoryStore" in history_src
+    assert "WatchHistoryEntry" in history_src
 
     media_clients_src = (ROOT / "Sources" / "Engine" / "MediaSourceClients.swift").read_text(encoding="utf-8")
     assert "getTokenForQrcodeLogin" in media_clients_src
@@ -365,6 +384,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "uiAuditLogs" in player_view
     assert "recordUISwitch" in player_view
     assert "DeviceDiagnosticsSampler" in player_view
+    assert "SubtitleControlSheet" in player_view
+    assert "WatchHistorySheet" in player_view
+    assert "subtitleManager" in player_view
+    assert "watchHistoryStore" in player_view
 
     swift_test_src = swift_test_file.read_text(encoding="utf-8")
     assert "testOpticalFlowResolutionPlannerAndCandidateFallback" in swift_test_src
@@ -384,6 +407,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testQuarkQRLoginParsingAndURLBuilder" in swift_test_src
     assert "testMetalDrawableSizingAndTelemetryThrottling" in swift_test_src
     assert "testLocalHTTPStreamProxyHEV1ToHVC1RewriteAndChunkBoundary" in swift_test_src
+    assert "testRemoteOpticalFlowBudgetPlannerAndAdaptiveLag" in swift_test_src
+    assert "testSubtitleParserSRTWebVTTASSAndActiveLookup" in swift_test_src
+    assert "testWatchHistoryStorePersistenceProgressAndContinueWatching" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

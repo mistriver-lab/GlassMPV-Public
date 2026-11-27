@@ -1941,4 +1941,155 @@ final class GlassMPVTests: XCTestCase {
         streamed.append(patcher.flush())
         XCTAssertEqual(streamed, oneShot)
     }
+
+    func testRemoteOpticalFlowBudgetPlannerAndAdaptiveLag() {
+        let plan2x = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
+            sourceWidth: 2936,
+            sourceHeight: 2160,
+            maxInterpolatedFrames: 1
+        )
+        XCTAssertEqual(plan2x.first?.height, 720)
+        XCTAssertEqual(plan2x.map(\.height), [720, 540, 480])
+
+        let plan96 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
+            sourceWidth: 2936,
+            sourceHeight: 2160,
+            maxInterpolatedFrames: 3
+        )
+        XCTAssertEqual(plan96.first?.height, 540)
+        XCTAssertTrue(plan96.contains(where: { $0.height == 480 }))
+
+        let plan120 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
+            sourceWidth: 2936,
+            sourceHeight: 2160,
+            maxInterpolatedFrames: 4
+        )
+        XCTAssertEqual(plan120.first?.height, 480)
+        XCTAssertTrue(plan120.contains(where: { $0.height == 360 }))
+
+        let lagLow = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
+            sourceFPS: 24.0,
+            averageInterpolationMs: 17.0,
+            targetFPS: .x2
+        )
+        let lagHigh = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
+            sourceFPS: 24.0,
+            averageInterpolationMs: 58.0,
+            targetFPS: .fps120
+        )
+        XCTAssertGreaterThan(lagHigh, lagLow)
+        XCTAssertGreaterThanOrEqual(lagHigh, 0.13)
+        XCTAssertLessThanOrEqual(lagHigh, 0.195)
+    }
+
+    func testSubtitleParserSRTWebVTTASSAndActiveLookup() {
+        let srt = """
+        1
+        00:00:01,500 --> 00:00:04,200
+        <i>第一句字幕</i>
+        第二行内容
+
+        2
+        00:00:05,000 --> 00:00:08,000
+        {\\an8}顶部注释
+        """
+        let srtCues = SubtitleParser.parse(text: srt, fileExtension: "srt")
+        XCTAssertEqual(srtCues.count, 2)
+        XCTAssertEqual(srtCues[0].text, "第一句字幕\n第二行内容")
+        XCTAssertEqual(srtCues[1].text, "顶部注释")
+
+        let activeAt2 = SubtitleParser.activeCues(in: srtCues, at: 2.0, offset: 0)
+        XCTAssertEqual(activeAt2.map(\.text), ["第一句字幕\n第二行内容"])
+        let activeWithOffset = SubtitleParser.activeCues(in: srtCues, at: 4.5, offset: 1.0)
+        XCTAssertEqual(activeWithOffset.map(\.text), ["顶部注释"])
+
+        let vtt = """
+        WEBVTT
+
+        NOTE comment ignored
+
+        00:10.000 --> 00:12.500 align:start position:10%
+        <c.cyan>WebVTT Cue</c>
+        """
+        let vttCues = SubtitleParser.parse(text: vtt, fileExtension: "vtt")
+        XCTAssertEqual(vttCues.count, 1)
+        XCTAssertEqual(vttCues[0].startTime, 10.0, accuracy: 0.001)
+        XCTAssertEqual(vttCues[0].text, "WebVTT Cue")
+
+        let ass = """
+        [Script Info]
+        Title: Test
+
+        [Events]
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        Dialogue: 0,0:01:02.50,0:01:05.75,Default,,0,0,0,,{\\pos(100,200)}Hello, World\\N第二行
+        """
+        let assCues = SubtitleParser.parse(text: ass, fileExtension: "ass")
+        XCTAssertEqual(assCues.count, 1)
+        XCTAssertEqual(assCues[0].startTime, 62.50, accuracy: 0.001)
+        XCTAssertEqual(assCues[0].endTime, 65.75, accuracy: 0.001)
+        XCTAssertEqual(assCues[0].text, "Hello, World\n第二行")
+    }
+
+    @MainActor
+    func testWatchHistoryStorePersistenceProgressAndContinueWatching() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("glassmpv_history_test_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let accountID = UUID()
+        let cloudItem = CloudMediaItem(
+            id: "fid_028",
+            name: "028.mp4",
+            isDirectory: false,
+            sizeBytes: 1_024_000,
+            durationSeconds: 3000,
+            fileExtension: "mp4",
+            subtitle: "MP4 · 4K",
+            sourceKind: .quark
+        )
+        let entryID = WatchHistoryEntry.makeEntryID(
+            sourceKind: .quark,
+            accountID: accountID,
+            cloudItemID: cloudItem.id
+        )
+
+        let store1 = WatchHistoryStore(storageDirectory: tempDir)
+        let saved = store1.upsertProgress(
+            id: entryID,
+            title: "028.mp4",
+            subtitle: "MP4 · 4K",
+            sourceKind: .quark,
+            sourceBadge: "夸克",
+            accountID: accountID,
+            cloudItem: cloudItem,
+            positionSeconds: 750,
+            durationSeconds: 3000
+        )
+        XCTAssertEqual(saved.progress, 0.25, accuracy: 0.001)
+        XCTAssertFalse(saved.isCompleted)
+        XCTAssertEqual(saved.remainingText, "剩余 37 分钟")
+        XCTAssertEqual(store1.continueWatchingEntries.count, 1)
+
+        // 重建实例验证磁盘持久化与自动标为已看完逻辑
+        let store2 = WatchHistoryStore(storageDirectory: tempDir)
+        let reloaded = try XCTUnwrap(store2.entry(forCloudItemID: "fid_028", accountID: accountID))
+        XCTAssertEqual(reloaded.positionSeconds, 750, accuracy: 0.01)
+
+        let completed = store2.upsertProgress(
+            id: entryID,
+            title: "028.mp4",
+            sourceKind: .quark,
+            accountID: accountID,
+            cloudItem: cloudItem,
+            positionSeconds: 2900,
+            durationSeconds: 3000
+        )
+        XCTAssertTrue(completed.isCompleted)
+        XCTAssertEqual(completed.remainingText, "已看完")
+        XCTAssertTrue(store2.continueWatchingEntries.isEmpty)
+
+        store2.remove(id: entryID)
+        XCTAssertTrue(store2.entries.isEmpty)
+    }
 }

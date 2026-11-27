@@ -14,6 +14,13 @@ final class NativeDocumentPickerPresenter: NSObject, UIDocumentPickerDelegate {
         .item
     ]
 
+    static let supportedSubtitleTypes: [UTType] = [
+        .plainText,
+        .text,
+        .data,
+        .item
+    ]
+
     private var onPick: (@MainActor (URL) -> Void)?
     private var onCancel: (@MainActor () -> Void)?
     private var onError: (@MainActor (String) -> Void)?
@@ -22,9 +29,9 @@ final class NativeDocumentPickerPresenter: NSObject, UIDocumentPickerDelegate {
         super.init()
     }
 
-    static func makePicker() -> UIDocumentPickerViewController {
+    static func makePicker(contentTypes: [UTType] = supportedContentTypes) -> UIDocumentPickerViewController {
         let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: supportedContentTypes,
+            forOpeningContentTypes: contentTypes,
             asCopy: true
         )
         picker.allowsMultipleSelection = false
@@ -38,6 +45,33 @@ final class NativeDocumentPickerPresenter: NSObject, UIDocumentPickerDelegate {
         onCancel: (@MainActor () -> Void)? = nil,
         onError: (@MainActor (String) -> Void)? = nil
     ) {
+        presentPicker(
+            contentTypes: Self.supportedContentTypes,
+            onPick: onPick,
+            onCancel: onCancel,
+            onError: onError
+        )
+    }
+
+    func presentSubtitlePicker(
+        onPick: @escaping @MainActor (URL) -> Void,
+        onCancel: (@MainActor () -> Void)? = nil,
+        onError: (@MainActor (String) -> Void)? = nil
+    ) {
+        presentPicker(
+            contentTypes: Self.supportedSubtitleTypes,
+            onPick: onPick,
+            onCancel: onCancel,
+            onError: onError
+        )
+    }
+
+    private func presentPicker(
+        contentTypes: [UTType],
+        onPick: @escaping @MainActor (URL) -> Void,
+        onCancel: (@MainActor () -> Void)?,
+        onError: (@MainActor (String) -> Void)?
+    ) {
         guard let topVC = Self.topmostViewController() else {
             onError?("无法获取当前窗口控制器，请重试。")
             return
@@ -50,7 +84,7 @@ final class NativeDocumentPickerPresenter: NSObject, UIDocumentPickerDelegate {
         self.onCancel = onCancel
         self.onError = onError
 
-        let picker = Self.makePicker()
+        let picker = Self.makePicker(contentTypes: contentTypes)
         picker.delegate = self
         topVC.present(picker, animated: true)
     }

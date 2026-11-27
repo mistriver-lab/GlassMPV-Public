@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.3"
+    static let releaseTag = "0.1.0-beta.4"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.4",
+            date: "2026-11-27",
+            highlights: [
+                "根治在线视频 60/96/120fps 补帧掉帧与失效：RemoteStreamOpticalFlowWorker 新增分级分辨率上限（60/96fps 起步 540p、120fps 起步 480p）、有界双帧输入队列、OpticalFlowBudgetGuard 自动降分辨率/降档稳帧，以及动态自适应时钟滞后 (remotePacerLagSeconds) 与切档队列扩容，彻底消除 184353 日志中 978×720 超预算导致的 1222 帧批量丢弃",
+                "新增纯原生字幕系统（内嵌软字幕 + 外挂 SRT/ASS/SSA/VTT）：支持云盘同目录字幕自动配对与 Emby 字幕轨发现、本地同目录自动挂载与文件导入，提供字号/底边距/配色/背景不透明度/±0.25s 时间偏移实时调节",
+                "新增 Infuse 风格观看记录与断点续播体系：首页「继续观看」16:9 剧照进度卡片墙 +「全部记录」管理面板、云盘列表实时进度条与「续播/已看完」徽章，自动截取高清剧照并在暂停/退后台/返回主页时瞬时持久化进度"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.3",
             date: "2026-11-27",

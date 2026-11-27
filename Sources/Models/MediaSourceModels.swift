@@ -83,15 +83,24 @@ struct CloudMediaItem: Identifiable, Hashable, Sendable {
     let mediaSourceId: String?
     let container: String?
     let directURL: URL?
+    let embeddedSubtitleCandidates: [CloudSubtitleCandidate]
 
     static let supportedVideoExtensions: Set<String> = [
         "mp4", "mov", "m4v", "mkv", "ts", "m2ts",
         "avi", "flv", "webm", "rmvb", "mpg", "mpeg", "wmv"
     ]
 
+    static let supportedSubtitleExtensions: Set<String> = [
+        "srt", "ass", "ssa", "vtt"
+    ]
+
     static let nativeAVFoundationExtensions: Set<String> = [
         "mp4", "mov", "m4v", "ts", "m3u8"
     ]
+
+    var isSubtitle: Bool {
+        !isDirectory && Self.supportedSubtitleExtensions.contains(fileExtension)
+    }
 
     init(
         id: String,
@@ -107,7 +116,8 @@ struct CloudMediaItem: Identifiable, Hashable, Sendable {
         embyItemType: String? = nil,
         mediaSourceId: String? = nil,
         container: String? = nil,
-        directURL: URL? = nil
+        directURL: URL? = nil,
+        embeddedSubtitleCandidates: [CloudSubtitleCandidate] = []
     ) {
         self.id = id
         self.name = name
@@ -123,6 +133,7 @@ struct CloudMediaItem: Identifiable, Hashable, Sendable {
         self.mediaSourceId = mediaSourceId
         self.container = container
         self.directURL = directURL
+        self.embeddedSubtitleCandidates = embeddedSubtitleCandidates
     }
 
     var formattedSizeString: String {
@@ -171,6 +182,8 @@ struct PlaybackMediaRequest: Sendable, Equatable {
     let isHLS: Bool
     let alternatives: [StreamVariantOption]
     let accountID: UUID?
+    let cloudItem: CloudMediaItem?
+    let subtitleCandidates: [CloudSubtitleCandidate]
 
     init(
         url: URL,
@@ -179,7 +192,9 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         sourceLabel: String,
         isHLS: Bool = false,
         alternatives: [StreamVariantOption],
-        accountID: UUID? = nil
+        accountID: UUID? = nil,
+        cloudItem: CloudMediaItem? = nil,
+        subtitleCandidates: [CloudSubtitleCandidate] = []
     ) {
         self.url = url
         self.headers = headers
@@ -188,5 +203,7 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         self.isHLS = isHLS
         self.alternatives = alternatives
         self.accountID = accountID
+        self.cloudItem = cloudItem
+        self.subtitleCandidates = subtitleCandidates
     }
 }

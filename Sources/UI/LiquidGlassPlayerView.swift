@@ -43,13 +43,20 @@ final class PlayerCoordinator: ObservableObject {
     @Published var qualityCompareMode: VideoEnhancementCompareMode = .off
     @Published var activeMediaRequest: PlaybackMediaRequest?
     @Published var currentStreamVariants: [StreamVariantOption] = []
+    @Published var resumeToastText: String?
+    @Published var isResolvingHistoryResume: Bool = false
+    @Published private(set) var activeHistoryEntryID: String?
 
     let opticalFlowController = OpticalFlowPlayerController()
     let mediaSourceStore = MediaSourceStore()
+    let subtitleManager = SubtitleManager()
+    let watchHistoryStore = WatchHistoryStore()
     private let thermalToken = ThermalObserverToken()
     private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
     private var autoFallbackAttemptedURLs: Set<URL> = []
+    private var resumeToastTask: Task<Void, Never>?
+    private var thumbnailCapturedEntryIDs: Set<String> = []
 
     private static let auditTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -61,6 +68,12 @@ final class PlayerCoordinator: ObservableObject {
         opticalFlowController.setEDREnabled(isEDREnabled)
         opticalFlowController.setAspectFill(isAspectFill)
         opticalFlowController.isLoopingEnabled = isLooping
+        opticalFlowController.onRemoteAssetReady = { [weak self] asset, item in
+            self?.subtitleManager.inspectRemoteAsset(asset, playerItem: item)
+        }
+        opticalFlowController.onLocalAssetReady = { [weak self] asset, url in
+            self?.subtitleManager.inspectLocalAsset(asset, url: url)
+        }
 
         thermalToken.observer = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
@@ -180,14 +193,36 @@ final class PlayerCoordinator: ObservableObject {
         )
     }
 
-    func open(url: URL, isSecurityScoped: Bool = false) {
+    func presentSubtitleFilePicker() {
+        opticalFlowController.appendLog("[sub] 正在拉起系统文件选择器导入外挂字幕...")
+        NativeDocumentPickerPresenter.shared.presentSubtitlePicker(
+            onPick: { [weak self] url in
+                self?.subtitleManager.loadExternalSubtitleFile(url: url)
+            },
+            onCancel: { [weak self] in
+                self?.opticalFlowController.appendLog("[sub] 用户取消了外挂字幕选择")
+            },
+            onError: { [weak self] message in
+                self?.opticalFlowController.appendLog("[sub][error] 打开字幕选择器失败：\(message)")
+            }
+        )
+    }
+
+    func open(url: URL, isSecurityScoped: Bool = false, seekTo: Double? = nil) {
         opticalFlowController.clearError()
         activeMediaRequest = nil
         currentStreamVariants = []
         autoFallbackAttemptedURLs.removeAll()
 
         if !url.isFileURL {
-            beginPlayback(url: url)
+            let entryID = WatchHistoryEntry.makeEntryID(sourceKind: .streamURL, streamURL: url)
+            let resolvedSeek = seekTo ?? {
+                if let hist = watchHistoryStore.entry(forID: entryID), !hist.isCompleted, hist.positionSeconds >= 5.0 {
+                    return max(0, hist.positionSeconds - 2.0)
+                }
+                return 0
+            }()
+            beginPlayback(url: url, seekTo: resolvedSeek)
             return
         }
 
@@ -203,7 +238,15 @@ final class PlayerCoordinator: ObservableObject {
                 )
                 self.isImportingFile = false
                 self.opticalFlowController.appendLog("[file] 本地视频已就绪: \(playableURL.lastPathComponent)")
-                self.beginPlayback(url: playableURL)
+                let resolvedSeek = seekTo ?? {
+                    if let hist = self.watchHistoryStore.entry(forLocalURL: playableURL),
+                       !hist.isCompleted,
+                       hist.positionSeconds >= 5.0 {
+                        return max(0, hist.positionSeconds - 2.0)
+                    }
+                    return 0
+                }()
+                self.beginPlayback(url: playableURL, seekTo: resolvedSeek)
             } catch {
                 self.isImportingFile = false
                 self.opticalFlowController.recordExternalError("无法读取本地视频（\(url.lastPathComponent)）：\(error.localizedDescription)")
@@ -246,6 +289,15 @@ final class PlayerCoordinator: ObservableObject {
         currentStreamVariants = request.alternatives
         recordUISwitch("openCloudStream(\(request.sourceLabel)) -> \(request.displayTitle)")
         beginPlayback(url: request.url, seekTo: seekTo)
+        if !request.subtitleCandidates.isEmpty {
+            let storeRef = mediaSourceStore
+            subtitleManager.attachCloudCandidates(
+                request.subtitleCandidates,
+                preferredTitle: request.displayTitle
+            ) { accountID in
+                storeRef.secret(for: accountID)
+            }
+        }
     }
 
     func switchStreamVariant(_ variant: StreamVariantOption) {
@@ -258,23 +310,39 @@ final class PlayerCoordinator: ObservableObject {
             sourceLabel: variant.label,
             isHLS: variant.isHLS,
             alternatives: currentReq.alternatives,
-            accountID: currentReq.accountID
+            accountID: currentReq.accountID,
+            cloudItem: currentReq.cloudItem,
+            subtitleCandidates: currentReq.subtitleCandidates
         )
         recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
         activeMediaRequest = updated
         beginPlayback(url: updated.url, seekTo: resumeTime)
+        if !updated.subtitleCandidates.isEmpty {
+            let storeRef = mediaSourceStore
+            subtitleManager.attachCloudCandidates(
+                updated.subtitleCandidates,
+                preferredTitle: updated.displayTitle
+            ) { accountID in
+                storeRef.secret(for: accountID)
+            }
+        }
     }
 
     func closeToHome() {
         if currentURL != nil {
+            saveWatchProgressNow(forceThumbnail: true)
             captureRuntimeTelemetrySample()
             lastSessionSummary = buildCurrentSessionSummary()
             persistLastSessionReport()
         }
         recordUISwitch("closeToHome interp=\(interpolationMode.rawValue) target=\(opticalFlowTargetFPS.shortBadge)")
         stopRuntimeTelemetrySampling()
+        resumeToastTask?.cancel()
+        resumeToastText = nil
+        subtitleManager.resetForNewMedia()
         opticalFlowController.stop()
         currentURL = nil
+        activeHistoryEntryID = nil
         activeMediaRequest = nil
         currentStreamVariants = []
         autoFallbackAttemptedURLs.removeAll()
@@ -287,11 +355,222 @@ final class PlayerCoordinator: ObservableObject {
         let enteringFromHome = (currentURL == nil)
         currentURL = url
         runtimeTimeline.removeAll()
+        subtitleManager.resetForNewMedia()
+        activeHistoryEntryID = resolveActiveHistoryEntryID(for: url)
+        saveWatchProgressNow(overridePosition: seekTo)
+        if seekTo >= 5.0 {
+            showResumeToast(at: seekTo)
+        } else {
+            resumeToastTask?.cancel()
+            resumeToastText = nil
+        }
         if enteringFromHome {
             OrientationController.shared.enterVideoLandscape()
         }
         startPlayback(seekTo: seekTo)
         startRuntimeTelemetrySampling()
+    }
+
+    private func resolveActiveHistoryEntryID(for url: URL) -> String {
+        if let req = activeMediaRequest, let item = req.cloudItem {
+            let kind: WatchHistorySourceKind
+            switch item.sourceKind {
+            case .quark: kind = .quark
+            case .emby: kind = .emby
+            case .webdav: kind = .webdav
+            }
+            return WatchHistoryEntry.makeEntryID(
+                sourceKind: kind,
+                accountID: req.accountID,
+                cloudItemID: item.id
+            )
+        }
+        if url.isFileURL {
+            return WatchHistoryEntry.makeEntryID(sourceKind: .local, localURL: url)
+        }
+        return WatchHistoryEntry.makeEntryID(sourceKind: .streamURL, streamURL: url)
+    }
+
+    private func showResumeToast(at seconds: Double) {
+        resumeToastTask?.cancel()
+        resumeToastText = "已从 \(WatchHistoryEntry.formatClock(seconds)) 续播"
+        resumeToastTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4.0))
+            guard !Task.isCancelled else { return }
+            self?.resumeToastText = nil
+        }
+    }
+
+    func saveWatchProgressNow(overridePosition: Double? = nil, forceThumbnail: Bool = false) {
+        guard let url = currentURL else { return }
+        let entryID = activeHistoryEntryID ?? resolveActiveHistoryEntryID(for: url)
+        activeHistoryEntryID = entryID
+        let pos = overridePosition ?? activeCurrentTime
+        let dur = activeDuration
+        guard pos.isFinite else { return }
+
+        if let req = activeMediaRequest {
+            let kind: WatchHistorySourceKind
+            switch req.cloudItem?.sourceKind {
+            case .quark: kind = .quark
+            case .emby: kind = .emby
+            case .webdav: kind = .webdav
+            case nil: kind = .streamURL
+            }
+            let badge = req.cloudItem?.sourceKind.shortBadge ?? req.sourceLabel
+            watchHistoryStore.upsertProgress(
+                id: entryID,
+                title: req.displayTitle,
+                subtitle: req.cloudItem?.subtitle ?? req.sourceLabel,
+                sourceKind: kind,
+                sourceBadge: badge,
+                accountID: req.accountID,
+                cloudItem: req.cloudItem,
+                streamURL: req.cloudItem == nil ? req.url : nil,
+                artworkURL: req.cloudItem?.artworkURL,
+                positionSeconds: pos,
+                durationSeconds: dur > 0 ? dur : (req.cloudItem?.durationSeconds ?? 0)
+            )
+        } else if url.isFileURL {
+            let resText = (activeVideoWidth > 0 && activeVideoHeight > 0) ? "\(activeVideoWidth)×\(activeVideoHeight)" : "本地视频"
+            watchHistoryStore.upsertProgress(
+                id: entryID,
+                title: url.lastPathComponent,
+                subtitle: resText,
+                sourceKind: .local,
+                sourceBadge: "本地",
+                localURL: url,
+                positionSeconds: pos,
+                durationSeconds: dur
+            )
+        } else {
+            watchHistoryStore.upsertProgress(
+                id: entryID,
+                title: url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent,
+                subtitle: url.host ?? "网络串流",
+                sourceKind: .streamURL,
+                sourceBadge: "网络流",
+                streamURL: url,
+                positionSeconds: pos,
+                durationSeconds: dur
+            )
+        }
+
+        if (forceThumbnail || pos >= 3.0) && !thumbnailCapturedEntryIDs.contains(entryID) {
+            captureThumbnailIfNeeded(for: entryID)
+        }
+    }
+
+    private func captureThumbnailIfNeeded(for entryID: String) {
+        guard let pb = opticalFlowController.captureCurrentFrameForThumbnail() else { return }
+        thumbnailCapturedEntryIDs.insert(entryID)
+        let box = RemoteSendablePixelBuffer(buffer: pb)
+        let storeRef = watchHistoryStore
+        Task.detached(priority: .utility) {
+            guard let jpegData = WatchHistoryStore.renderJPEGThumbnail(from: box.buffer) else { return }
+            await MainActor.run {
+                storeRef.saveThumbnailJPEG(jpegData, for: entryID)
+            }
+        }
+    }
+
+    func resumeFromHistory(_ entry: WatchHistoryEntry, fromBeginning: Bool = false) {
+        let seekTarget = (fromBeginning || entry.isCompleted) ? 0 : max(0, entry.positionSeconds - 2.0)
+        opticalFlowController.clearError()
+
+        switch entry.sourceKind {
+        case .local:
+            guard let path = entry.localFilePath else {
+                opticalFlowController.recordExternalError("该本地视频记录缺少文件路径，请重新从文件或相册打开。")
+                return
+            }
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.isReadableFile(atPath: path) else {
+                opticalFlowController.recordExternalError("本地文件《\(entry.title)》已不存在或不可读取。")
+                return
+            }
+            open(url: url, isSecurityScoped: false, seekTo: seekTarget)
+
+        case .streamURL:
+            guard let urlStr = entry.streamURLString, let url = URL(string: urlStr) else {
+                opticalFlowController.recordExternalError("该串流记录地址无效。")
+                return
+            }
+            open(url: url, isSecurityScoped: false, seekTo: seekTarget)
+
+        case .quark, .emby, .webdav:
+            guard let accountID = entry.accountID,
+                  let account = mediaSourceStore.accounts.first(where: { $0.id == accountID }),
+                  let itemID = entry.cloudItemID else {
+                opticalFlowController.recordExternalError("关联的云端片源账号已删除或凭证缺失，请重新挂载后播放。")
+                return
+            }
+            let secret = mediaSourceStore.secret(for: account.id)
+            let item = CloudMediaItem(
+                id: itemID,
+                name: entry.cloudItemName ?? entry.title,
+                isDirectory: false,
+                durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil,
+                fileExtension: entry.cloudItemExtension ?? (entry.title as NSString).pathExtension.lowercased(),
+                subtitle: entry.subtitle,
+                artworkURL: entry.artworkURLString.flatMap { URL(string: $0) },
+                sourceKind: account.kind,
+                mediaSourceId: entry.cloudMediaSourceID,
+                container: entry.cloudContainer,
+                directURL: account.kind == .webdav ? URL(string: itemID) : nil
+            )
+            isResolvingHistoryResume = true
+            let storeRef = mediaSourceStore
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.isResolvingHistoryResume = false }
+                do {
+                    let resolved: ResolvedPlaybackStream
+                    switch account.kind {
+                    case .quark:
+                        resolved = try await QuarkDriveClient.resolvePlaybackStream(
+                            item: item,
+                            cookie: secret,
+                            preferTranscode: false,
+                            onCookieRefresh: { refreshed in
+                                Task { @MainActor in
+                                    storeRef.addOrUpdate(account: account, secret: refreshed)
+                                }
+                            }
+                        )
+                    case .emby:
+                        guard let baseURL = EmbyClient.normalizedBaseURL(account.baseURL) else {
+                            throw MediaSourceClientError.invalidURL("Emby 地址无效")
+                        }
+                        resolved = try EmbyClient.buildPlaybackStream(
+                            item: item,
+                            baseURL: baseURL,
+                            token: secret,
+                            preferHLS: false
+                        )
+                    case .webdav:
+                        resolved = try WebDAVClient.buildPlaybackStream(
+                            item: item,
+                            username: account.username,
+                            password: secret
+                        )
+                    }
+                    let req = PlaybackMediaRequest(
+                        url: resolved.url,
+                        headers: resolved.headers,
+                        displayTitle: resolved.title,
+                        sourceLabel: "\(account.kind.shortBadge) · \(resolved.qualityLabel)",
+                        isHLS: resolved.isHLS,
+                        alternatives: resolved.alternatives,
+                        accountID: account.id,
+                        cloudItem: item
+                    )
+                    self.openCloudStream(req, seekTo: seekTarget)
+                } catch {
+                    self.opticalFlowController.recordExternalError("续播《\(entry.title)》失败：\(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     var currentInterpolationVerdict: InterpolationVerdict {
@@ -358,6 +637,7 @@ final class PlayerCoordinator: ObservableObject {
             lastSessionSummary = buildCurrentSessionSummary()
             if runtimeTimeline.count == 1 || runtimeTimeline.count % 3 == 0 {
                 persistLastSessionReport()
+                saveWatchProgressNow()
             }
         }
     }
@@ -632,6 +912,9 @@ final class PlayerCoordinator: ObservableObject {
         let nextState = activePaused ? "play" : "pause"
         recordUISwitch("togglePlayPause(\(nextState))")
         opticalFlowController.togglePlayPause()
+        if opticalFlowController.isPaused {
+            saveWatchProgressNow()
+        }
     }
 
     func seek(to seconds: Double) {
@@ -659,6 +942,12 @@ final class PlayerCoordinator: ObservableObject {
         opticalFlowController.setEDREnabled(isEDREnabled)
         opticalFlowController.setAspectFill(isAspectFill)
         opticalFlowController.isLoopingEnabled = isLooping
+        opticalFlowController.onRemoteAssetReady = { [weak self] asset, item in
+            self?.subtitleManager.inspectRemoteAsset(asset, playerItem: item)
+        }
+        opticalFlowController.onLocalAssetReady = { [weak self] asset, url in
+            self?.subtitleManager.inspectLocalAsset(asset, url: url)
+        }
         if let accountID = activeMediaRequest?.accountID,
            let matchedAccount = mediaSourceStore.accounts.first(where: { $0.id == accountID }) {
             let storeRef = mediaSourceStore
@@ -911,9 +1200,12 @@ private struct QualityPresetStrip: View {
 }
 
 struct LiquidGlassPlayerView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject private var optical: OpticalFlowPlayerController
     @ObservedObject private var mediaSourceStore: MediaSourceStore
+    @ObservedObject private var subtitleManager: SubtitleManager
+    @ObservedObject private var watchHistoryStore: WatchHistoryStore
 
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = false
@@ -923,6 +1215,8 @@ struct LiquidGlassPlayerView: View {
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
     @State private var showEnhancementSheet: Bool = false
+    @State private var showSubtitleSheet: Bool = false
+    @State private var showHistorySheet: Bool = false
     @State private var showChangelogSheet: Bool = false
     @State private var showDiagnosticSheet: Bool = false
     @State private var showAddMediaSourceSheet: Bool = false
@@ -936,6 +1230,8 @@ struct LiquidGlassPlayerView: View {
         self.coordinator = coordinator
         self._optical = ObservedObject(wrappedValue: coordinator.opticalFlowController)
         self._mediaSourceStore = ObservedObject(wrappedValue: coordinator.mediaSourceStore)
+        self._subtitleManager = ObservedObject(wrappedValue: coordinator.subtitleManager)
+        self._watchHistoryStore = ObservedObject(wrappedValue: coordinator.watchHistoryStore)
     }
 
     var body: some View {
@@ -997,6 +1293,41 @@ struct LiquidGlassPlayerView: View {
                     )
                 }
 
+                if subtitleManager.isEnabled, subtitleManager.selectedTrackID != nil {
+                    SubtitleOverlayView(
+                        subtitleManager: subtitleManager,
+                        optical: optical,
+                        bottomInset: showHUD ? 104.0 : 0.0
+                    )
+                    .allowsHitTesting(false)
+                }
+
+                if let toast = coordinator.resumeToastText {
+                    VStack {
+                        HStack(spacing: 10) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.cyan)
+                            Text(toast)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                            Button("从头播放") {
+                                coordinator.seek(to: 0)
+                                coordinator.resumeToastText = nil
+                            }
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.cyan)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(Color.black.opacity(0.75)))
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
+                        .padding(.top, showHUD ? 60 : 18)
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
                 if showStatsHUD {
                     VStack {
                         HStack {
@@ -1018,8 +1349,8 @@ struct LiquidGlassPlayerView: View {
                 }
             }
 
-            if coordinator.isImportingFile {
-                loadingStatusPill("正在导入视频...")
+            if coordinator.isImportingFile || coordinator.isResolvingHistoryResume {
+                loadingStatusPill(coordinator.isResolvingHistoryResume ? "正在解析续播直链..." : "正在导入视频...")
             }
 
             if let error = optical.errorMessage {
@@ -1059,6 +1390,16 @@ struct LiquidGlassPlayerView: View {
                 scheduleHUDAutoHide()
             }
         }
+        .onChange(of: showSubtitleSheet) { _, presented in
+            if !presented && showHUD {
+                scheduleHUDAutoHide()
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background && coordinator.currentURL != nil {
+                coordinator.saveWatchProgressNow(forceThumbnail: true)
+            }
+        }
         .alert("打开网络视频流", isPresented: $showURLPrompt) {
             TextField("https:// 视频地址", text: $streamURLInput)
                 .textInputAutocapitalization(.never)
@@ -1091,12 +1432,23 @@ struct LiquidGlassPlayerView: View {
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.ultraThinMaterial)
         }
+        .sheet(isPresented: $showSubtitleSheet) {
+            SubtitleControlSheet(coordinator: coordinator)
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showHistorySheet) {
+            WatchHistorySheet(coordinator: coordinator)
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.ultraThinMaterial)
+        }
         .sheet(item: $activeBrowseAccount) { account in
             CloudSourceBrowserSheet(
                 account: account,
                 store: mediaSourceStore,
-                onPlay: { request in
-                    coordinator.openCloudStream(request)
+                watchHistoryStore: watchHistoryStore,
+                onPlay: { request, seekTo in
+                    coordinator.openCloudStream(request, seekTo: seekTo)
                 },
                 onDownloadLocal: { localURL in
                     coordinator.open(url: localURL, isSecurityScoped: false)
@@ -1115,6 +1467,7 @@ struct LiquidGlassPlayerView: View {
               !showFPSPicker,
               !showQualityPicker,
               !showEnhancementSheet,
+              !showSubtitleSheet,
               !showDiagnosticSheet else {
             return
         }
@@ -1127,6 +1480,7 @@ struct LiquidGlassPlayerView: View {
                   !showFPSPicker,
                   !showQualityPicker,
                   !showEnhancementSheet,
+                  !showSubtitleSheet,
                   !showDiagnosticSheet else {
                 return
             }
@@ -1215,6 +1569,10 @@ struct LiquidGlassPlayerView: View {
                     }
                     .padding(20)
                     .glassEffect(.regular, in: .rect(cornerRadius: 28))
+
+                    if !watchHistoryStore.entries.isEmpty {
+                        continueWatchingSection
+                    }
 
                     HStack(spacing: 12) {
                         Button {
@@ -1372,6 +1730,62 @@ struct LiquidGlassPlayerView: View {
             }
             .frame(maxWidth: .infinity)
         }
+    }
+
+    private var continueWatchingSection: some View {
+        let carouselItems = watchHistoryStore.continueWatchingEntries.isEmpty
+            ? Array(watchHistoryStore.entries.prefix(10))
+            : watchHistoryStore.continueWatchingEntries
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("继续观看", systemImage: "play.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.cyan)
+                Spacer()
+                Button {
+                    showHistorySheet = true
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("全部记录 (\(watchHistoryStore.entries.count))")
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.08), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(carouselItems) { entry in
+                        ContinueWatchingCard(
+                            entry: entry,
+                            thumbnailURL: watchHistoryStore.thumbnailURL(for: entry),
+                            onPlay: {
+                                coordinator.resumeFromHistory(entry)
+                            },
+                            onPlayFromBeginning: {
+                                coordinator.resumeFromHistory(entry, fromBeginning: true)
+                            },
+                            onToggleCompleted: {
+                                watchHistoryStore.markCompleted(id: entry.id, completed: !entry.isCompleted)
+                            },
+                            onDelete: {
+                                watchHistoryStore.remove(id: entry.id)
+                            }
+                        )
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(14)
+        .glassEffect(.regular, in: .rect(cornerRadius: 22))
     }
 
     // MARK: - Clean Floating Player HUD
@@ -1659,6 +2073,36 @@ struct LiquidGlassPlayerView: View {
                                 .overlay(
                                     Capsule().strokeBorder(
                                         isQualityActive ? Color.purple.opacity(0.9) : Color.white.opacity(0.16),
+                                        lineWidth: 0.7
+                                    )
+                                )
+                                .contentShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
+
+                            let isSubActive = subtitleManager.isEnabled && subtitleManager.selectedTrackID != nil
+                            Button {
+                                hudAutoHideTask?.cancel()
+                                showFPSPicker = false
+                                showQualityPicker = false
+                                showSubtitleSheet = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: isSubActive ? "captions.bubble.fill" : "captions.bubble")
+                                        .font(.caption2.weight(.bold))
+                                    Text("字幕")
+                                        .font(.caption2.weight(.bold))
+                                }
+                                .foregroundStyle(isSubActive ? .black : .white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 8)
+                                .background(
+                                    Capsule().fill(isSubActive ? Color.cyan : Color.white.opacity(0.14))
+                                )
+                                .overlay(
+                                    Capsule().strokeBorder(
+                                        isSubActive ? Color.cyan.opacity(0.9) : Color.white.opacity(0.16),
                                         lineWidth: 0.7
                                     )
                                 )
@@ -2320,5 +2764,507 @@ struct DiagnosticLogSheet: View {
 
     private func buildFullDiagnosticReport() -> String {
         coordinator.exportDiagnosticReportText(includePersistedFallback: true)
+    }
+}
+
+// MARK: - Infuse-Style Watch History Cards & Sheet
+
+private struct ContinueWatchingCard: View {
+    let entry: WatchHistoryEntry
+    let thumbnailURL: URL?
+    let onPlay: () -> Void
+    let onPlayFromBeginning: () -> Void
+    let onToggleCompleted: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        Button(action: onPlay) {
+            ZStack(alignment: .bottomLeading) {
+                backdropView
+                    .frame(width: 216, height: 122)
+                    .clipped()
+
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(0.15),
+                        Color.black.opacity(0.35),
+                        Color.black.opacity(0.88)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Text(entry.sourceBadge)
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.55), in: Capsule())
+                        Spacer()
+                        Text(entry.remainingText)
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(entry.isCompleted ? .green : .cyan)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.55), in: Capsule())
+                    }
+                    .padding(8)
+
+                    Spacer()
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.title)
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+
+                        HStack(spacing: 4) {
+                            Text(entry.timeProgressLabel)
+                                .monospacedDigit()
+                            Text("·")
+                            Text(entry.relativeDateText())
+                        }
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .lineLimit(1)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.bottom, 7)
+
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Rectangle().fill(Color.white.opacity(0.22))
+                            Rectangle()
+                                .fill(entry.isCompleted ? Color.green : Color.cyan)
+                                .frame(width: max(6, geo.size.width * entry.progress))
+                        }
+                    }
+                    .frame(height: 3.5)
+                }
+            }
+            .frame(width: 216, height: 122)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8)
+            )
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(action: onPlay) {
+                Label("继续播放", systemImage: "play.fill")
+            }
+            Button(action: onPlayFromBeginning) {
+                Label("从头播放", systemImage: "backward.end.fill")
+            }
+            Button(action: onToggleCompleted) {
+                Label(entry.isCompleted ? "标为未看完" : "标为已看完", systemImage: "checkmark.circle")
+            }
+            Button(role: .destructive, action: onDelete) {
+                Label("移除记录", systemImage: "trash")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var backdropView: some View {
+        if let thumbURL = thumbnailURL,
+           let uiImg = UIImage(contentsOfFile: thumbURL.path) {
+            Image(uiImage: uiImg)
+                .resizable()
+                .scaledToFill()
+        } else if let artStr = entry.artworkURLString,
+                  let artURL = URL(string: artStr) {
+            AsyncImage(url: artURL) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                default:
+                    fallbackBackdrop
+                }
+            }
+        } else {
+            fallbackBackdrop
+        }
+    }
+
+    private var fallbackBackdrop: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.cyan.opacity(0.26), Color.indigo.opacity(0.32), Color.black],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Image(systemName: "play.rectangle.fill")
+                .font(.title)
+                .foregroundStyle(.white.opacity(0.25))
+        }
+    }
+}
+
+struct WatchHistorySheet: View {
+    @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject private var watchHistoryStore: WatchHistoryStore
+    @Environment(\.dismiss) private var dismiss
+
+    init(coordinator: PlayerCoordinator) {
+        self.coordinator = coordinator
+        self._watchHistoryStore = ObservedObject(wrappedValue: coordinator.watchHistoryStore)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if watchHistoryStore.entries.isEmpty {
+                    ContentUnavailableView(
+                        "暂无观看记录",
+                        systemImage: "clock.arrow.circlepath",
+                        description: Text("播放本地视频或云盘影片后将自动记录进度与剧照")
+                    )
+                } else {
+                    ForEach(watchHistoryStore.entries) { entry in
+                        Button {
+                            dismiss()
+                            coordinator.resumeFromHistory(entry)
+                        } label: {
+                            HStack(spacing: 12) {
+                                historyThumb(entry)
+                                    .frame(width: 96, height: 56)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(entry.title)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+
+                                    HStack(spacing: 6) {
+                                        Text(entry.sourceBadge)
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundStyle(.cyan)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.cyan.opacity(0.15), in: Capsule())
+
+                                        Text(entry.remainingText)
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(entry.isCompleted ? .green : .secondary)
+
+                                        Text("· \(entry.relativeDateText())")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    HStack(spacing: 8) {
+                                        GeometryReader { geo in
+                                            ZStack(alignment: .leading) {
+                                                Capsule().fill(Color.white.opacity(0.14))
+                                                Capsule()
+                                                    .fill(entry.isCompleted ? Color.green : Color.cyan)
+                                                    .frame(width: max(4, geo.size.width * entry.progress))
+                                            }
+                                        }
+                                        .frame(height: 3.5)
+
+                                        Text(entry.timeProgressLabel)
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                        .buttonStyle(.plain)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                watchHistoryStore.remove(id: entry.id)
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                            Button {
+                                watchHistoryStore.markCompleted(id: entry.id, completed: !entry.isCompleted)
+                            } label: {
+                                Label(entry.isCompleted ? "标为未看" : "标为已看", systemImage: "checkmark")
+                            }
+                            .tint(.green)
+                        }
+                        .contextMenu {
+                            Button {
+                                dismiss()
+                                coordinator.resumeFromHistory(entry)
+                            } label: {
+                                Label("断点续播", systemImage: "play.fill")
+                            }
+                            Button {
+                                dismiss()
+                                coordinator.resumeFromHistory(entry, fromBeginning: true)
+                            } label: {
+                                Label("从头开始", systemImage: "backward.end.fill")
+                            }
+                            Button(role: .destructive) {
+                                watchHistoryStore.remove(id: entry.id)
+                            } label: {
+                                Label("删除记录", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("观看记录")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !watchHistoryStore.entries.isEmpty {
+                        Button("清空", role: .destructive) {
+                            watchHistoryStore.clearAll()
+                        }
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func historyThumb(_ entry: WatchHistoryEntry) -> some View {
+        if let thumbURL = watchHistoryStore.thumbnailURL(for: entry),
+           let uiImg = UIImage(contentsOfFile: thumbURL.path) {
+            Image(uiImage: uiImg)
+                .resizable()
+                .scaledToFill()
+        } else if let artStr = entry.artworkURLString, let artURL = URL(string: artStr) {
+            AsyncImage(url: artURL) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFill()
+                default:
+                    placeholderRect
+                }
+            }
+        } else {
+            placeholderRect
+        }
+    }
+
+    private var placeholderRect: some View {
+        ZStack {
+            Color.indigo.opacity(0.22)
+            Image(systemName: "film.fill")
+                .foregroundStyle(.white.opacity(0.45))
+        }
+    }
+}
+
+// MARK: - Native Subtitle Overlay & Control Sheet
+
+private struct SubtitleOverlayView: View {
+    @ObservedObject var subtitleManager: SubtitleManager
+    @ObservedObject var optical: OpticalFlowPlayerController
+    let bottomInset: Double
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.12)) { _ in
+            let lines = subtitleManager.displayLines(at: optical.currentTime)
+            if !lines.isEmpty {
+                VStack {
+                    Spacer()
+                    Text(lines.joined(separator: "\n"))
+                        .font(.system(size: subtitleManager.style.fontSize, weight: .semibold, design: .rounded))
+                        .foregroundStyle(foregroundColor(for: subtitleManager.style.colorPreset))
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                        .shadow(color: .black.opacity(0.85), radius: 2.5, x: 0, y: 1)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.black.opacity(subtitleManager.style.backgroundOpacity))
+                        )
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, subtitleManager.style.bottomPadding + bottomInset)
+                }
+            }
+        }
+    }
+
+    private func foregroundColor(for preset: SubtitleColorPreset) -> Color {
+        switch preset {
+        case .white: return .white
+        case .yellow: return Color(red: 1.0, green: 0.92, blue: 0.45)
+        case .cyan: return .cyan
+        }
+    }
+}
+
+struct SubtitleControlSheet: View {
+    @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject private var subtitleManager: SubtitleManager
+    @Environment(\.dismiss) private var dismiss
+
+    init(coordinator: PlayerCoordinator) {
+        self.coordinator = coordinator
+        self._subtitleManager = ObservedObject(wrappedValue: coordinator.subtitleManager)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("字幕轨道") {
+                    Toggle("显示字幕", isOn: $subtitleManager.isEnabled)
+
+                    if subtitleManager.isLoadingTrack {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("正在加载并解析字幕...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let status = subtitleManager.statusMessage {
+                        Text(status)
+                            .font(.caption2)
+                            .foregroundStyle(.cyan)
+                    }
+
+                    if subtitleManager.availableTracks.isEmpty {
+                        Text("未发现内嵌或同目录字幕，可点击下方按钮导入本地 .srt / .ass / .vtt 字幕")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button {
+                            subtitleManager.selectTrack(nil)
+                        } label: {
+                            HStack {
+                                Text("关闭字幕")
+                                Spacer()
+                                if subtitleManager.selectedTrackID == nil {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.cyan)
+                                }
+                            }
+                        }
+
+                        ForEach(subtitleManager.availableTracks) { track in
+                            Button {
+                                let storeRef = coordinator.mediaSourceStore
+                                subtitleManager.selectTrack(track) { accountID in
+                                    storeRef.secret(for: accountID)
+                                }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(track.displayName)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.primary)
+                                        Text(track.detail)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if subtitleManager.selectedTrackID == track.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.cyan)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Button {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            coordinator.presentSubtitleFilePicker()
+                        }
+                    } label: {
+                        Label("导入外挂字幕 (.srt / .ass / .vtt)", systemImage: "doc.badge.plus")
+                            .foregroundStyle(.cyan)
+                    }
+                }
+
+                Section("样式与同步微调") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("字号大小")
+                            Spacer()
+                            Text("\(Int(subtitleManager.style.fontSize)) pt")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $subtitleManager.style.fontSize, in: 14...34, step: 1)
+                            .tint(.cyan)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("底部边距")
+                            Spacer()
+                            Text("\(Int(subtitleManager.style.bottomPadding)) pt")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $subtitleManager.style.bottomPadding, in: 10...90, step: 2)
+                            .tint(.cyan)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("背景不透明度")
+                            Spacer()
+                            Text("\(Int((subtitleManager.style.backgroundOpacity * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $subtitleManager.style.backgroundOpacity, in: 0...0.85, step: 0.05)
+                            .tint(.cyan)
+                    }
+
+                    Picker("字体颜色", selection: $subtitleManager.style.colorPreset) {
+                        ForEach(SubtitleColorPreset.allCases) { preset in
+                            Text(preset.rawValue).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    HStack {
+                        Text("时间偏移")
+                        Spacer()
+                        Button("-0.25s") {
+                            subtitleManager.style.timeOffsetSeconds -= 0.25
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Text(String(format: "%+.2fs", subtitleManager.style.timeOffsetSeconds))
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .frame(minWidth: 56)
+
+                        Button("+0.25s") {
+                            subtitleManager.style.timeOffsetSeconds += 0.25
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        if abs(subtitleManager.style.timeOffsetSeconds) > 0.01 {
+                            Button("归零") {
+                                subtitleManager.style.timeOffsetSeconds = 0
+                            }
+                            .font(.caption2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("字幕设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
     }
 }

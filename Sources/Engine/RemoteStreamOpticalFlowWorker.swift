@@ -13,6 +13,66 @@ struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer
 }
 
+/// 跨平台云端流媒体光流预算与动态送显时钟规划器（可独立在模拟器单测）
+enum RemoteOpticalFlowBudgetPlanner: Sendable {
+    static func resolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
+        if maxInterp <= 1 {
+            return [(1280, 720), (960, 540), (854, 480)]
+        }
+        if maxInterp <= 3 {
+            return [(960, 540), (854, 480), (640, 360)]
+        }
+        return [(854, 480), (640, 360), (512, 288)]
+    }
+
+    static func recommendedPacerLagSeconds(
+        sourceFPS: Double,
+        averageInterpolationMs: Double,
+        targetFPS: OpticalFlowTargetFPS
+    ) -> Double {
+        let clampedFPS = max(12.0, min(120.0, sourceFPS.isFinite ? sourceFPS : 24.0))
+        let frameInterval = 1.0 / clampedFPS
+        let defaultInferMs = targetFPS == .x2 ? 18.0 : 28.0
+        let rawInferMs = (averageInterpolationMs.isFinite && averageInterpolationMs > 0)
+            ? averageInterpolationMs
+            : defaultInferMs
+        let inferSec = max(0.015, min(0.095, rawInferMs / 1000.0))
+        return min(0.195, max(0.095, frameInterval + inferSec + 0.040))
+    }
+
+    static func buildRemoteCandidatePlan(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        maxInterpolatedFrames: Int
+    ) -> [OpticalFlowCandidate] {
+        let safeW = max(2, sourceWidth)
+        let safeH = max(2, sourceHeight)
+        let safeMaxInterp = max(1, maxInterpolatedFrames)
+        let caps = resolutionCaps(forMaxInterpolatedFrames: safeMaxInterp)
+
+        var plan: [OpticalFlowCandidate] = []
+        for (longCap, shortCap) in caps {
+            let fitted = OpticalFlowResolutionPlanner.fitProportionally(
+                width: safeW,
+                height: safeH,
+                maxLongSide: longCap,
+                maxShortSide: shortCap
+            )
+            let candidate = OpticalFlowCandidate(
+                backend: .lowLatency,
+                width: fitted.width,
+                height: fitted.height,
+                spatial2x: false,
+                maxInterpolatedFrames: safeMaxInterp
+            )
+            if !plan.contains(candidate) {
+                plan.append(candidate)
+            }
+        }
+        return plan
+    }
+}
+
 /// 面向云端流媒体 (`AVPlayerItemVideoOutput`) 的实时 ANE 硬件光流异步工作器
 final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     typealias FrameBatchCallback = @Sendable (
@@ -24,15 +84,26 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
 
     private let lock = NSLock()
     private let onBatch: FrameBatchCallback
+    private let onTargetDowngrade: (@Sendable (_ newTarget: OpticalFlowTargetFPS, _ reason: String) -> Void)?
+    private let onLog: (@Sendable (_ message: String) -> Void)?
+
     private var targetFPS: OpticalFlowTargetFPS
     private var sourceFPS: Double
     private var generation: UInt64 = 0
-    private var pendingInput: (pts: Double, box: RemoteSendablePixelBuffer)?
+    private var pendingInputs: [(pts: Double, box: RemoteSendablePixelBuffer)] = []
     private var isProcessing = false
     private var wantsReconfigure = false
+    private var droppedInputCounter: Int = 0
 
     private var previousFrame: (pts: Double, buffer: CVPixelBuffer)?
     private var phaseScheduler: OpticalFlowPhaseScheduler
+    private var budgetGuard = OpticalFlowBudgetGuard(
+        windowSize: 10,
+        overloadRatioThreshold: 0.86,
+        consecutiveOverloadWindowsRequired: 2,
+        maxConsecutiveCatchUpSkips: 4,
+        cooldownPairs: 16
+    )
     private var totalInterpolationMs: Double = 0
     private var batchCount: Int = 0
 
@@ -40,6 +111,9 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     private var processor: VTFrameProcessor?
     private var configuration: VTLowLatencyFrameInterpolationConfiguration?
     private var activeCandidate: OpticalFlowCandidate?
+    private var candidates: [OpticalFlowCandidate] = []
+    private var candidateIndex: Int = 0
+    private var candidatePlanSignature: String = ""
     private var activePixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     private var sourceNormPool: CVPixelBufferPool?
     private var sourceTransferSession: VTPixelTransferSession?
@@ -51,12 +125,16 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     init(
         targetFPS: OpticalFlowTargetFPS,
         sourceFPS: Double,
+        onTargetDowngrade: (@Sendable (_ newTarget: OpticalFlowTargetFPS, _ reason: String) -> Void)? = nil,
+        onLog: (@Sendable (_ message: String) -> Void)? = nil,
         onBatch: @escaping FrameBatchCallback
     ) {
         self.targetFPS = targetFPS
         let clamped = max(12.0, sourceFPS)
         self.sourceFPS = clamped
         self.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: targetFPS, sourceFPS: clamped)
+        self.onTargetDowngrade = onTargetDowngrade
+        self.onLog = onLog
         self.onBatch = onBatch
     }
 
@@ -65,7 +143,8 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         self.targetFPS = targetFPS
         self.sourceFPS = max(12.0, sourceFPS)
         self.generation &+= 1
-        self.pendingInput = nil
+        self.pendingInputs.removeAll(keepingCapacity: true)
+        self.droppedInputCounter = 0
         self.wantsReconfigure = true
         lock.unlock()
     }
@@ -73,14 +152,19 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     func reset() {
         lock.lock()
         self.generation &+= 1
-        self.pendingInput = nil
+        self.pendingInputs.removeAll(keepingCapacity: true)
+        self.droppedInputCounter = 0
         self.wantsReconfigure = true
         lock.unlock()
     }
 
     func submitFrame(pts: Double, box: RemoteSendablePixelBuffer) {
         lock.lock()
-        pendingInput = (pts: pts, box: box)
+        if pendingInputs.count >= 2 {
+            pendingInputs.removeFirst()
+            droppedInputCounter += 1
+        }
+        pendingInputs.append((pts: pts, box: box))
         let shouldLaunch = !isProcessing
         if shouldLaunch {
             isProcessing = true
@@ -100,18 +184,21 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         generation: UInt64,
         targetFPS: OpticalFlowTargetFPS,
         sourceFPS: Double,
-        needsReconfigure: Bool
+        needsReconfigure: Bool,
+        skippedCount: Int
     )? {
         lock.lock()
         defer { lock.unlock() }
-        guard let next = pendingInput else {
+        guard !pendingInputs.isEmpty else {
             isProcessing = false
             return nil
         }
-        pendingInput = nil
+        let next = pendingInputs.removeFirst()
         let reconfig = wantsReconfigure
         wantsReconfigure = false
-        return (next.pts, next.box, generation, targetFPS, sourceFPS, reconfig)
+        let skipped = droppedInputCounter
+        droppedInputCounter = 0
+        return (next.pts, next.box, generation, targetFPS, sourceFPS, reconfig, skipped)
     }
 
     private func readGeneration() -> UInt64 {
@@ -121,24 +208,41 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         return g
     }
 
+    private func updateWorkerTargetTier(_ newTier: OpticalFlowTargetFPS) {
+        lock.lock()
+        self.targetFPS = newTier
+        lock.unlock()
+    }
+
     private func drainLoop() async {
+        var workingTargetFPS: OpticalFlowTargetFPS?
         while let job = popNextJob() {
             if job.needsReconfigure {
                 previousFrame = nil
+                workingTargetFPS = job.targetFPS
                 phaseScheduler = OpticalFlowPhaseScheduler(targetTier: job.targetFPS, sourceFPS: job.sourceFPS)
+                budgetGuard.reset()
                 totalInterpolationMs = 0
                 batchCount = 0
 #if !targetEnvironment(simulator)
+                candidateIndex = 0
+                candidates.removeAll(keepingCapacity: true)
+                candidatePlanSignature = ""
                 teardownSession()
 #endif
             }
-            await processSingleFrame(
+            let effectiveTier = workingTargetFPS ?? job.targetFPS
+            let updatedTier = await processSingleFrame(
                 pts: job.pts,
                 currBuffer: job.box.buffer,
                 jobGeneration: job.generation,
-                targetFPS: job.targetFPS,
-                sourceFPS: job.sourceFPS
+                targetFPS: effectiveTier,
+                sourceFPS: job.sourceFPS,
+                skippedInputs: job.skippedCount
             )
+            if let updatedTier {
+                workingTargetFPS = updatedTier
+            }
         }
     }
 
@@ -147,28 +251,29 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         currBuffer: CVPixelBuffer,
         jobGeneration: UInt64,
         targetFPS: OpticalFlowTargetFPS,
-        sourceFPS: Double
-    ) async {
+        sourceFPS: Double,
+        skippedInputs: Int
+    ) async -> OpticalFlowTargetFPS? {
 #if targetEnvironment(simulator)
         previousFrame = (pts: currPTS, buffer: currBuffer)
         let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
         onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
-        return
+        return nil
 #else
         let srcW = CVPixelBufferGetWidth(currBuffer)
         let srcH = CVPixelBufferGetHeight(currBuffer)
         guard srcW >= 64, srcH >= 64 else {
             onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, "远程硬解直通")
-            return
+            return nil
         }
 
         if let prev = previousFrame {
             let dt = currPTS - prev.pts
-            if dt <= 0.008 || dt >= 0.25 {
+            if dt <= 0.008 || dt >= 0.35 {
                 previousFrame = (pts: currPTS, buffer: currBuffer)
                 phaseScheduler.reset()
                 onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, activeCandidate?.displayLabel ?? "远程流直通")
-                return
+                return nil
             }
 
             if ensureSession(srcWidth: srcW, srcHeight: srcH, targetFPS: targetFPS, sourceFPS: sourceFPS),
@@ -215,7 +320,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                         do {
                             let startHost = CACurrentMediaTime()
                             _ = try await processor.process(parameters: params)
-                            guard readGeneration() == jobGeneration else { return }
+                            guard readGeneration() == jobGeneration else { return nil }
                             let elapsedMs = (CACurrentMediaTime() - startHost) * 1000.0
                             totalInterpolationMs += elapsedMs
                             batchCount += 1
@@ -227,20 +332,80 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                 CVBufferPropagateAttachments(currBuffer, destBuf)
                                 outFrames.append(RemoteOpticalFlowOutputFrame(pts: slot.pts, buffer: destBuf))
                             }
-                            if step.shouldEmitOriginalFrame {
+                            if step.shouldEmitOriginalFrame || outFrames.isEmpty {
                                 outFrames.append(RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer))
                             }
+                            let emittedLabel = "远程·\(activeCandidate.displayLabel)"
                             previousFrame = (pts: currPTS, buffer: currBuffer)
-                            onBatch(outFrames, step.interpolatedSlots.count, avgMs, "远程·\(activeCandidate.displayLabel)")
-                            return
+                            onBatch(outFrames, step.interpolatedSlots.count, avgMs, emittedLabel)
+
+                            let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
+                            let canDowngradeRes = (candidateIndex + 1) < candidates.count
+                            let canDowngradeFPS = targetFPS.nextLowerTier != nil
+                            let action = budgetGuard.recordPair(
+                                processMs: elapsedMs,
+                                sourceIntervalMs: sourceIntervalMs,
+                                skippedForCatchUp: skippedInputs > 0,
+                                canDowngradeResolution: canDowngradeRes,
+                                canDowngradeTargetFPS: canDowngradeFPS
+                            )
+                            switch action {
+                            case .keep:
+                                return nil
+                            case .downgradeResolution:
+                                if candidateIndex + 1 < candidates.count {
+                                    let prevLabel = activeCandidate.displayLabel
+                                    candidateIndex += 1
+                                    let nextLabel = candidates[candidateIndex].displayLabel
+                                    teardownSession()
+                                    budgetGuard.reset()
+                                    totalInterpolationMs = 0
+                                    batchCount = 0
+                                    onLog?("[remote][perf] 远程光流推理耗时 \(String(format: "%.1f", elapsedMs))ms 超出源帧间隔 \(String(format: "%.1f", sourceIntervalMs))ms，\(prevLabel) 自动降分辨率 -> \(nextLabel)")
+                                    return nil
+                                } else if let lower = targetFPS.nextLowerTier {
+                                    updateWorkerTargetTier(lower)
+                                    phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
+                                    candidateIndex = 0
+                                    candidates.removeAll(keepingCapacity: true)
+                                    candidatePlanSignature = ""
+                                    teardownSession()
+                                    budgetGuard.reset()
+                                    totalInterpolationMs = 0
+                                    batchCount = 0
+                                    onTargetDowngrade?(lower, "远程光流分辨率已触底，自动稳帧降档至 \(lower.shortBadge)")
+                                    return lower
+                                }
+                            case .downgradeTargetFPS:
+                                if let lower = targetFPS.nextLowerTier {
+                                    updateWorkerTargetTier(lower)
+                                    phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
+                                    candidateIndex = 0
+                                    candidates.removeAll(keepingCapacity: true)
+                                    candidatePlanSignature = ""
+                                    teardownSession()
+                                    budgetGuard.reset()
+                                    totalInterpolationMs = 0
+                                    batchCount = 0
+                                    onTargetDowngrade?(lower, "远程光流持续超预算或追帧跳过，自动稳帧至 \(lower.shortBadge)")
+                                    return lower
+                                }
+                            }
+                            return nil
                         } catch {
                             let now = CACurrentMediaTime()
                             if now - lastErrorLogTime > 2.0 {
                                 lastErrorLogTime = now
+                                onLog?("[remote][warn] 远程光流推理异常 (\(activeCandidate.displayLabel)): \(error.localizedDescription)")
                             }
                             teardownSession()
                         }
                     }
+                } else if step.interpolatedSlots.isEmpty {
+                    previousFrame = (pts: currPTS, buffer: currBuffer)
+                    let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
+                    onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程·\(activeCandidate.displayLabel)")
+                    return nil
                 }
             }
         }
@@ -248,6 +413,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         previousFrame = (pts: currPTS, buffer: currBuffer)
         let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
         onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
+        return nil
 #endif
     }
 
@@ -260,7 +426,20 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     ) -> Bool {
         let maxInterp = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
         let exponent = OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: maxInterp)
-        let sig = "\(srcWidth)x\(srcHeight):\(exponent)"
+        let planSig = "\(srcWidth)x\(srcHeight):\(maxInterp)"
+        if planSig != candidatePlanSignature {
+            candidates = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
+                sourceWidth: srcWidth,
+                sourceHeight: srcHeight,
+                maxInterpolatedFrames: maxInterp
+            )
+            candidatePlanSignature = planSig
+            candidateIndex = 0
+        }
+        guard candidateIndex < candidates.count else {
+            return false
+        }
+        let sig = "\(planSig):\(exponent):idx\(candidateIndex)"
         if sig == activeSignature, processor != nil, destPool != nil {
             return true
         }
@@ -269,18 +448,9 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         guard VTLowLatencyFrameInterpolationConfiguration.isSupported else {
             return false
         }
-        let allCandidates = OpticalFlowResolutionPlanner.buildCandidatePlan(
-            sourceWidth: srcWidth,
-            sourceHeight: srcHeight,
-            requestedSpatial2x: false,
-            lowLatencySupported: true,
-            frcSupported: false,
-            maxInterpolatedFrames: maxInterp
-        )
-        let cappedCandidates = allCandidates.filter { max($0.width, $0.height) <= 1280 }
-        let searchList = cappedCandidates.isEmpty ? allCandidates : cappedCandidates
 
-        for candidate in searchList where candidate.backend == .lowLatency {
+        for index in candidateIndex..<candidates.count {
+            let candidate = candidates[index]
             guard let config = VTLowLatencyFrameInterpolationConfiguration(
                 frameWidth: candidate.width,
                 frameHeight: candidate.height,
@@ -343,12 +513,14 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
 
             self.processor = proc
             self.configuration = config
+            self.candidateIndex = index
             self.activeCandidate = candidate
             self.activePixelFormat = chosenFormat
             self.sourceNormPool = normPool
             self.sourceTransferSession = xfer
             self.destPool = outPool
-            self.activeSignature = sig
+            self.activeSignature = "\(planSig):\(exponent):idx\(index)"
+            onLog?("[remote][ane] 已激活远程光流会话: \(candidate.displayLabel) (exp=\(exponent), fmt=\(HEVCFormatNormalizer.fourCCString(chosenFormat)))")
             return true
         }
         return false
