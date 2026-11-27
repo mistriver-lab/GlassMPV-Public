@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
+import Metal
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers

@@ -4,6 +4,7 @@ import Metal
 #if canImport(MetalFX) && !targetEnvironment(simulator)
 import MetalFX
 #endif
+import QuartzCore
 import VideoToolbox
 
 private struct MetalEnhanceUniforms {

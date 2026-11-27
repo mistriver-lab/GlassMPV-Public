@@ -1396,7 +1396,7 @@ struct LiquidGlassPlayerView: View {
                                 Text(coordinator.videoEnhancementPreset.shortBadge)
                                     .font(.caption2.weight(.bold))
                             }
-                            .foregroundStyle(coordinator.videoEnhancementPreset == .off ? .primary : .purple)
+                            .foregroundStyle(coordinator.videoEnhancementPreset == .off ? Color.primary : Color.purple)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .contentShape(Capsule())
