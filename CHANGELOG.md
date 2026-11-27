@@ -5,6 +5,10 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
+- **新增实时 Metal + MetalFX GPU 画质增强引擎 (`VideoEnhancementOptions` + `MetalVideoEnhancer` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 针对「假 4K 高压缩发糊老片」：上线纯亮度通道（Y-Plane）保边双边去噪 + 对比度自适应锐化（Luma CAS）+ 去灰微反差管线，直通 `420v/420f/x420/xf20`（零彩边光晕且完整保留 10-bit HDR10/HLG 亮度空间）。
+  - 针对「480p/720p/1080p 低清视频」及「60/96/120fps 高帧率 720p 光流帧」：在 `MTLCommandBuffer` 单次提交链中串联 `YUV→BGRA 预降噪` → `MTLFXSpatialScaler` 感知重建（最高 2560×1440，模拟器自动回退双三次超分）→ `CAS` 收尾锐化。
+  - 提供「原画 / 老片去糊 / 动漫强化 / 低清超分」4 档预设 + 「轻度 / 标准 / 强力」3 级强度及底栏 **`画质` 快捷弹窗 + `按住对比原画`**，杜比视界自动旁路保护原厂映射。
 - **最终敲定实用帧率档位体系、按档位精准锁屏与低电量保护 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
   - 结合 ProMotion 物理分频（`240Hz` 整除限制）与 A17 Pro ANE 指数算力阶梯，正式移除非整除微颤的 `72fps` 鸡肋档位，确立「24p→原画 / 48(2×清晰省电) / 60 / 96(4×高刷甜点) / 120 fps；30p→原画 / 60 / 120 fps；60p→原画 / 120 fps」最终矩阵。
   - `recommendedDisplayFrameRateRange` 改为按档位精准锁频：`48fps` 锁原生 `(48, 48, 48)`、`60fps` 锁原生 `(60, 60, 60)`、`96/120fps` 锁 `(80, 120, 120)`，减少中低档 50%~60% 主线程唤醒与屏幕功耗；新增 `effectivePowerThermalCap` 监听 `NSProcessInfoPowerStateDidChange`，iOS 低电量模式下自动封顶 `60fps` 并锁 60Hz，杜绝 60Hz 屏幕上限下 ANE 白烧 `120fps` 算力；`OpticalFlowFramePacer` 同步将 `earlySnapSeconds` 微调至 `0.006s` 巩固 48/60Hz 锁相。

@@ -205,6 +205,18 @@ def test_swift_sources_non_empty_and_balanced():
     assert "smartPresets" in options_src
     assert "activeCapsuleSummary" in options_src
 
+    enhance_opts = ROOT / "Sources" / "Models" / "VideoEnhancementOptions.swift"
+    assert enhance_opts.is_file(), f"Missing {enhance_opts}"
+    enhance_opts_src = enhance_opts.read_text(encoding="utf-8")
+    assert "enum VideoEnhancementPreset" in enhance_opts_src
+    assert "enum VideoEnhancementPlanner" in enhance_opts_src
+
+    metal_enhancer = ROOT / "Sources" / "Engine" / "MetalVideoEnhancer.swift"
+    assert metal_enhancer.is_file(), f"Missing {metal_enhancer}"
+    metal_enhancer_src = metal_enhancer.read_text(encoding="utf-8")
+    assert "final class MetalVideoEnhancer" in metal_enhancer_src
+    assert "MTLFXSpatialScaler" in metal_enhancer_src
+
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "MPVUI" not in vt_engine
     assert "MPV 超分核" not in vt_engine

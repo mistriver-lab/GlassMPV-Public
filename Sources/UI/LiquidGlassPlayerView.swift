@@ -38,6 +38,8 @@ final class PlayerCoordinator: ObservableObject {
     @Published var lastSessionSummary: SessionDiagnosticSummary?
     @Published var uiAuditLogs: [String] = []
     @Published var isLowPowerModeEnabled: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @Published var videoEnhancementPreset: VideoEnhancementPreset = .off
+    @Published var videoEnhancementStrength: VideoEnhancementStrength = .standard
 
     let opticalFlowController = OpticalFlowPlayerController()
     private let thermalToken = ThermalObserverToken()
@@ -385,6 +387,7 @@ final class PlayerCoordinator: ObservableObject {
             "Interpolation Verdict: \(verdict.shortLabel) | \(verdict.detailText)",
             "HDR/EDR: \(metrics.hdrTag) (edr=\(isEDREnabled ? "ON" : "OFF"), active=\(metrics.isHDRActive ? "YES" : "NO")) | Fill=\(isAspectFill ? "Fill" : "Fit") | Loop=\(isLooping ? "ON" : "OFF")",
             "ANE Target: \(opticalFlowController.targetSummaryBadge) (requested=\(opticalFlowController.requestedTargetFPS.shortBadge), effective=\(opticalFlowController.effectiveTargetFPS.shortBadge)) | ANE Backend: \(opticalFlowController.activeBackendLabel) | Clock: \(opticalFlowController.clockSourceLabel) | spatial2x=\(opticalFlowController.enableSpatial2xUpscale ? "ON" : "OFF")",
+            "Quality Enhance: \(videoEnhancementPreset.rawValue) (\(videoEnhancementStrength.rawValue)) -> \(opticalFlowController.activeQualityPipelineLabel) | avgMs=\(String(format: "%.2f", opticalFlowController.averageQualityEnhanceMs))",
             "ANE Counters: interpolated=\(opticalFlowController.interpolatedFrameCount) | skipped=\(opticalFlowController.skippedInterpolationCount) | failed=\(opticalFlowController.failedInterpolationCount) | presented=\(opticalFlowController.presentedFrameCount) | avgMs=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs)) | actualFPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | queueDepth=\(opticalFlowController.currentQueueDepthSnapshot()) | avDelta=\(opticalFlowController.latestAVDeltaMs.map { String(format: "%+.1fms", $0) } ?? "--")"
         ]
         return SessionDiagnosticSummary(
@@ -431,7 +434,7 @@ final class PlayerCoordinator: ObservableObject {
             }
         }()
 
-        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 模式=\(interpolationMode.rawValue) | HDR=\(opticalFlowController.hdrLabel)(EDR=\(isEDREnabled ? "ON" : "OFF")) | 目标=\(opticalFlowController.targetSummaryBadge) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
+        let opticalStatus = "\(opticalFlowController.capabilityDescription) | 模式=\(interpolationMode.rawValue) | 画质=\(videoEnhancementPreset.rawValue)(\(opticalFlowController.activeQualityPipelineLabel)) | HDR=\(opticalFlowController.hdrLabel)(EDR=\(isEDREnabled ? "ON" : "OFF")) | 目标=\(opticalFlowController.targetSummaryBadge) | 后端=\(opticalFlowController.activeBackendLabel) | 时钟=\(opticalFlowController.clockSourceLabel) | 补帧=\(opticalFlowController.interpolatedFrameCount) | 跳帧追赶=\(opticalFlowController.skippedInterpolationCount) | 失败=\(opticalFlowController.failedInterpolationCount) | 送显=\(opticalFlowController.presentedFrameCount) | 平均耗时=\(String(format: "%.1f", opticalFlowController.averageInterpolationMs))ms | 实测FPS=\(String(format: "%.1f", opticalFlowController.actualOutputFPS)) | err=\(opticalFlowController.errorMessage ?? opticalFlowController.lastInterpolationError ?? "none")"
 
         let gateStatus = isSuperResolutionDisabledBy4K ? "已触发4K禁超分" : "允许2×空间超分"
         let lines = [
@@ -547,6 +550,30 @@ final class PlayerCoordinator: ObservableObject {
         speed = value
         recordUISwitch("setSpeed(\(String(format: "%.2g", value))x)")
         opticalFlowController.setSpeed(value)
+    }
+
+    func setVideoEnhancementPreset(_ preset: VideoEnhancementPreset) {
+        guard preset != videoEnhancementPreset else { return }
+        let prev = videoEnhancementPreset
+        videoEnhancementPreset = preset
+        opticalFlowController.videoEnhancementPreset = preset
+        if preset == .off {
+            opticalFlowController.isComparingOriginalQuality = false
+        }
+        recordUISwitch("setVideoEnhancementPreset \(prev.rawValue) -> \(preset.rawValue)")
+    }
+
+    func setVideoEnhancementStrength(_ strength: VideoEnhancementStrength) {
+        guard strength != videoEnhancementStrength else { return }
+        let prev = videoEnhancementStrength
+        videoEnhancementStrength = strength
+        opticalFlowController.videoEnhancementStrength = strength
+        recordUISwitch("setVideoEnhancementStrength \(prev.rawValue) -> \(strength.rawValue)")
+    }
+
+    func setComparingOriginalQuality(_ comparing: Bool) {
+        guard opticalFlowController.isComparingOriginalQuality != comparing else { return }
+        opticalFlowController.isComparingOriginalQuality = comparing
     }
 
     func togglePlayPause() {
@@ -686,6 +713,103 @@ private struct FrameRatePresetStrip: View {
     }
 }
 
+// MARK: - Quality Enhancement Preset & Comparison Strip
+
+private struct QualityPresetStrip: View {
+    @ObservedObject var coordinator: PlayerCoordinator
+    @ObservedObject var optical: OpticalFlowPlayerController
+    var compact: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 8 : 10) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: compact ? 8 : 10) {
+                    ForEach(VideoEnhancementPreset.allCases) { preset in
+                        let isSelected = (coordinator.videoEnhancementPreset == preset)
+                        Button {
+                            coordinator.setVideoEnhancementPreset(preset)
+                        } label: {
+                            VStack(spacing: 2) {
+                                Text(preset.rawValue)
+                                    .font(.system(size: compact ? 13 : 14, weight: .bold, design: .rounded))
+                                Text(preset.subtitle)
+                                    .font(.system(size: compact ? 9.5 : 10.5, weight: .medium))
+                                    .opacity(isSelected ? 0.85 : 0.72)
+                            }
+                            .foregroundStyle(isSelected ? .black : .white.opacity(0.92))
+                            .padding(.horizontal, compact ? 12 : 14)
+                            .padding(.vertical, compact ? 7 : 9)
+                            .background(
+                                RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous)
+                                    .fill(isSelected ? (preset == .off ? .white : .purple.opacity(0.95)) : Color.white.opacity(0.11))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous)
+                                    .strokeBorder(
+                                        isSelected ? (preset == .off ? Color.white.opacity(0.9) : Color.purple.opacity(0.9)) : Color.white.opacity(0.16),
+                                        lineWidth: 0.7
+                                    )
+                            )
+                            .contentShape(RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
+            if coordinator.videoEnhancementPreset != .off {
+                HStack(spacing: 8) {
+                    HStack(spacing: 4) {
+                        ForEach(VideoEnhancementStrength.allCases) { strength in
+                            let selected = (coordinator.videoEnhancementStrength == strength)
+                            Button {
+                                coordinator.setVideoEnhancementStrength(strength)
+                            } label: {
+                                Text(strength.rawValue)
+                                    .font(.caption2.weight(selected ? .bold : .medium))
+                                    .foregroundStyle(selected ? .black : .white.opacity(0.85))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        Capsule().fill(selected ? Color.cyan : Color.white.opacity(0.12))
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    Spacer(minLength: 4)
+
+                    if coordinator.currentURL != nil {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye")
+                                .font(.caption2.weight(.semibold))
+                            Text(optical.isComparingOriginalQuality ? "原画对比中" : "按住对比原画")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundStyle(optical.isComparingOriginalQuality ? .black : .white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule().fill(optical.isComparingOriginalQuality ? Color.yellow : Color.white.opacity(0.16))
+                        )
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { _ in
+                                    coordinator.setComparingOriginalQuality(true)
+                                }
+                                .onEnded { _ in
+                                    coordinator.setComparingOriginalQuality(false)
+                                }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct LiquidGlassPlayerView: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject private var optical: OpticalFlowPlayerController
@@ -693,6 +817,7 @@ struct LiquidGlassPlayerView: View {
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = false
     @State private var showFPSPicker: Bool = false
+    @State private var showQualityPicker: Bool = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
@@ -718,9 +843,10 @@ struct LiquidGlassPlayerView: View {
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if showFPSPicker {
+                        if showFPSPicker || showQualityPicker {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
                                 showFPSPicker = false
+                                showQualityPicker = false
                             }
                             fpsAutoCloseTask?.cancel()
                             scheduleHUDAutoHide()
@@ -740,6 +866,19 @@ struct LiquidGlassPlayerView: View {
             if coordinator.currentURL == nil {
                 welcomeOverlay
             } else {
+                if optical.isComparingOriginalQuality {
+                    VStack {
+                        Text("按住对比中 · 原画")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(Color.yellow))
+                            .padding(.top, 14)
+                        Spacer()
+                    }
+                    .allowsHitTesting(false)
+                }
                 if optical.errorMessage == nil,
                    (optical.isLoadingPipeline || optical.presentedFrameCount == 0) {
                     loadingStatusPill(
@@ -844,6 +983,7 @@ struct LiquidGlassPlayerView: View {
               !coordinator.activePaused,
               !isScrubbing,
               !showFPSPicker,
+              !showQualityPicker,
               !showEnhancementSheet,
               !showDiagnosticSheet else {
             return
@@ -855,6 +995,7 @@ struct LiquidGlassPlayerView: View {
                   !coordinator.activePaused,
                   !isScrubbing,
                   !showFPSPicker,
+                  !showQualityPicker,
                   !showEnhancementSheet,
                   !showDiagnosticSheet else {
                 return
@@ -919,6 +1060,22 @@ struct LiquidGlassPlayerView: View {
                                     .foregroundStyle(.cyan)
                             }
                             FrameRatePresetStrip(
+                                coordinator: coordinator,
+                                optical: optical,
+                                compact: true
+                            )
+
+                            HStack {
+                                Text("默认画质增强")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(coordinator.videoEnhancementPreset == .off ? "原画直通" : "\(coordinator.videoEnhancementPreset.rawValue) · \(coordinator.videoEnhancementStrength.rawValue)")
+                                    .font(.caption2.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.purple)
+                            }
+                            .padding(.top, 4)
+                            QualityPresetStrip(
                                 coordinator: coordinator,
                                 optical: optical,
                                 compact: true
@@ -1027,6 +1184,43 @@ struct LiquidGlassPlayerView: View {
             Spacer()
 
             VStack(spacing: 8) {
+                if showQualityPicker {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label(
+                                optical.isDolbyVisionContent
+                                    ? "杜比视界原片自动保留原厂映射"
+                                    : "Metal + MetalFX 实时画质增强（\(optical.activeQualityPipelineLabel)）",
+                                systemImage: "wand.and.stars"
+                            )
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(optical.isDolbyVisionContent ? .yellow : .secondary)
+                            Spacer()
+                            Button {
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                    showQualityPicker = false
+                                }
+                                scheduleHUDAutoHide()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        QualityPresetStrip(
+                            coordinator: coordinator,
+                            optical: optical,
+                            compact: true
+                        )
+                    }
+                    .padding(12)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                    .frame(maxWidth: 680)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
                 if showFPSPicker {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -1150,6 +1344,7 @@ struct LiquidGlassPlayerView: View {
                         Button {
                             fpsAutoCloseTask?.cancel()
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                showQualityPicker = false
                                 showFPSPicker.toggle()
                             }
                             if showFPSPicker {
@@ -1180,6 +1375,36 @@ struct LiquidGlassPlayerView: View {
                         .contentShape(Capsule())
                         .glassEffect(
                             coordinator.interpolationMode == .vtOpticalFlow ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                            in: .capsule
+                        )
+
+                        Button {
+                            fpsAutoCloseTask?.cancel()
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                showFPSPicker = false
+                                showQualityPicker.toggle()
+                            }
+                            if showQualityPicker {
+                                hudAutoHideTask?.cancel()
+                            } else {
+                                scheduleHUDAutoHide()
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: coordinator.videoEnhancementPreset.iconName)
+                                    .font(.caption2.weight(.bold))
+                                Text(coordinator.videoEnhancementPreset.shortBadge)
+                                    .font(.caption2.weight(.bold))
+                            }
+                            .foregroundStyle(coordinator.videoEnhancementPreset == .off ? .primary : .purple)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Capsule())
+                        .glassEffect(
+                            coordinator.videoEnhancementPreset != .off ? .regular.tint(.purple).interactive() : .regular.interactive(),
                             in: .capsule
                         )
 
@@ -1378,6 +1603,13 @@ struct LiquidGlassPlayerView: View {
                 .foregroundStyle(.white.opacity(0.78))
                 .lineLimit(1)
 
+            if optical.videoEnhancementPreset != .off {
+                Text("画质 \(optical.activeQualityPipelineLabel) · \(String(format: "%.1f", optical.averageQualityEnhanceMs))ms")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.purple.opacity(0.95))
+                    .lineLimit(1)
+            }
+
             HStack(spacing: 5) {
                 Circle()
                     .fill(thermalColor(metrics.thermalLevel))
@@ -1548,6 +1780,29 @@ struct EnhancementControlSheet: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+                }
+
+                Section("实时 GPU 画质增强（假 4K 去糊 + MetalFX 低清超分）") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("当前画质")
+                            Spacer()
+                            Text(optical.activeQualityPipelineLabel)
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .foregroundStyle(.purple)
+                        }
+
+                        QualityPresetStrip(
+                            coordinator: coordinator,
+                            optical: optical,
+                            compact: false
+                        )
+
+                        Text(coordinator.videoEnhancementPreset.detailDescription)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
                 }
 
                 Section("画质与播放开关") {

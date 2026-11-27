@@ -1676,7 +1676,23 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var isEDREnabled: Bool = true
     @Published @MainActor var isDolbyVisionContent: Bool = false
     @Published @MainActor var isHDRContent: Bool = false
+    @Published @MainActor var videoEnhancementPreset: VideoEnhancementPreset = .off
+    @Published @MainActor var videoEnhancementStrength: VideoEnhancementStrength = .standard
+    @Published @MainActor var isComparingOriginalQuality: Bool = false
+    @Published @MainActor var activeQualityPipelineLabel: String = "关闭"
+    @Published @MainActor var averageQualityEnhanceMs: Double = 0
     @MainActor private var rawHDRTransferName: String? = nil
+    @MainActor private var metalEnhancerStorage: MetalVideoEnhancer? = nil
+
+    @MainActor
+    private var metalEnhancer: MetalVideoEnhancer {
+        if let existing = metalEnhancerStorage {
+            return existing
+        }
+        let created = MetalVideoEnhancer()
+        metalEnhancerStorage = created
+        return created
+    }
 
     @MainActor
     var targetSummaryBadge: String {
@@ -2326,6 +2342,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         lastDisplayTickHostTime = 0
         displayContainer?.updateProMotionLink(isActive: false, range: .default)
         updatePlaybackActivity(isActive: false)
+        metalEnhancerStorage?.reset()
+        isComparingOriginalQuality = false
+        activeQualityPipelineLabel = "关闭"
+        averageQualityEnhanceMs = 0
         UIApplication.shared.isIdleTimerDisabled = false
         if hadActiveSession {
             appendLog("[ane] 光流核已停止")
@@ -3544,7 +3564,31 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func presentFrame(_ buffer: CVPixelBuffer, ptsSeconds: Double, on layer: AVSampleBufferDisplayLayer) {
-        guard let sampleBuffer = makeSampleBuffer(from: buffer, ptsSeconds: ptsSeconds) else { return }
+        let displayBuffer: CVPixelBuffer
+        if videoEnhancementPreset != .off {
+            let enhancer = metalEnhancer
+            displayBuffer = enhancer.process(
+                buffer,
+                preset: videoEnhancementPreset,
+                strength: videoEnhancementStrength,
+                isHDRContent: isHDRContent,
+                isDolbyVision: isDolbyVisionContent,
+                bypassForComparison: isComparingOriginalQuality
+            )
+            if activeQualityPipelineLabel != enhancer.activePipelineLabel {
+                activeQualityPipelineLabel = enhancer.activePipelineLabel
+            }
+            if presentedFrameCount % 15 == 0 {
+                averageQualityEnhanceMs = enhancer.averageProcessMs
+            }
+        } else {
+            displayBuffer = buffer
+            if activeQualityPipelineLabel != "关闭" {
+                activeQualityPipelineLabel = "关闭"
+                averageQualityEnhanceMs = 0
+            }
+        }
+        guard let sampleBuffer = makeSampleBuffer(from: displayBuffer, ptsSeconds: ptsSeconds) else { return }
         let renderer = layer.sampleBufferRenderer
         if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
             let reason = renderer.error?.localizedDescription ?? "requiresFlushToResumeDecoding"

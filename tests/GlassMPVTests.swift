@@ -1266,4 +1266,144 @@ final class GlassMPVTests: XCTestCase {
         await producer.value
         XCTAssertEqual(receivedValues, [0, 1, 2, 3, 4])
     }
+
+    @MainActor
+    func testVideoEnhancementPlannerAndMetalEnhancer() throws {
+        let offParams = VideoEnhancementPlanner.parameters(for: .off, strength: .standard)
+        XCTAssertEqual(offParams.casStrength, 0)
+        XCTAssertFalse(offParams.wantsSpatialUpscale)
+
+        let subtleOld = VideoEnhancementPlanner.parameters(for: .old4KRestore, strength: .subtle)
+        let stdOld = VideoEnhancementPlanner.parameters(for: .old4KRestore, strength: .standard)
+        let strongOld = VideoEnhancementPlanner.parameters(for: .old4KRestore, strength: .strong)
+        XCTAssertLessThan(subtleOld.casStrength, stdOld.casStrength)
+        XCTAssertLessThan(stdOld.casStrength, strongOld.casStrength)
+        XCTAssertFalse(stdOld.wantsSpatialUpscale)
+
+        let superParams = VideoEnhancementPlanner.parameters(for: .lowResSuperRes, strength: .standard)
+        XCTAssertTrue(superParams.wantsSpatialUpscale)
+        XCTAssertGreaterThan(superParams.casStrength, 0)
+
+        let up720 = try XCTUnwrap(VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: 986, inputHeight: 720))
+        XCTAssertEqual(up720.width, 1972)
+        XCTAssertEqual(up720.height, 1440)
+
+        let up360 = try XCTUnwrap(VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: 640, inputHeight: 360))
+        XCTAssertEqual(up360.width, 1280)
+        XCTAssertEqual(up360.height, 720)
+
+        let up1080 = try XCTUnwrap(VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: 1920, inputHeight: 1080))
+        XCTAssertEqual(up1080.width, 2560)
+        XCTAssertEqual(up1080.height, 1440)
+
+        XCTAssertNil(VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: 2960, inputHeight: 2160))
+
+        let upPortrait = try XCTUnwrap(VideoEnhancementPlanner.recommendedUpscaleDimensions(inputWidth: 720, inputHeight: 1280))
+        XCTAssertEqual(upPortrait.width, 1440)
+        XCTAssertEqual(upPortrait.height, 2560)
+
+        let coordinator = PlayerCoordinator()
+        defer { coordinator.closeToHome() }
+        coordinator.setVideoEnhancementPreset(.old4KRestore)
+        XCTAssertEqual(coordinator.opticalFlowController.videoEnhancementPreset, .old4KRestore)
+        coordinator.setVideoEnhancementStrength(.strong)
+        XCTAssertEqual(coordinator.opticalFlowController.videoEnhancementStrength, .strong)
+        coordinator.setComparingOriginalQuality(true)
+        XCTAssertTrue(coordinator.opticalFlowController.isComparingOriginalQuality)
+        XCTAssertTrue(coordinator.uiAuditLogs.contains(where: { $0.contains("setVideoEnhancementPreset") }))
+
+        let enhancer = MetalVideoEnhancer()
+        var yuvOpt: CVPixelBuffer?
+        let yuvStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            72,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ] as CFDictionary,
+            &yuvOpt
+        )
+        XCTAssertEqual(yuvStatus, kCVReturnSuccess)
+        let yuvBuffer = try XCTUnwrap(yuvOpt)
+
+        CVPixelBufferLockBaseAddress(yuvBuffer, [])
+        if let baseY = CVPixelBufferGetBaseAddressOfPlane(yuvBuffer, 0) {
+            let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(yuvBuffer, 0)
+            let ptr = baseY.assumingMemoryBound(to: UInt8.self)
+            for row in 0..<72 {
+                for col in 0..<128 {
+                    ptr[row * bytesPerRow + col] = col < 64 ? 48 : 200
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(yuvBuffer, [])
+
+        let bypassedCompare = enhancer.process(
+            yuvBuffer,
+            preset: .old4KRestore,
+            strength: .standard,
+            isHDRContent: false,
+            isDolbyVision: false,
+            bypassForComparison: true
+        )
+        XCTAssertTrue(bypassedCompare === yuvBuffer)
+
+        let bypassedDV = enhancer.process(
+            yuvBuffer,
+            preset: .lowResSuperRes,
+            strength: .standard,
+            isHDRContent: true,
+            isDolbyVision: true,
+            bypassForComparison: false
+        )
+        XCTAssertTrue(bypassedDV === yuvBuffer)
+
+        let restoredYUV = enhancer.process(
+            yuvBuffer,
+            preset: .old4KRestore,
+            strength: .standard,
+            isHDRContent: false,
+            isDolbyVision: false
+        )
+        XCTAssertEqual(CVPixelBufferGetWidth(restoredYUV), 128)
+        XCTAssertEqual(CVPixelBufferGetHeight(restoredYUV), 72)
+
+        let upscaledYUV = enhancer.process(
+            yuvBuffer,
+            preset: .lowResSuperRes,
+            strength: .standard,
+            isHDRContent: false,
+            isDolbyVision: false
+        )
+        if MTLCreateSystemDefaultDevice() != nil {
+            XCTAssertEqual(CVPixelBufferGetWidth(upscaledYUV), 256)
+            XCTAssertEqual(CVPixelBufferGetHeight(upscaledYUV), 144)
+        }
+
+        var bgraOpt: CVPixelBuffer?
+        let bgraStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            128,
+            72,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ] as CFDictionary,
+            &bgraOpt
+        )
+        XCTAssertEqual(bgraStatus, kCVReturnSuccess)
+        let bgraBuffer = try XCTUnwrap(bgraOpt)
+        let animeBGRA = enhancer.process(
+            bgraBuffer,
+            preset: .animeLineArt,
+            strength: .strong,
+            isHDRContent: false,
+            isDolbyVision: false
+        )
+        XCTAssertEqual(CVPixelBufferGetWidth(animeBGRA), 128)
+        XCTAssertEqual(CVPixelBufferGetHeight(animeBGRA), 72)
+    }
 }
