@@ -1,7 +1,9 @@
 import CoreVideo
 import Foundation
 import Metal
+#if canImport(MetalFX) && !targetEnvironment(simulator)
 import MetalFX
+#endif
 import VideoToolbox
 
 private struct MetalEnhanceUniforms {
@@ -35,7 +37,9 @@ final class MetalVideoEnhancer {
     private var outputPool: CVPixelBufferPool?
     private var outputPoolSignature: String = ""
 
+#if canImport(MetalFX) && !targetEnvironment(simulator)
     private var spatialScaler: MTLFXSpatialScaler?
+#endif
     private var scalerInputTexture: MTLTexture?
     private var scalerOutputTexture: MTLTexture?
     private var scalerSignature: String = ""
@@ -358,7 +362,9 @@ final class MetalVideoEnhancer {
     func reset() {
         outputPool = nil
         outputPoolSignature = ""
+#if canImport(MetalFX) && !targetEnvironment(simulator)
         spatialScaler = nil
+#endif
         scalerInputTexture = nil
         scalerOutputTexture = nil
         scalerSignature = ""
@@ -553,6 +559,7 @@ final class MetalVideoEnhancer {
             upscaleInputTex = bgraTex
         }
 
+#if canImport(MetalFX) && !targetEnvironment(simulator)
         if let spatialScaler, isUsingHardwareMetalFX {
             spatialScaler.colorTexture = upscaleInputTex
             spatialScaler.outputTexture = upscaledTex
@@ -567,6 +574,18 @@ final class MetalVideoEnhancer {
         } else {
             return nil
         }
+#else
+        if let bicubicBGRAPipeline,
+           let upEncoder = commandBuffer.makeComputeCommandEncoder() {
+            upEncoder.setComputePipelineState(bicubicBGRAPipeline)
+            upEncoder.setTexture(upscaleInputTex, index: 0)
+            upEncoder.setTexture(upscaledTex, index: 1)
+            dispatch2D(encoder: upEncoder, pipeline: bicubicBGRAPipeline, width: outW, height: outH)
+            upEncoder.endEncoding()
+        } else {
+            return nil
+        }
+#endif
 
         guard let finishEncoder = commandBuffer.makeComputeCommandEncoder() else {
             return nil
@@ -727,6 +746,7 @@ final class MetalVideoEnhancer {
         outDesc.storageMode = .private
         scalerOutputTexture = device.makeTexture(descriptor: outDesc)
 
+#if canImport(MetalFX) && !targetEnvironment(simulator)
         if MTLFXSpatialScalerDescriptor.supportsDevice(device) {
             let fxDesc = MTLFXSpatialScalerDescriptor()
             fxDesc.colorTextureFormat = .bgra8Unorm
@@ -743,6 +763,7 @@ final class MetalVideoEnhancer {
             }
         }
         spatialScaler = nil
+#endif
         isUsingHardwareMetalFX = false
     }
 
