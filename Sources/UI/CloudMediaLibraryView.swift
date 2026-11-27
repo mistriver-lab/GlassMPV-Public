@@ -965,6 +965,7 @@ struct CloudSourceBrowserSheet: View {
                     headers: resolved.headers,
                     displayTitle: resolved.title,
                     sourceLabel: "\(account.kind.shortBadge) · \(resolved.qualityLabel)",
+                    isHLS: resolved.isHLS,
                     alternatives: resolved.alternatives,
                     accountID: account.id
                 )

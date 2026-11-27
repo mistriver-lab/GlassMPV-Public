@@ -168,6 +168,7 @@ struct PlaybackMediaRequest: Sendable, Equatable {
     let headers: [String: String]
     let displayTitle: String
     let sourceLabel: String
+    let isHLS: Bool
     let alternatives: [StreamVariantOption]
     let accountID: UUID?
 
@@ -176,6 +177,7 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         headers: [String: String],
         displayTitle: String,
         sourceLabel: String,
+        isHLS: Bool = false,
         alternatives: [StreamVariantOption],
         accountID: UUID? = nil
     ) {
@@ -183,6 +185,7 @@ struct PlaybackMediaRequest: Sendable, Equatable {
         self.headers = headers
         self.displayTitle = displayTitle
         self.sourceLabel = sourceLabel
+        self.isHLS = isHLS
         self.alternatives = alternatives
         self.accountID = accountID
     }

@@ -2,6 +2,14 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.3] - 2026-11-27
+
+### 变更与修复 (Changed & Fixed)
+- **彻底解决 `172520` 实机日志定位的夸克云端原画有声黑屏 (`Decoder: hev1`, `pres=0`, `0×0`) (`LocalHTTPStreamProxy` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView` + `MediaSourceModels`)**：
+  - **流式 MP4 `hev1 → hvc1` 在线重封装 (`patchHEV1ToHVC1` + `MP4HEV1StreamPatcher`)**：基于 ISO BMFF `VisualSampleEntry` 结构约束（Box 长度、`reserved[6]`、`data_reference_index`、合理分辨率、`depth=0x0018`、`pre_defined=0xFFFF` 与 `hvcC`）在 `127.0.0.1` 代理滑动窗口内将 `hev1` 原地改写为 `hvc1`（零长度漂移、零 `mdat` 误伤），使 `AVPlayer` 可直接硬解夸克 `hev1` HEVC MP4。
+  - **云端 `AVPlayerItemVideoOutput` 与黑屏看门狗自动切流**：为 `AVPlayerItemVideoOutput` 显式声明 `kCVPixelBufferPixelFormatTypeKey = 420v`、移除无 `AVPlayerLayer` 时的 `suppressesPlayerRendering`、在 `.readyToPlay` 按轨道 `naturalSize` 兜底元数据，并在 `itemTime(forHostTime:)` 无效时回退 `player.currentTime()`；新增 3.5s 无画面看门狗，自动切换至未尝试的 `夸克 4K / 1080P` HLS 流或给出精准引导；全面传递 `PlaybackMediaRequest.isHLS`。
+  - **版本一致性加固 (`AppReleaseInfo` + `test_project_integrity.py`)**：将 `AppReleaseInfo.releaseTag` 同步至 `0.1.0-beta.3` 并补全 `beta.2`/`beta.3` 更新日志，门禁新增 `VERSION` 与 `AppReleaseInfo.releaseTag` 强一致断言。
+
 ## [v0.1.0-beta.2] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)

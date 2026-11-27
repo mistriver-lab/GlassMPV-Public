@@ -88,7 +88,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         lock.unlock()
 
         if shouldLaunch {
-            Task.detached(priority: .userInteractive) { [weak self] in
+            Task.detached(priority: .high) { [weak self] in
                 await self?.drainLoop()
             }
         }

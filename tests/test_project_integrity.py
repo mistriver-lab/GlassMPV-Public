@@ -74,6 +74,9 @@ def test_version_changelog_and_app_icon():
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert f"[v{version}]" in changelog
 
+    release_info = (ROOT / "Sources" / "Models" / "AppReleaseInfo.swift").read_text(encoding="utf-8")
+    assert f'releaseTag = "{version}"' in release_info, f"AppReleaseInfo.releaseTag must match VERSION ({version})"
+
     icon_path = ROOT / "Resources" / "Assets.xcassets" / "AppIcon.appiconset" / "AppIcon-1024.png"
     assert icon_path.is_file(), f"Missing AppIcon: {icon_path}"
     with Image.open(icon_path) as img:
@@ -233,6 +236,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "NWListener" in local_proxy_src
     assert "mergeSetCookieHeaders" in local_proxy_src
     assert "rewriteHLSManifest" in local_proxy_src
+    assert "patchHEV1ToHVC1" in local_proxy_src
+    assert "MP4HEV1StreamPatcher" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -378,6 +383,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testMetalDirectRendererAspectMathAndZeroWaitMetrics" in swift_test_src
     assert "testQuarkQRLoginParsingAndURLBuilder" in swift_test_src
     assert "testMetalDrawableSizingAndTelemetryThrottling" in swift_test_src
+    assert "testLocalHTTPStreamProxyHEV1ToHVC1RewriteAndChunkBoundary" in swift_test_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

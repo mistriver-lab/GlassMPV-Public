@@ -242,7 +242,9 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             upstreamReq.setValue(rangeHeader, forHTTPHeaderField: "Range")
         }
 
-        let isManifest = matchedRoute.isHLS || matchedRoute.upstreamURL.pathExtension.lowercased() == "m3u8"
+        let isManifest = matchedRoute.isHLS
+            || matchedRoute.upstreamURL.pathExtension.lowercased() == "m3u8"
+            || matchedRoute.upstreamURL.absoluteString.lowercased().contains(".m3u8")
         if isManifest {
             let redirectDelegate = RedirectHeaderPreservingDelegate(
                 headers: matchedRoute.headers,
@@ -298,6 +300,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             connection: connection,
             headers: matchedRoute.headers,
             rangeHeader: parsed.rangeHeader,
+            enableMP4HEV1Patch: parsed.method != "HEAD",
             onResponse: { [weak self] http in
                 self?.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
             }
@@ -424,6 +427,87 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         updated.replaceSubrange(afterOpen..<closeQuote, with: replaced)
         return updated
     }
+
+    /// 将 ISO BMFF MP4 `stsd` 容器内的 `hev1` SampleEntry 类型字节无损原地改写为 Apple `AVPlayer` 支持的 `hvc1`。
+    /// 严格校验 Box 长度、保留字段、`data_reference_index`、合理分辨率、`depth=0x0018`、`pre_defined=0xFFFF` 与子 Box `hvcC`，
+    /// 避免误伤 `mdat` 媒体负载中的偶然字节序列。
+    static func patchHEV1ToHVC1(in data: inout Data) -> Int {
+        let count = data.count
+        guard count >= 90 else { return 0 }
+        var patched = 0
+        var i = 4
+        while i + 86 <= count {
+            if data[i] == 0x68 && data[i + 1] == 0x65 && data[i + 2] == 0x76 && data[i + 3] == 0x31 {
+                let boxSize = (UInt32(data[i - 4]) << 24)
+                    | (UInt32(data[i - 3]) << 16)
+                    | (UInt32(data[i - 2]) << 8)
+                    | UInt32(data[i - 1])
+                if boxSize >= 94 && boxSize <= 65536 {
+                    let reservedZero = data[i + 4] == 0 && data[i + 5] == 0 && data[i + 6] == 0
+                        && data[i + 7] == 0 && data[i + 8] == 0 && data[i + 9] == 0
+                    let dataRefIdx = (UInt16(data[i + 10]) << 8) | UInt16(data[i + 11])
+                    let width = (UInt16(data[i + 28]) << 8) | UInt16(data[i + 29])
+                    let height = (UInt16(data[i + 30]) << 8) | UInt16(data[i + 31])
+                    let depth = (UInt16(data[i + 78]) << 8) | UInt16(data[i + 79])
+                    let preDefined = (UInt16(data[i + 80]) << 8) | UInt16(data[i + 81])
+                    if reservedZero,
+                       (1...255).contains(dataRefIdx),
+                       (16...16384).contains(width),
+                       (16...16384).contains(height),
+                       depth == 0x0018,
+                       preDefined == 0xFFFF {
+                        let boxEnd = min(count, min(i + 240, i - 4 + Int(boxSize)))
+                        var hasHVCC = false
+                        if i + 82 + 4 <= boxEnd {
+                            var j = i + 82
+                            while j + 4 <= boxEnd {
+                                if data[j] == 0x68 && data[j + 1] == 0x76 && data[j + 2] == 0x63 && data[j + 3] == 0x43 {
+                                    hasHVCC = true
+                                    break
+                                }
+                                j += 1
+                            }
+                        }
+                        if hasHVCC {
+                            data[i + 1] = 0x76
+                            data[i + 2] = 0x63
+                            patched += 1
+                            i += 86
+                            continue
+                        }
+                    }
+                }
+            }
+            i += 1
+        }
+        return patched
+    }
+}
+
+struct MP4HEV1StreamPatcher: Sendable {
+    private var tail = Data()
+    private let overlapSize: Int = 256
+
+    mutating func processChunk(_ chunk: Data) -> Data {
+        guard !chunk.isEmpty else { return Data() }
+        tail.append(chunk)
+        _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+        guard tail.count > overlapSize else {
+            return Data()
+        }
+        let emitCount = tail.count - overlapSize
+        let out = Data(tail.prefix(emitCount))
+        tail = Data(tail.suffix(overlapSize))
+        return out
+    }
+
+    mutating func flush() -> Data {
+        guard !tail.isEmpty else { return Data() }
+        _ = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &tail)
+        let out = tail
+        tail.removeAll(keepingCapacity: false)
+        return out
+    }
 }
 
 private final class RedirectHeaderPreservingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -457,21 +541,26 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
     private let connection: NWConnection
     private let headers: [String: String]
     private let rangeHeader: String?
+    private let enableMP4HEV1Patch: Bool
     private let onResponse: @Sendable (HTTPURLResponse) -> Void
     private let lock = NSLock()
     private var session: URLSession?
     private var dataTask: URLSessionDataTask?
     private var didFinish = false
+    private var shouldPatchMP4Stream = false
+    private var mp4Patcher = MP4HEV1StreamPatcher()
 
     init(
         connection: NWConnection,
         headers: [String: String],
         rangeHeader: String?,
+        enableMP4HEV1Patch: Bool = true,
         onResponse: @escaping @Sendable (HTTPURLResponse) -> Void
     ) {
         self.connection = connection
         self.headers = headers
         self.rangeHeader = rangeHeader
+        self.enableMP4HEV1Patch = enableMP4HEV1Patch
         self.onResponse = onResponse
     }
 
@@ -533,9 +622,13 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
             return
         }
         onResponse(http)
+        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
+        let isMP4OrBinary = !contentType.lowercased().contains("mpegurl") && !contentType.lowercased().contains("text/")
+        lock.lock()
+        shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
+        lock.unlock()
 
         var headerLines = ["HTTP/1.1 \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))"]
-        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
         headerLines.append("Content-Type: \(contentType)")
         if let len = http.value(forHTTPHeaderField: "Content-Length") {
             headerLines.append("Content-Length: \(len)")
@@ -552,7 +645,16 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !data.isEmpty else { return }
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        let outgoing: Data
+        lock.lock()
+        if shouldPatchMP4Stream {
+            outgoing = mp4Patcher.processChunk(data)
+        } else {
+            outgoing = data
+        }
+        lock.unlock()
+        guard !outgoing.isEmpty else { return }
+        connection.send(content: outgoing, completion: .contentProcessed { _ in })
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -561,9 +663,13 @@ private final class UpstreamStreamRelay: NSObject, URLSessionDataDelegate, @unch
         didFinish = true
         self.dataTask = nil
         self.session = nil
+        let trailing = shouldPatchMP4Stream ? mp4Patcher.flush() : Data()
         lock.unlock()
         session.finishTasksAndInvalidate()
         guard !alreadyFinished else { return }
+        if !trailing.isEmpty {
+            connection.send(content: trailing, completion: .contentProcessed { _ in })
+        }
         connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
             self?.connection.cancel()
         })

@@ -1877,4 +1877,67 @@ final class GlassMPVTests: XCTestCase {
         controller.flushPublishedTelemetryIfNeeded(force: true)
         XCTAssertEqual(controller.presentedFrameCount, 0)
     }
+
+    func testLocalHTTPStreamProxyHEV1ToHVC1RewriteAndChunkBoundary() throws {
+        func makeVisualSampleEntry(fourCC: String, width: UInt16, height: UInt16, includeHVCC: Bool) -> Data {
+            var entry = Data()
+            var sizePlaceholder = UInt32(0).bigEndian
+            withUnsafeBytes(of: &sizePlaceholder) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: fourCC.utf8.prefix(4))
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 6)) // reserved[6]
+            var dataRefIdx = UInt16(1).bigEndian
+            withUnsafeBytes(of: &dataRefIdx) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 16)) // pre_defined + reserved + horiz/vert/etc
+            var w = width.bigEndian
+            var h = height.bigEndian
+            withUnsafeBytes(of: &w) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &h) { entry.append(contentsOf: $0) }
+            entry.append(contentsOf: [UInt8](repeating: 0, count: 46)) // resolution + frame_count + compressorname[32]
+            var depth = UInt16(0x0018).bigEndian
+            var preDef = UInt16(0xFFFF).bigEndian
+            withUnsafeBytes(of: &depth) { entry.append(contentsOf: $0) }
+            withUnsafeBytes(of: &preDef) { entry.append(contentsOf: $0) }
+            if includeHVCC {
+                var childLen = UInt32(16).bigEndian
+                withUnsafeBytes(of: &childLen) { entry.append(contentsOf: $0) }
+                entry.append(contentsOf: "hvcC".utf8)
+                entry.append(contentsOf: [UInt8](repeating: 0x01, count: 8))
+            } else {
+                entry.append(contentsOf: [UInt8](repeating: 0x00, count: 16))
+            }
+            var totalLen = UInt32(entry.count).bigEndian
+            entry.replaceSubrange(0..<4, with: withUnsafeBytes(of: &totalLen) { Data($0) })
+            return entry
+        }
+
+        let validHEV1 = makeVisualSampleEntry(fourCC: "hev1", width: 1920, height: 1080, includeHVCC: true)
+        let prefixNoise = Data([0x11, 0x22, 0x33]) + Data("mdat_hev1_payload_bytes".utf8)
+        var randomFalseHEV1 = makeVisualSampleEntry(fourCC: "hev1", width: 1920, height: 1080, includeHVCC: false)
+        randomFalseHEV1[20] = 0xAA // corrupt non-hvcC noise box
+
+        var packet = Data()
+        packet.append(prefixNoise)
+        packet.append(validHEV1)
+        packet.append(randomFalseHEV1)
+
+        var oneShot = packet
+        let count = LocalHTTPStreamProxy.patchHEV1ToHVC1(in: &oneShot)
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(oneShot.count, packet.count)
+        let entrySlice = oneShot[prefixNoise.count..<(prefixNoise.count + validHEV1.count)]
+        XCTAssertEqual(String(data: entrySlice.subdata(in: 4..<8), encoding: .utf8), "hvc1")
+        XCTAssertTrue(String(decoding: oneShot.prefix(prefixNoise.count), as: UTF8.self).contains("hev1"))
+        XCTAssertEqual(String(data: oneShot.subdata(in: (prefixNoise.count + validHEV1.count + 4)..<(prefixNoise.count + validHEV1.count + 8)), encoding: .utf8), "hev1")
+
+        // 切分跨 "hev1" 与 "hvcC" 边界的流式重组校验
+        var patcher = MP4HEV1StreamPatcher()
+        let splitPoints = [0, 5, prefixNoise.count + 6, prefixNoise.count + 40, prefixNoise.count + 90, packet.count]
+        var streamed = Data()
+        for idx in 0..<(splitPoints.count - 1) {
+            let chunk = packet.subdata(in: splitPoints[idx]..<splitPoints[idx + 1])
+            streamed.append(patcher.processChunk(chunk))
+        }
+        streamed.append(patcher.flush())
+        XCTAssertEqual(streamed, oneShot)
+    }
 }

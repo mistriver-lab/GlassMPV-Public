@@ -1774,6 +1774,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private var lastRemoteSamplePTS: Double = -1
     private var remoteStatusObserver: NSKeyValueObservation?
     var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
+    var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
+    private var didLogFirstRemoteFrame: Bool = false
+    private final class RemoteWatchdogHolder: @unchecked Sendable {
+        var task: Task<Void, Never>?
+    }
+    private let remoteWatchdogHolder = RemoteWatchdogHolder()
     private var activeActivityIncludesLatencyCritical: Bool = false
 
     @MainActor
@@ -2003,6 +2009,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private func startRemoteStreamSession(
         url: URL,
         httpHeaders: [String: String],
+        isHLS: Bool,
         targetFPS: OpticalFlowTargetFPS,
         startAt: Double,
         autoPlay: Bool,
@@ -2012,15 +2019,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let playbackURL: URL
         let options: [String: Any]?
         if !httpHeaders.isEmpty {
-            let isHLS = url.pathExtension.lowercased() == "m3u8"
+            let detectedHLS = isHLS
+                || url.pathExtension.lowercased() == "m3u8"
+                || url.absoluteString.lowercased().contains(".m3u8")
             playbackURL = LocalHTTPStreamProxy.shared.registerStream(
                 url: url,
                 headers: httpHeaders,
-                isHLS: isHLS,
+                isHLS: detectedHLS,
                 onCookieUpdate: onRemoteCookieRefresh
             )
             options = nil
-            appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(isHLS))")
+            appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(detectedHLS))")
         } else {
             playbackURL = url
             options = nil
@@ -2028,11 +2037,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
         let pixelAttrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: pixelAttrs)
-        videoOutput.suppressesPlayerRendering = true
         item.add(videoOutput)
         self.remoteVideoOutput = videoOutput
 
@@ -2091,8 +2100,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     }
                     if let videoTrack = (try? await observedItem.asset.loadTracks(withMediaType: .video))?.first {
                         let nominal = (try? await videoTrack.load(.nominalFrameRate)) ?? 0
+                        let natSize = (try? await videoTrack.load(.naturalSize)) ?? .zero
                         let fmts = (try? await videoTrack.load(.formatDescriptions)) ?? []
                         guard self.isTokenValid(token) else { return }
+                        if self.videoWidth == 0 && natSize.width > 0 && natSize.height > 0 {
+                            self.videoWidth = Int(abs(natSize.width).rounded())
+                            self.videoHeight = Int(abs(natSize.height).rounded())
+                        }
                         if nominal > 1 {
                             self.sourceFPS = Double(nominal)
                             self.interpolatedFPS = self.isInterpolationEnabled
@@ -2105,7 +2119,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                 : 24.0
                         }
                         if let firstDesc = fmts.first {
-                            let metrics = Self.extractTrackMetrics(from: firstDesc, naturalSize: presSize)
+                            let resolvedSize = (presSize.width > 0 && presSize.height > 0) ? presSize : natSize
+                            let metrics = Self.extractTrackMetrics(from: firstDesc, naturalSize: resolvedSize)
                             self.setColorFallbackMetadata(from: firstDesc, trackMetrics: metrics)
                             self.videoCodec = metrics.codec
                             self.bitDepthLabel = metrics.bitDepth
@@ -2119,6 +2134,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                                 isHDRActive: self.isHDRActive,
                                 isDolbyVision: metrics.isDolbyVision
                             )
+                            self.appendLog("[remote] 轨道格式: \(HEVCFormatNormalizer.describeFormat(firstDesc)), pres=\(Int(presSize.width))×\(Int(presSize.height)), nat=\(Int(natSize.width))×\(Int(natSize.height))")
                         }
                     } else if self.sourceFPS <= 0 {
                         self.sourceFPS = 24.0
@@ -2144,6 +2160,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         self.startActiveClockIfNeeded()
                     }
                     self.appendLog("[remote] 云端视频流已就绪 (\(self.videoWidth)×\(self.videoHeight), srcFPS=\(String(format: "%.2f", self.sourceFPS)))")
+                    self.scheduleRemoteVideoWatchdog(token: token)
 
                 case .failed:
                     self.isLoadingPipeline = false
@@ -2208,6 +2225,24 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    private func scheduleRemoteVideoWatchdog(token: UUID) {
+        remoteWatchdogHolder.task?.cancel()
+        remoteWatchdogHolder.task = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3.5))
+            guard let self,
+                  !Task.isCancelled,
+                  self.isTokenValid(token),
+                  !self.isPaused,
+                  self.isPipelineReadyToPlay,
+                  self.rawPresentedFrameCount == 0 else {
+                return
+            }
+            self.appendLog("[remote][warn] 云端流已起播音频但 3.5s 内未收到视频解码帧，触发自动切流/提示兜底")
+            self.onRemoteVideoTrackUnplayable?("音频已起播但视频轨未输出画面（可能为非原生封装或编码不兼容）")
+        }
+    }
+
+    @MainActor
     func load(
         url: URL,
         spatial2x: Bool,
@@ -2217,7 +2252,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         enableInterpolation: Bool = true,
         httpHeaders: [String: String] = [:],
         displayTitle: String? = nil,
-        streamLabel: String = ""
+        streamLabel: String = "",
+        isHLS: Bool = false
     ) {
         stopInternal()
         currentURL = url
@@ -2324,6 +2360,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             startRemoteStreamSession(
                 url: url,
                 httpHeaders: httpHeaders,
+                isHLS: isHLS,
                 targetFPS: targetFPS,
                 startAt: startAt,
                 autoPlay: autoPlay,
@@ -2595,11 +2632,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
         if isRemoteStream {
             lastRemoteSamplePTS = -1
+            didLogFirstRemoteFrame = false
             remoteFlowWorker?.reset()
             isLoadingPipeline = false
             pipelineStatusText = ""
             isPipelineReadyToPlay = true
             startActiveClockIfNeeded()
+            scheduleRemoteVideoWatchdog(token: currentSessionToken())
             return
         }
 
@@ -2734,6 +2773,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         displayContainer?.updateProMotionLink(isActive: false, range: .default)
         displayContainer?.setMetalOverlayActive(false)
         updatePlaybackActivity(isActive: false)
+        remoteWatchdogHolder.task?.cancel()
+        remoteWatchdogHolder.task = nil
         remoteStatusObserver?.invalidate()
         remoteStatusObserver = nil
         remoteVideoOutput = nil
@@ -2742,6 +2783,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             worker.reset()
         }
         lastRemoteSamplePTS = -1
+        didLogFirstRemoteFrame = false
+        onRemoteVideoTrackUnplayable = nil
         currentHTTPHeaders = [:]
         isRemoteStream = false
         displayTitle = ""
@@ -3991,20 +4034,30 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     private func handleRemoteDisplayTick(on layer: AVSampleBufferDisplayLayer) {
         guard !isPaused, let output = remoteVideoOutput, let player = audioPlayer else { return }
         let hostTime = CACurrentMediaTime()
-        let itemTime = output.itemTime(forHostTime: hostTime)
+        let hostItemTime = output.itemTime(forHostTime: hostTime)
+        let currentItemTime = player.currentTime()
+        let queryTime = hostItemTime.isValid ? hostItemTime : currentItemTime
         var pulledBuffer: CVPixelBuffer?
-        var samplePTS = player.currentTime().seconds
-        if itemTime.isValid && output.hasNewPixelBuffer(forItemTime: itemTime) {
+        var samplePTS = currentItemTime.seconds
+        if queryTime.isValid && output.hasNewPixelBuffer(forItemTime: queryTime) {
             var displayItemTime = CMTime.invalid
-            if let pb = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayItemTime) {
+            if let pb = output.copyPixelBuffer(forItemTime: queryTime, itemTimeForDisplay: &displayItemTime) {
                 pulledBuffer = pb
-                let resolved = displayItemTime.isValid ? displayItemTime.seconds : itemTime.seconds
+                let resolved = displayItemTime.isValid ? displayItemTime.seconds : queryTime.seconds
                 if resolved.isFinite {
                     samplePTS = resolved
                 }
                 if videoWidth == 0 || videoHeight == 0 {
                     videoWidth = CVPixelBufferGetWidth(pb)
                     videoHeight = CVPixelBufferGetHeight(pb)
+                }
+                if !didLogFirstRemoteFrame {
+                    didLogFirstRemoteFrame = true
+                    remoteWatchdogHolder.task?.cancel()
+                    let w = CVPixelBufferGetWidth(pb)
+                    let h = CVPixelBufferGetHeight(pb)
+                    let fmt = Self.fourCCString(CVPixelBufferGetPixelFormatType(pb))
+                    appendLog("[remote] 首帧视频解码缓冲就绪: \(w)×\(h), fmt=\(fmt)")
                 }
                 inspectDecodedBufferColorOnceIfNeeded(pb, token: sessionToken)
             }
@@ -4024,7 +4077,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
         }
 
-        let pacerNow = max(0, samplePTS - 0.055)
+        let pacerNow = max(0, samplePTS - 0.085)
         bufferLock.lock()
         let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
             from: &frameQueue,
@@ -4186,6 +4239,13 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let valid = (sessionToken == token)
         tokenLock.unlock()
         return valid
+    }
+
+    private func currentSessionToken() -> UUID {
+        tokenLock.lock()
+        let tok = sessionToken
+        tokenLock.unlock()
+        return tok
     }
 
     private func queuedCount() -> Int {

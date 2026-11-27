@@ -49,6 +49,7 @@ final class PlayerCoordinator: ObservableObject {
     private let thermalToken = ThermalObserverToken()
     private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
+    private var autoFallbackAttemptedURLs: Set<URL> = []
 
     private static let auditTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -183,6 +184,7 @@ final class PlayerCoordinator: ObservableObject {
         opticalFlowController.clearError()
         activeMediaRequest = nil
         currentStreamVariants = []
+        autoFallbackAttemptedURLs.removeAll()
 
         if !url.isFileURL {
             beginPlayback(url: url)
@@ -239,6 +241,7 @@ final class PlayerCoordinator: ObservableObject {
 
     func openCloudStream(_ request: PlaybackMediaRequest, seekTo: Double = 0) {
         opticalFlowController.clearError()
+        autoFallbackAttemptedURLs.removeAll()
         activeMediaRequest = request
         currentStreamVariants = request.alternatives
         recordUISwitch("openCloudStream(\(request.sourceLabel)) -> \(request.displayTitle)")
@@ -253,7 +256,9 @@ final class PlayerCoordinator: ObservableObject {
             headers: variant.headers,
             displayTitle: currentReq.displayTitle,
             sourceLabel: variant.label,
-            alternatives: currentReq.alternatives
+            isHLS: variant.isHLS,
+            alternatives: currentReq.alternatives,
+            accountID: currentReq.accountID
         )
         recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
         activeMediaRequest = updated
@@ -272,6 +277,7 @@ final class PlayerCoordinator: ObservableObject {
         currentURL = nil
         activeMediaRequest = nil
         currentStreamVariants = []
+        autoFallbackAttemptedURLs.removeAll()
         qualityCompareMode = .off
         isImportingFile = false
         OrientationController.shared.returnToHomeOrientation()
@@ -664,6 +670,21 @@ final class PlayerCoordinator: ObservableObject {
         } else {
             opticalFlowController.onRemoteCookieRefresh = nil
         }
+        opticalFlowController.onRemoteVideoTrackUnplayable = { [weak self] reason in
+            guard let self else { return }
+            if let current = self.currentURL {
+                self.autoFallbackAttemptedURLs.insert(current)
+            }
+            let candidates = self.currentStreamVariants.filter {
+                $0.url != self.currentURL && !self.autoFallbackAttemptedURLs.contains($0.url)
+            }
+            if let fallback = candidates.first(where: \.isHLS) ?? candidates.first {
+                self.opticalFlowController.appendLog("[remote][fallback] \(reason)，自动切流 -> \(fallback.label)")
+                self.switchStreamVariant(fallback)
+            } else {
+                self.opticalFlowController.recordExternalError("\(reason)。请点击底部「切换画质流」选择「夸克 4K / 1080P」，或长按列表中的「缓存到本地离线精播」。")
+            }
+        }
         let enableInterp = (interpolationMode == .vtOpticalFlow)
         opticalFlowController.load(
             url: url,
@@ -674,7 +695,8 @@ final class PlayerCoordinator: ObservableObject {
             enableInterpolation: enableInterp,
             httpHeaders: activeMediaRequest?.headers ?? [:],
             displayTitle: activeMediaRequest?.displayTitle,
-            streamLabel: activeMediaRequest?.sourceLabel ?? ""
+            streamLabel: activeMediaRequest?.sourceLabel ?? "",
+            isHLS: activeMediaRequest?.isHLS ?? false
         )
         opticalFlowController.setSpeed(speed)
     }

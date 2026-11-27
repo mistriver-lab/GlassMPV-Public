@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.1"
+    static let releaseTag = "0.1.0-beta.3"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,22 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.3",
+            date: "2026-11-27",
+            highlights: [
+                "彻底打通夸克网盘原画直链与云端转码播控：LocalHTTPStreamProxy 在线流式将 MP4 容器内的 hev1 SampleEntry 无损改写为 Apple AVPlayer 兼容的 hvc1（严格校验 Box 长度/分辨率/hvcC 避免误改 mdat），根治夸克 MP4 有声黑屏（pres=0, 0×0）",
+                "修复云端 AVPlayerItemVideoOutput 输出格式与时序回退：补齐 420v 像素格式声明、移除未挂 AVPlayerLayer 下的 suppressesPlayerRendering 阻塞，并加入 3.5 秒云端黑屏看门狗自动切换至夸克 4K / 1080P HLS 流；同步 AppReleaseInfo.releaseTag 与 VERSION 一致性"
+            ]
+        ),
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.2",
+            date: "2026-11-27",
+            highlights: [
+                "彻底解决 120fps 展开控制栏与超分弹窗掉帧：Frame 级遥测按 4Hz 节流发布、layoutDisplayLayer 全字段幂等防抖、高刷非超分直绘封顶 1600px 并接入 3 缓冲背压、剥离底栏 9 处嵌套 .glassEffect 并启用高刷轻量化描边 HUD",
+                "重塑夸克网盘单机登录闭环：接入 uop.quark.cn 原生 CAS 二维码接口，支持一键「保存二维码并打开夸克 App」+ 2 秒自动轮询兑票与首访补齐 __puus；网页登录默认 .mobile 视口并补齐 WKUIDelegate/WKNavigationDelegate 跳转"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.1",
             date: "2026-11-27",
