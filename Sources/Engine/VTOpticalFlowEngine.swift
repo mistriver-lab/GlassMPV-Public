@@ -3257,7 +3257,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         return (isHDR, transferName, parsedDepth == "--" ? nil : parsedDepth)
     }
 
-    private static func selectPrimaryVideoTrack(from tracks: [AVAssetTrack]) async -> AVAssetTrack? {
+    private static func selectPrimaryVideoTrack(
+        from tracks: [AVAssetTrack],
+        isolation: isolated (any Actor)? = #isolation
+    ) async -> AVAssetTrack? {
         guard tracks.count > 1 else { return tracks.first }
         var scored: [(track: AVAssetTrack, score: Double)] = []
         scored.reserveCapacity(tracks.count)
@@ -3285,6 +3288,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         return scored.max(by: { $0.score < $1.score })?.track ?? tracks.first
     }
 
+    @MainActor
     private static func selectPlayableAudioTrack(from tracks: [AVAssetTrack]) async -> AVAssetTrack? {
         guard tracks.count > 1 else { return tracks.first }
         for track in tracks {
