@@ -37,9 +37,11 @@ final class PlayerCoordinator: ObservableObject {
     @Published var runtimeTimeline: [RuntimeTelemetrySample] = []
     @Published var lastSessionSummary: SessionDiagnosticSummary?
     @Published var uiAuditLogs: [String] = []
+    @Published var isLowPowerModeEnabled: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
 
     let opticalFlowController = OpticalFlowPlayerController()
     private let thermalToken = ThermalObserverToken()
+    private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
 
     private static let auditTimeFormatter: DateFormatter = {
@@ -61,6 +63,19 @@ final class PlayerCoordinator: ObservableObject {
             let current = ProcessInfo.processInfo.thermalState
             Task { @MainActor [weak self] in
                 self?.thermalState = current
+            }
+        }
+
+        powerModeToken.observer = NotificationCenter.default.addObserver(
+            forName: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isLowPowerModeEnabled = lowPower
+                self.opticalFlowController.syncDisplayLinkState()
             }
         }
     }
@@ -1016,11 +1031,13 @@ struct LiquidGlassPlayerView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Label(
-                                "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · 120Hz ProMotion",
-                                systemImage: "sparkles"
+                                coordinator.isLowPowerModeEnabled
+                                    ? "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · 低电量 60Hz 上限"
+                                    : "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · ProMotion 智能锁频",
+                                systemImage: coordinator.isLowPowerModeEnabled ? "battery.25" : "sparkles"
                             )
                             .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(coordinator.isLowPowerModeEnabled ? .yellow : .secondary)
                             Spacer()
                             Button {
                                 fpsAutoCloseTask?.cancel()
@@ -1516,7 +1533,7 @@ struct EnhancementControlSheet: View {
                             compact: false
                         )
 
-                        Text("自动匹配片源帧率与 120Hz ProMotion 整数分频（48/60/96/120 fps）；播放中点选卡片立即原地热切换，无需重建音频。")
+                        Text("自动匹配片源帧率与 ProMotion 物理锁频（48Hz / 60Hz / 120Hz），并随低电量模式自动封顶 60Hz；播放中点选卡片立即原地热切换，无需重建音频。")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }

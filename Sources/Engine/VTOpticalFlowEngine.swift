@@ -259,7 +259,7 @@ enum OpticalFlowFramePacer {
         now: Double,
         isInterpolationEnabled: Bool,
         maxLateGraceSeconds: Double = 0.055,
-        earlySnapSeconds: Double = 0.004
+        earlySnapSeconds: Double = 0.006
     ) -> (frame: Frame?, presentedPTS: Double?, droppedCount: Int) {
         guard !queue.isEmpty else {
             return (nil, nil, 0)
@@ -1108,12 +1108,18 @@ enum OpticalFlowResolutionPlanner: Sendable {
     static func recommendedDisplayFrameRateRange(
         targetFPS: Double,
         isInterpolationEnabled: Bool = true,
-        maxScreenFPS: Int = 120
+        maxScreenFPS: Int = 120,
+        isLowPowerMode: Bool = false
     ) -> (minimum: Float, maximum: Float, preferred: Float) {
         let safeFPS = (targetFPS.isFinite && targetFPS > 1.0) ? targetFPS : 48.0
         if isInterpolationEnabled {
             if maxScreenFPS >= 120 {
-                // 开启补帧时锁定 120Hz VSync（minimum: 80 防止退回 24Hz / 60Hz 相位拍频丢帧）
+                if safeFPS >= 47.0 && safeFPS <= 48.5 {
+                    return (48, 48, 48)
+                }
+                if isLowPowerMode || safeFPS <= 60.5 {
+                    return (60, 60, 60)
+                }
                 return (80, 120, 120)
             }
             return (60, 60, 60)
@@ -1121,7 +1127,7 @@ enum OpticalFlowResolutionPlanner: Sendable {
         if safeFPS <= 60.0 {
             return (24, 60, Float(max(24.0, min(60.0, safeFPS.rounded()))))
         }
-        if maxScreenFPS >= 120 {
+        if maxScreenFPS >= 120 && !isLowPowerMode {
             return (60, 120, 120)
         }
         return (60, 60, 60)
@@ -1161,9 +1167,8 @@ enum OpticalFlowResolutionPlanner: Sendable {
         switch tier {
         case .x2: return 0
         case .fps60: return 1
-        case .fps72: return 2
-        case .fps96: return 3
-        case .fps120: return 4
+        case .fps96: return 2
+        case .fps120: return 3
         }
     }
 
@@ -1173,6 +1178,23 @@ enum OpticalFlowResolutionPlanner: Sendable {
     ) -> OpticalFlowTargetFPS? {
         guard let cap = thermalMaxTargetTier(for: thermalState) else { return nil }
         return targetTierRank(active) > targetTierRank(cap) ? cap : nil
+    }
+
+    static func effectivePowerThermalCap(
+        active: OpticalFlowTargetFPS,
+        thermalState: ProcessInfo.ThermalState,
+        isLowPowerMode: Bool
+    ) -> (tier: OpticalFlowTargetFPS, reason: String)? {
+        if thermalState == .critical, targetTierRank(active) > targetTierRank(.x2) {
+            return (.x2, "严重过热")
+        }
+        if isLowPowerMode, targetTierRank(active) > targetTierRank(.fps60) {
+            return (.fps60, "低电量60Hz上限")
+        }
+        if thermalState == .serious, targetTierRank(active) > targetTierRank(.fps60) {
+            return (.fps60, "过热保护")
+        }
+        return nil
     }
 
     static func buildCandidatePlan(
@@ -1897,7 +1919,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let initialRange = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
             targetFPS: initialTargetRate,
             isInterpolationEnabled: enableInterpolation,
-            maxScreenFPS: maxScreenFPS
+            maxScreenFPS: maxScreenFPS,
+            isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled
         )
         let initialCARange = CAFrameRateRange(
             minimum: initialRange.minimum,
@@ -2338,7 +2361,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func syncDisplayLinkState() {
+    func syncDisplayLinkState() {
         let shouldBoostPlayback = (!isPaused && currentURL != nil && isInterpolationEnabled)
         UIApplication.shared.isIdleTimerDisabled = (!isPaused && currentURL != nil)
         updatePlaybackActivity(isActive: shouldBoostPlayback)
@@ -2356,7 +2379,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let range = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
             targetFPS: targetRate,
             isInterpolationEnabled: isInterpolationEnabled,
-            maxScreenFPS: maxScreenFPS
+            maxScreenFPS: maxScreenFPS,
+            isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled
         )
         let caRange = CAFrameRateRange(
             minimum: range.minimum,
@@ -2937,6 +2961,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         var isCatchingUpToClock: Bool = false
         var lastPairReadyHostTime: CFTimeInterval = 0
         var lastObservedThermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+        var lastObservedLowPowerMode: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
 
         init(
             configuration: ActiveOpticalFlowConfiguration,
@@ -3013,10 +3038,15 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         do {
             let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 1.0) ? sourceFPS : 24.0
             let initialThermal = ProcessInfo.processInfo.thermalState
+            let initialLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
             var startingTier = targetFPS
-            if let thermalCap = OpticalFlowResolutionPlanner.exceedsThermalCap(active: targetFPS, thermalState: initialThermal) {
-                startingTier = thermalCap
-                logAsync("[ane][thermal] 设备当前热状态(\(ThermalLevel(state: initialThermal).rawValue))，初始目标帧率限档为 \(thermalCap.shortBadge)")
+            if let cap = OpticalFlowResolutionPlanner.effectivePowerThermalCap(
+                active: targetFPS,
+                thermalState: initialThermal,
+                isLowPowerMode: initialLowPower
+            ) {
+                startingTier = cap.tier
+                logAsync("[ane][power] \(cap.reason)，初始目标帧率限档为 \(cap.tier.shortBadge)")
             }
             var resolvedTier = startingTier
             var candidates: [OpticalFlowCandidate] = []
@@ -4208,7 +4238,20 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         token: UUID
     ) {
         let is4K = SuperResolutionPolicy.isAlready4K(width: state.sourceWidth, height: state.sourceHeight)
-        let allowedSpatial = requestedSpatial2x && target.allowsSpatial2x && !is4K
+        var effectiveRequestedTarget = target
+        let currentThermal = ProcessInfo.processInfo.thermalState
+        let currentLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        state.lastObservedThermalState = currentThermal
+        state.lastObservedLowPowerMode = currentLowPower
+        if let cap = OpticalFlowResolutionPlanner.effectivePowerThermalCap(
+            active: target,
+            thermalState: currentThermal,
+            isLowPowerMode: currentLowPower
+        ) {
+            effectiveRequestedTarget = cap.tier
+            logAsync("[ane][power] \(cap.reason)，切档目标从 \(target.shortBadge) 限档为 \(cap.tier.shortBadge)")
+        }
+        let allowedSpatial = requestedSpatial2x && effectiveRequestedTarget.allowsSpatial2x && !is4K
         state.requestedTargetFPS = target
         state.requestedSpatial2x = allowedSpatial
         state.interpolationExhausted = false
@@ -4216,7 +4259,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         state.localConsecutiveFailures = 0
         state.didLogCatchUp = false
 
-        var candidateTierOpt: OpticalFlowTargetFPS? = target
+        var candidateTierOpt: OpticalFlowTargetFPS? = effectiveRequestedTarget
         while let tier = candidateTierOpt {
             let tierSpatial2x = allowedSpatial && tier.allowsSpatial2x
             let tierCandidates = buildCandidatePlanForDevice(
@@ -4322,19 +4365,21 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
 
         let currentThermal = ProcessInfo.processInfo.thermalState
-        if currentThermal != state.lastObservedThermalState {
+        let currentLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        if currentThermal != state.lastObservedThermalState || currentLowPower != state.lastObservedLowPowerMode {
             state.lastObservedThermalState = currentThermal
-            if let cappedTier = OpticalFlowResolutionPlanner.exceedsThermalCap(
+            state.lastObservedLowPowerMode = currentLowPower
+            if let cap = OpticalFlowResolutionPlanner.effectivePowerThermalCap(
                 active: state.activeTargetFPS,
-                thermalState: currentThermal
+                thermalState: currentThermal,
+                isLowPowerMode: currentLowPower
             ) {
-                let thermalName = ThermalLevel(state: currentThermal).rawValue
-                logAsync("[ane][thermal] 热状态升至 \(thermalName)，主动将目标帧率限档至 \(cappedTier.shortBadge)")
+                logAsync("[ane][power] \(cap.reason)，主动将目标帧率限档至 \(cap.tier.shortBadge)")
                 _ = downgradeTargetFPS(
-                    to: cappedTier,
+                    to: cap.tier,
                     state: state,
                     token: token,
-                    reason: "温控主动限档(\(thermalName))"
+                    reason: cap.reason
                 )
             }
             if currentThermal == .critical && canDowngradeResolution(in: state) {

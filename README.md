@@ -6,7 +6,7 @@
 
 1. **ANE 硬件光流真补帧（默认开启，支持多档位）**
    - 调用 Apple `VideoToolbox.VTFrameProcessor`（优先 `VTLowLatencyFrameInterpolationConfiguration` 低内存 `420v` 管线，辅以 `VTFrameRateConversionConfiguration` 兜底）。
-   - 支持 **2× / 60fps / 72fps / 96fps / 120fps** 多档位目标帧率与 2× 单相空间硬件超分（4K 片源自动禁用空间超分，保留光流补帧）。
+   - 支持 **2× / 60fps / 96fps / 120fps** 四档实用目标帧率（24p 自动匹配 `48 / 60 / 96 / 120 fps`，30p 自动收敛为 `60 / 120 fps`，60p 收敛为 `120 fps`），配合 ProMotion 物理档位精准锁频（48Hz / 60Hz / 120Hz）、低电量 60Hz 上限保护及 2× 单相空间硬件超分（4K 片源自动禁用空间超分，保留光流补帧）。
    - 内置 `OpticalFlowPhaseScheduler`（整倍等分 + 非整倍时间栅格重采样）、`OpticalFlowBudgetGuard`（「先降分辨率、再降目标帧率」算力自适应）、`ThermalState` 主动温控限档及 `hev1→hvc1` 压缩透传硬解兜底。
 
 2. **原帧率硬解直通模式（关闭补帧时启用）**
@@ -27,7 +27,7 @@
 
 ## 目录结构
 
-- `Sources/Models/OpticalFlowOptions.swift`：补帧模式与 ANE 目标帧率枚举（`2× / 60 / 72 / 96 / 120fps`）
+- `Sources/Models/OpticalFlowOptions.swift`：补帧模式与 ANE 目标帧率枚举（`2× / 60 / 96 / 120fps`）与片源自适应选项
 - `Sources/Engine/VTOpticalFlowEngine.swift`：`VideoToolbox` `VTFrameProcessor` 硬件光流真补帧与原帧率硬解直通核心
 - `Sources/Models/PlaybackTelemetry.swift`：HUD 参数汇总、设备内存/型号采样、黑匣子时间轴与客观判定
 - `Sources/UI/LiquidGlassPlayerView.swift`：Liquid Glass 液态玻璃播放界面、光流控制台与诊断中心

@@ -12,7 +12,6 @@
 ## 🎯 当前核心推进焦点 (Active Focus)
 `已解决隐藏控制栏掉帧与截图短暂恢复再降问题（CI Run 45946821529 全绿 23/23），新版 IPA 已下载校验并投递微信「文件传输助手」，待真机实测`
 - 最近交付闭环（更早的历史里程碑已归档至 [CHANGELOG.md](CHANGELOG.md)）：
-  * [x] 响应 `095509` 实机日志（`3a30121` / `ed3e252`）：修复 `OpticalFlowTargetFPS` `id: Self` 切档失效、新增热切换与杜比视界/HDR EDR 支持、移除内置 3 秒测试并重塑 UI（CI Run `45927575289`，22/22 PASS）。
   * [x] 响应实机截图与 `112252` 反馈（`d061a84`、`ab8ec57` / `5567335`）：接入 `UIUpdateLink` + `(80, 120, 120)` 锁定、`buildCandidatePlan` 720p 起步与两行极简底栏 + 智能帧率弹窗（CI Run `45936597804`，22/22 PASS）。
   * [x] 响应 `131253` 实机日志与对比截图（`d1ce224`、`2c38ce6` / 公开镜像 `8f12ce7`）：修复 `handleUpdateLinkTick()` + `onDisplayTick()` 同帧双次 `pulseProMotionCommit()` 翻转抵消与 `(0,0,1,1)` 圆角裁切；开启光流期间启用 `.latencyCritical` Activity；为 `>1080p` 片源引入硬件缩放 `1920×1080` 解码、`OpticalFlowDecodedFramePipe` 并行 VDEC/ANE 流水线与 `OpticalFlowFramePacer`（55ms 容错 + 每 VSync 至多弹出 1 帧）及 `-45ms / +85ms` 迟滞追赶；CI Run `45946821529`（`6m29s`）`GlassMPVTests` 23/23 全绿交付 `2,810,226` bytes IPA。
 

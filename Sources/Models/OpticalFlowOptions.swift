@@ -19,7 +19,6 @@ enum InterpolationMode: String, CaseIterable, Identifiable, Hashable, Sendable {
 enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendable {
     case x2 = "2×"
     case fps60 = "60fps"
-    case fps72 = "72fps"
     case fps96 = "96fps"
     case fps120 = "120fps"
 
@@ -31,7 +30,6 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
         switch self {
         case .x2: return "2×"
         case .fps60: return "60"
-        case .fps72: return "72"
         case .fps96: return "96"
         case .fps120: return "120"
         }
@@ -41,7 +39,6 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
         switch self {
         case .x2: return nil
         case .fps60: return 60.0
-        case .fps72: return 72.0
         case .fps96: return 96.0
         case .fps120: return 120.0
         }
@@ -56,7 +53,6 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
         switch self {
         case .fps120: return .fps96
         case .fps96: return .fps60
-        case .fps72: return .fps60
         case .fps60: return .x2
         case .x2: return nil
         }
@@ -95,13 +91,13 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
 
         if safeSrc < 27.0 {
             let x2FPS = Int((safeSrc * 2.0).rounded())
-            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 纯净"))
+            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 清晰省电"))
             items.append(FrameRatePresetItem(target: .fps60, primaryTitle: "60 fps", subtitle: "均衡流畅"))
-            items.append(FrameRatePresetItem(target: .fps96, primaryTitle: "96 fps", subtitle: "4× 影院"))
+            items.append(FrameRatePresetItem(target: .fps96, primaryTitle: "96 fps", subtitle: "4× 高刷甜点"))
             items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "120Hz 满血"))
         } else if safeSrc < 45.0 {
             let x2FPS = Int((safeSrc * 2.0).rounded())
-            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 流畅"))
+            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 清晰省电"))
             items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "4× 满血"))
         } else {
             items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "2× 满血"))
@@ -129,13 +125,11 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
         let subtitle: String
         switch effective {
         case .x2:
-            subtitle = spatial2x ? "2×+超分" : "2× 光流"
+            subtitle = spatial2x ? "2×+超分" : "2× 清晰"
         case .fps60:
             subtitle = "均衡流畅"
-        case .fps72:
-            subtitle = "3× 光流"
         case .fps96:
-            subtitle = "4× 影院"
+            subtitle = "高刷甜点"
         case .fps120:
             subtitle = "120Hz"
         }

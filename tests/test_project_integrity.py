@@ -201,6 +201,7 @@ def test_swift_sources_non_empty_and_balanced():
     options_src = options_path.read_text(encoding="utf-8")
     assert "enum InterpolationMode" in options_src
     assert "enum OpticalFlowTargetFPS" in options_src
+    assert "fps72" not in options_src
     assert "smartPresets" in options_src
     assert "activeCapsuleSummary" in options_src
 
@@ -275,6 +276,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "OpticalFlowFramePacer" in vt_engine
     assert "OpticalFlowDecodedFramePipe" in vt_engine
     assert "recommendedDecodeDimensions" in vt_engine
+    assert "effectivePowerThermalCap" in vt_engine
     assert ".latencyCritical" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)

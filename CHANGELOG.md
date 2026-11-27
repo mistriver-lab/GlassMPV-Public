@@ -5,6 +5,9 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
+- **最终敲定实用帧率档位体系、按档位精准锁屏与低电量保护 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 结合 ProMotion 物理分频（`240Hz` 整除限制）与 A17 Pro ANE 指数算力阶梯，正式移除非整除微颤的 `72fps` 鸡肋档位，确立「24p→原画 / 48(2×清晰省电) / 60 / 96(4×高刷甜点) / 120 fps；30p→原画 / 60 / 120 fps；60p→原画 / 120 fps」最终矩阵。
+  - `recommendedDisplayFrameRateRange` 改为按档位精准锁频：`48fps` 锁原生 `(48, 48, 48)`、`60fps` 锁原生 `(60, 60, 60)`、`96/120fps` 锁 `(80, 120, 120)`，减少中低档 50%~60% 主线程唤醒与屏幕功耗；新增 `effectivePowerThermalCap` 监听 `NSProcessInfoPowerStateDidChange`，iOS 低电量模式下自动封顶 `60fps` 并锁 60Hz，杜绝 60Hz 屏幕上限下 ANE 白烧 `120fps` 算力；`OpticalFlowFramePacer` 同步将 `earlySnapSeconds` 微调至 `0.006s` 巩固 48/60Hz 锁相。
 - **彻底解决隐藏操作栏掉帧与「截图后短暂恢复又降回 24fps」问题 (`VTOpticalFlowEngine`)**：
   - `131253` 实机日志证实：一方面 `handleUpdateLinkTick()` 与 `onDisplayTick()` 在同一 RunLoop 事务内双次调用 `pulseProMotionCommit()` 导致透明度翻转互相抵消且 `(0,0,1,1)` 被 OLED 圆角裁切；另一方面 HID/HUD 隐去后系统 CLPC 降低能效配额，使 4K 串行「硬解→缩放→ANE」单对周期从 `<35ms` 滑向 `>42ms`，队列耗尽后批量到达的帧在 `onDisplayTick` 同帧丢光中间帧导致帧率悬崖坍缩。
   - 修复：① 将 `proMotionPulseLayer` 移至安全区活跃视口内（`x >= 64, y >= 12, 2×2`）并确保每 VSync 仅提交 1 次位姿+透明度变化；② 开启光流期间激活 `.latencyCritical` Activity、4K 解码期即启用 `1920×1080` 硬件缩放、通过 `OpticalFlowDecodedFramePipe` 将硬解 (VDEC) 与 ANE 推理拆分为高优先级并行生产者-消费者流水线；③ 新增 `OpticalFlowFramePacer`（55ms 容错 + 每 VSync 至多送显 1 帧）与 `-45ms / +85ms` 迟滞追赶，并在预算守卫计入全周期墙钟耗时。
@@ -155,3 +158,5 @@
 - [x] 修复 `VTOpticalFlowEngine.swift` `VTDecompressionSessionCreate` 参数标签与 `test_project_integrity.py` 断言（`b4676df`）；CI Run `45588353144` 全绿出包并交付微信「文件传输助手」。
 
 - [x] 修复 `OpticalFlowCandidate` / `OpticalFlowBackendKind` `Hashable`（`42a9739`）与 `testMPVUIControllerPlaybackWithWindowHost` 慢跑器轮询窗口放宽至 30s（`1014b2b`），CI Run `45737880768` 全绿出包并交付微信「文件传输助手」。
+
+- [x] 响应 `095509` 实机日志（`3a30121` / `ed3e252`）：修复 `OpticalFlowTargetFPS` `id: Self` 切档失效、新增热切换与杜比视界/HDR EDR 支持、移除内置 3 秒测试并重塑 UI（CI Run `45927575289`，22/22 PASS）。
