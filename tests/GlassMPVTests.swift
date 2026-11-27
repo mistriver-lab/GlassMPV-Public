@@ -2543,9 +2543,7 @@ final class GlassMPVTests: XCTestCase {
                 let head = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: \(slice.count)\r\nContent-Range: bytes \(rangeTuple.start)-\(rangeTuple.end)/\(totalLen)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 var packet = Data(head.utf8)
                 packet.append(slice)
-                conn.send(content: packet, completion: .contentProcessed { _ in
-                    conn.cancel()
-                })
+                conn.send(content: packet, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
             }
         }
         listener.start(queue: stubQueue)

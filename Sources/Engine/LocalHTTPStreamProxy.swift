@@ -1712,6 +1712,7 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
     private let onLog: @Sendable (Bool, String) -> Void
     private let lock = NSLock()
     private var isCancelled = false
+    private var selfRetain: ParallelChunkedStreamRelay?
     private var mp4Patcher: MP4HEV1StreamPatcher
 
     init(
@@ -1738,11 +1739,15 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
     }
 
     func start() {
+        lock.lock()
+        selfRetain = self
+        lock.unlock()
+
         connection.stateUpdateHandler = { [weak self] state in
             if case .cancelled = state {
-                self?.markCancelled()
+                self?.markCancelledAndRelease()
             } else if case .failed = state {
-                self?.markCancelled()
+                self?.markCancelledAndRelease()
             }
         }
 
@@ -1767,7 +1772,7 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
         connection.send(content: headPacket, completion: .contentProcessed { [weak self] sendError in
             guard let self else { return }
             if sendError != nil {
-                self.markCancelled()
+                self.markCancelledAndRelease()
                 self.connection.cancel()
                 return
             }
@@ -1775,9 +1780,10 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
         })
     }
 
-    private func markCancelled() {
+    private func markCancelledAndRelease() {
         lock.lock()
         isCancelled = true
+        selfRetain = nil
         lock.unlock()
     }
 
@@ -1797,8 +1803,14 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
             trailing = enableMP4HEV1Patch ? mp4Patcher.flush() : Data()
             lock.unlock()
             if !trailing.isEmpty {
-                connection.send(content: trailing, completion: .contentProcessed { [weak self] _ in
-                    self?.finishConnection()
+                connection.send(content: trailing, completion: .contentProcessed { [weak self] sendError in
+                    guard let self else { return }
+                    if sendError != nil {
+                        self.markCancelledAndRelease()
+                        self.connection.cancel()
+                        return
+                    }
+                    self.finishConnection()
                 })
             } else {
                 finishConnection()
@@ -1819,7 +1831,7 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
                 if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
                     self.onLog(true, "[proxy][error] 并发分块直传终止 (#\(chunkIdx)): \(error.localizedDescription)")
                 }
-                self.markCancelled()
+                self.markCancelledAndRelease()
                 self.connection.cancel()
 
             case .success(let chunkData):
@@ -1828,7 +1840,7 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
                 let targetEnd = min(self.rangeEnd, availableEndOffset)
                 let sliceEnd = Int(targetEnd - chunkStart) + 1
                 guard sliceStart >= 0, sliceEnd > sliceStart, sliceEnd <= chunkData.count else {
-                    self.markCancelled()
+                    self.markCancelledAndRelease()
                     self.connection.cancel()
                     return
                 }
@@ -1851,7 +1863,7 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
                     self.connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
                         guard let self else { return }
                         if sendError != nil {
-                            self.markCancelled()
+                            self.markCancelledAndRelease()
                             self.connection.cancel()
                             return
                         }
@@ -1864,7 +1876,9 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
 
     private func finishConnection() {
         connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
-            self?.connection.cancel()
+            guard let self else { return }
+            self.markCancelledAndRelease()
+            self.connection.cancel()
         })
     }
 }
