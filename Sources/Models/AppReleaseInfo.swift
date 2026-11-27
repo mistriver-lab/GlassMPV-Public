@@ -26,10 +26,10 @@ enum AppReleaseInfo {
             version: "v2026.11.27",
             date: "2026-11-27",
             highlights: [
-                "根治补帧档位切换仅 2× 生效问题：修复 OpticalFlowTargetFPS / InterpolationMode 的 Identifiable id 与 SwiftUI Picker Tag 失配 bug，并将播放期档位条重构为直点胶囊按钮，同时支持播放中无感热切换目标帧率（不中断音频与解码器）",
-                "完整支持杜比视界（Dolby Vision dvh1/dvhe/dvcC/dvvC）及 HDR10/HLG 峰值亮度输出：开启 AVSampleBufferDisplayLayer EDR（preferredDynamicRange = .high）与逐帧 HDR 元数据透传，并在缺省色域附件时自动回填 BT.2020/PQ 防止闪烁",
-                "全新极简 Liquid Glass 播放界面：移除内置 3 秒自测视频入口，新增播放页 4.5s 自动隐藏、原帧/2×/60/72/96/120 一体化直选条、HDR/EDR 开关、铺满屏幕裁剪（Fill/Fit）与循环播放快捷开关",
-                "彻底移除 MPV 内核、58 个 GLSL 着色器及 MPVUI/MPVKit 依赖，升级为纯原生 VideoToolbox ANE 硬件光流播放器（保留「原帧率硬解直通」模式），全档位优先 LowLatency (420v) 低功耗低内存管线"
+                "根治播放栏自动隐藏后补帧失效掉回 24fps：新增 UIUpdateLink(requiresContinuousUpdates=true) + 1×1 ProMotion 刷新率保活与 120Hz VSync 锁定（80..120Hz），熄隐控制栏后依然稳定满帧输出且消除 60Hz 拍频丢帧",
+                "解决 72fps 不生效并重构智能源适配帧率选择：多相 2× 以上（含 72fps/3×）统一从 720p 起跑并支持 540p/480p 阶梯降档；底栏瘦身为两行并升级为折叠式智能帧率弹窗（自动匹配 24p/30p/60p 片源与 120Hz 屏幕整分频档位：48/60/96/120 fps）",
+                "支持重开 App 后保留上一次会话完整黑匣子诊断日志（避免重启导出空白报告）",
+                "根治补帧档位切换仅 2× 生效问题：修复 OpticalFlowTargetFPS / InterpolationMode 的 Identifiable id，播放中原地热切换 VTFrameProcessor 且不中断音轨；完整支持杜比视界（Dolby Vision dvh1/dvhe）及 HDR10/HLG 峰值亮度输出"
             ]
         ),
         ReleaseNoteEntry(

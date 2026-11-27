@@ -5,6 +5,10 @@
 ## [v2026.11.27] - 2026-11-27
 
 ### 变更与修复 (Changed & Fixed)
+- **根治隐藏控制栏后掉回 24Hz 与 `72fps` 起步分辨率过高，重构智能源适配帧率菜单 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 实机截图证实隐藏控制栏（`showHUD = false`）后 `AVSampleBufferDisplayLayer` 未产生 CoreAnimation 图层提交，导致 iPhone 15 Pro Max ProMotion 与 `CADisplayLink` 被系统降至 24Hz（`actualOutputFPS` 从 `57.9` 跌至 `23.4` 而 `droppedFrames` 暴涨）。现通过 `UIUpdateLink(requiresContinuousUpdates=true, wantsImmediatePresentation=true)` + `1×1` 微扰层保活，并在开启补帧且 120Hz 屏幕下锁定 `(80, 120, 120)` 刷新率区间，彻底消除 HUD 隐藏退化与 60Hz 拍频丢帧。
+  - 修复 `buildCandidatePlan` 中 `maxInterpolatedFrames == 2`（`72fps`/`3×`）误从 `1080p` 起步问题（现与 `60/96/120fps` 一致从 `720p` 起跑），降档链 `120 -> 96 -> 60 -> 2×` 自动避开非 120Hz 整除的 `72fps`。
+  - 播放底栏精简为两行 + 弹出式 **智能源适配帧率选单 (`FrameRatePresetStrip`)**：自动按片源帧率展示清晰目标帧率卡片（24p→原画/48/60/96/120 fps；30p→原画/60/120 fps；60p→原画/120 fps），支持原地无感热切换与重启保留上次完整运行黑匣子日志。
 - **根治补帧档位切换失效与热切换卡顿 (`OpticalFlowOptions` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
   - `095509` 实机日志证实 `UI Switch Audit` 零条 `setOpticalFlowTargetFPS` 记录，根因为 `OpticalFlowTargetFPS`/`InterpolationMode` 的 `id: String` 导致 SwiftUI `Picker + ForEach` 隐式 Tag 失配、点选 `60/72/96/120` 全部静默丢弃。现将 `id` 改为 `Self`，全面撤除 `Picker` 并改用直点式 `FrameRatePillStrip` 胶囊按钮条（支持首页预设、控制栏直切与控制台同步联动）。
   - 新增 `updateTargetConfiguration` + `applyUserSwitchInPlace`，播放中切换 `2×/60/72/96/120` 与 `2×超分` 时原地热替换 `VTFrameProcessor` 会话，不再重建 `AVPlayer` 音轨与 `AVAssetReader`。

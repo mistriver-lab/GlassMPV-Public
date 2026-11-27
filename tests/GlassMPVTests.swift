@@ -707,10 +707,30 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertFalse(OpticalFlowTargetFPS.fps120.allowsSpatial2x)
 
         XCTAssertEqual(OpticalFlowTargetFPS.fps120.nextLowerTier, .fps96)
-        XCTAssertEqual(OpticalFlowTargetFPS.fps96.nextLowerTier, .fps72)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps96.nextLowerTier, .fps60)
         XCTAssertEqual(OpticalFlowTargetFPS.fps72.nextLowerTier, .fps60)
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.nextLowerTier, .x2)
         XCTAssertNil(OpticalFlowTargetFPS.x2.nextLowerTier)
+
+        let plan72 = OpticalFlowResolutionPlanner.buildCandidatePlan(
+            sourceWidth: 2960,
+            sourceHeight: 2160,
+            requestedSpatial2x: false,
+            lowLatencySupported: true,
+            frcSupported: true,
+            maxInterpolatedFrames: 2
+        )
+        XCTAssertEqual(plan72.first, OpticalFlowCandidate(backend: .lowLatency, width: 986, height: 720, spatial2x: false, maxInterpolatedFrames: 2))
+
+        let presets24 = OpticalFlowTargetFPS.smartPresets(forSourceFPS: 23.976)
+        XCTAssertEqual(presets24.map(\.target), [nil, .x2, .fps60, .fps96, .fps120])
+        XCTAssertEqual(presets24.map(\.primaryTitle), ["原画", "48 fps", "60 fps", "96 fps", "120 fps"])
+
+        let presets30 = OpticalFlowTargetFPS.smartPresets(forSourceFPS: 30.0)
+        XCTAssertEqual(presets30.map(\.target), [nil, .x2, .fps120])
+
+        let presets60 = OpticalFlowTargetFPS.smartPresets(forSourceFPS: 60.0)
+        XCTAssertEqual(presets60.map(\.target), [nil, .fps120])
 
         XCTAssertEqual(OpticalFlowTargetFPS.x2.effectiveTargetFPS(sourceFPS: 23.976), 47.952, accuracy: 0.01)
         XCTAssertEqual(OpticalFlowTargetFPS.fps60.effectiveTargetFPS(sourceFPS: 24.0), 60.0, accuracy: 0.01)
@@ -864,12 +884,30 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertLessThanOrEqual(heavyLimits.maxQueued, 30)
         XCTAssertLessThanOrEqual(heavyLimits.prebuffer, 10)
 
-        let range48 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: 48.0)
-        XCTAssertEqual(range48.maximum, 60)
-        XCTAssertEqual(range48.preferred, 48)
-        let range120 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: 120.0)
-        XCTAssertEqual(range120.maximum, 120)
-        XCTAssertEqual(range120.preferred, 120)
+        let rangeInterp120 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
+            targetFPS: 60.0,
+            isInterpolationEnabled: true,
+            maxScreenFPS: 120
+        )
+        XCTAssertEqual(rangeInterp120.minimum, 80)
+        XCTAssertEqual(rangeInterp120.maximum, 120)
+        XCTAssertEqual(rangeInterp120.preferred, 120)
+
+        let rangeInterp60 = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
+            targetFPS: 48.0,
+            isInterpolationEnabled: true,
+            maxScreenFPS: 60
+        )
+        XCTAssertEqual(rangeInterp60.maximum, 60)
+        XCTAssertEqual(rangeInterp60.preferred, 60)
+
+        let rangePassthrough = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
+            targetFPS: 48.0,
+            isInterpolationEnabled: false,
+            maxScreenFPS: 120
+        )
+        XCTAssertEqual(rangePassthrough.maximum, 60)
+        XCTAssertEqual(rangePassthrough.preferred, 48)
 
         XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .nominal))
         XCTAssertNil(OpticalFlowResolutionPlanner.thermalMaxTargetTier(for: .fair))

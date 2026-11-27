@@ -201,6 +201,8 @@ def test_swift_sources_non_empty_and_balanced():
     options_src = options_path.read_text(encoding="utf-8")
     assert "enum InterpolationMode" in options_src
     assert "enum OpticalFlowTargetFPS" in options_src
+    assert "smartPresets" in options_src
+    assert "activeCapsuleSummary" in options_src
 
     vt_engine = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "MPVUI" not in vt_engine
@@ -268,6 +270,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "isDolbyVision" in vt_engine
     assert "updateTargetConfiguration" in vt_engine
     assert "applyUserSwitchInPlace" in vt_engine
+    assert "UIUpdateLink" in vt_engine
+    assert "pulseProMotionCommit" in vt_engine
     task_start = vt_engine.index("private func runOpticalFlowTask(")
     task_end = vt_engine.index("#endif", task_start)
     optical_flow_task_body = vt_engine[task_start:task_end]

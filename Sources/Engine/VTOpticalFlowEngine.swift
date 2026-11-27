@@ -9,6 +9,10 @@ import VideoToolbox
 
 final class SampleBufferDisplayContainerView: UIView {
     let displayLayer = AVSampleBufferDisplayLayer()
+    private let proMotionPulseLayer = CALayer()
+    @MainActor private var proMotionToggle: Bool = false
+    @MainActor private var updateLink: UIUpdateLink?
+    @MainActor var onProMotionTick: (@MainActor () -> Void)?
     @MainActor private(set) var videoTransform: CGAffineTransform = .identity
 
     override init(frame: CGRect) {
@@ -19,7 +23,46 @@ final class SampleBufferDisplayContainerView: UIView {
         displayLayer.preferredDynamicRange = .high
         displayLayer.preventsDisplaySleepDuringVideoPlayback = true
         layer.addSublayer(displayLayer)
+
+        // 1×1 透明微扰层与 UIUpdateLink 联动：HUD 隐藏时仍向 CoreAnimation 渲染服务宣告持续 120Hz 帧率需求
+        proMotionPulseLayer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        proMotionPulseLayer.backgroundColor = UIColor.black.cgColor
+        proMotionPulseLayer.opacity = 0.01
+        layer.addSublayer(proMotionPulseLayer)
+
+        let link = UIUpdateLink(view: self)
+        link.requiresContinuousUpdates = true
+        link.wantsImmediatePresentation = true
+        link.isEnabled = false
+        link.addAction { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                self?.handleUpdateLinkTick()
+            }
+        }
+        self.updateLink = link
+
         layoutDisplayLayer()
+    }
+
+    @MainActor
+    private func handleUpdateLinkTick() {
+        pulseProMotionCommit()
+        onProMotionTick?()
+    }
+
+    @MainActor
+    func updateProMotionLink(isActive: Bool, range: CAFrameRateRange) {
+        updateLink?.preferredFrameRateRange = range
+        updateLink?.isEnabled = isActive
+    }
+
+    @MainActor
+    func pulseProMotionCommit() {
+        proMotionToggle.toggle()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        proMotionPulseLayer.opacity = proMotionToggle ? 0.02 : 0.01
+        CATransaction.commit()
     }
 
     @MainActor
@@ -827,21 +870,26 @@ enum OpticalFlowResolutionPlanner: Sendable {
         return (maxQueued: maxQueued, prebuffer: prebuffer)
     }
 
-    static func recommendedDisplayFrameRateRange(targetFPS: Double) -> (minimum: Float, maximum: Float, preferred: Float) {
+    static func recommendedDisplayFrameRateRange(
+        targetFPS: Double,
+        isInterpolationEnabled: Bool = true,
+        maxScreenFPS: Int = 120
+    ) -> (minimum: Float, maximum: Float, preferred: Float) {
         let safeFPS = (targetFPS.isFinite && targetFPS > 1.0) ? targetFPS : 48.0
-        if safeFPS <= 50.0 {
+        if isInterpolationEnabled {
+            if maxScreenFPS >= 120 {
+                // 开启补帧时锁定 120Hz VSync（minimum: 80 防止退回 24Hz / 60Hz 相位拍频丢帧）
+                return (80, 120, 120)
+            }
+            return (60, 60, 60)
+        }
+        if safeFPS <= 60.0 {
             return (24, 60, Float(max(24.0, min(60.0, safeFPS.rounded()))))
         }
-        if safeFPS <= 62.0 {
-            return (30, 60, 60)
+        if maxScreenFPS >= 120 {
+            return (60, 120, 120)
         }
-        if safeFPS <= 80.0 {
-            return (48, 120, Float(max(60.0, min(80.0, safeFPS.rounded()))))
-        }
-        if safeFPS <= 100.0 {
-            return (60, 120, Float(max(80.0, min(100.0, safeFPS.rounded()))))
-        }
-        return (80, 120, 120)
+        return (60, 60, 60)
     }
 
     static func thermalMaxTargetTier(for state: ProcessInfo.ThermalState) -> OpticalFlowTargetFPS? {
@@ -892,16 +940,12 @@ enum OpticalFlowResolutionPlanner: Sendable {
         let safeMaxInterp = max(1, maxInterpolatedFrames)
 
         let caps: [(Int, Int)]
-        if safeMaxInterp >= 4 {
+        if safeMaxInterp >= 2 {
+            // 2 相及以上（60/72/96/120fps）：统一从 720p 起跑并支持降至 540p/480p，避免 1080p 超预算
             caps = [
                 (1280, 720),
                 (960, 540),
                 (854, 480)
-            ]
-        } else if safeMaxInterp == 3 {
-            caps = [
-                (1280, 720),
-                (960, 540)
             ]
         } else {
             caps = [
@@ -1433,14 +1477,19 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor private var isPipelineReadyToPlay: Bool = false
     private var presentedTimestamps: [CFTimeInterval] = []
     private var lastFPSPublishTimestamp: CFTimeInterval = 0
+    @MainActor private var lastDisplayTickHostTime: CFTimeInterval = 0
 
     @MainActor
     func attach(to container: SampleBufferDisplayContainerView) {
         self.displayContainer = container
+        container.onProMotionTick = { [weak self] in
+            self?.onDisplayTick()
+        }
         container.applyVideoTransform(videoTransform)
         container.setAspectFill(isAspectFill)
         container.setEDREnabled(isEDREnabled)
         attach(to: container.displayLayer)
+        syncDisplayLinkState()
     }
 
     @MainActor
@@ -1579,17 +1628,27 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let initialTargetRate = enableInterpolation
             ? targetFPS.effectiveTargetFPS(sourceFPS: 24.0)
             : 24.0
+        let maxScreenFPS = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.maximumFramesPerSecond ?? 120
         let initialRange = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
-            targetFPS: initialTargetRate
+            targetFPS: initialTargetRate,
+            isInterpolationEnabled: enableInterpolation,
+            maxScreenFPS: maxScreenFPS
         )
-        link.preferredFrameRateRange = CAFrameRateRange(
+        let initialCARange = CAFrameRateRange(
             minimum: initialRange.minimum,
             maximum: initialRange.maximum,
             preferred: initialRange.preferred
         )
+        link.preferredFrameRateRange = initialCARange
         link.isPaused = !autoPlay
         link.add(to: .main, forMode: .common)
         self.displayLink = link
+        displayContainer?.updateProMotionLink(
+            isActive: autoPlay && enableInterpolation,
+            range: initialCARange
+        )
 
         let token = rotateToken()
 
@@ -1978,6 +2037,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         pipelineStatusText = ""
         isPipelineReadyToPlay = false
         isPaused = true
+        lastDisplayTickHostTime = 0
+        displayContainer?.updateProMotionLink(isActive: false, range: .default)
         UIApplication.shared.isIdleTimerDisabled = false
         if hadActiveSession {
             appendLog("[ane] 光流核已停止")
@@ -2000,8 +2061,6 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor
     private func syncDisplayLinkState() {
         UIApplication.shared.isIdleTimerDisabled = (!isPaused && currentURL != nil)
-        guard let displayLink else { return }
-        displayLink.isPaused = isPaused
         let targetRate: Double
         if !isInterpolationEnabled {
             targetRate = sourceFPS > 1.0 ? sourceFPS : 24.0
@@ -2010,11 +2069,26 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         } else {
             targetRate = effectiveTargetFPS.effectiveTargetFPS(sourceFPS: sourceFPS)
         }
-        let range = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(targetFPS: targetRate)
-        displayLink.preferredFrameRateRange = CAFrameRateRange(
+        let maxScreenFPS = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.maximumFramesPerSecond ?? 120
+        let range = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
+            targetFPS: targetRate,
+            isInterpolationEnabled: isInterpolationEnabled,
+            maxScreenFPS: maxScreenFPS
+        )
+        let caRange = CAFrameRateRange(
             minimum: range.minimum,
             maximum: range.maximum,
             preferred: range.preferred
+        )
+        if let displayLink {
+            displayLink.isPaused = isPaused
+            displayLink.preferredFrameRateRange = caRange
+        }
+        displayContainer?.updateProMotionLink(
+            isActive: (!isPaused && currentURL != nil && isInterpolationEnabled),
+            range: caRange
         )
     }
 
@@ -2976,7 +3050,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     @objc private func onDisplayTick() {
+        let hostTick = CACurrentMediaTime()
+        if hostTick - lastDisplayTickHostTime < 0.003 {
+            return
+        }
+        lastDisplayTickHostTime = hostTick
+
         guard let layer = displayLayer else { return }
+        if isInterpolationEnabled && !isPaused {
+            displayContainer?.pulseProMotionCommit()
+        }
 
         let now: Double
         if usesSyntheticClock {
@@ -3165,6 +3248,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let eof = isReaderEOF
         bufferLock.unlock()
         return eof
+    }
+
+    private func pruneExpiredFrames(before minPTS: Double) {
+        bufferLock.lock()
+        frameQueue.removeAll { $0.pts < minPTS }
+        bufferLock.unlock()
     }
 
     private func setColorFallbackMetadata(
@@ -3768,6 +3857,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 state.activeTargetFPS = tier
                 state.phaseScheduler = OpticalFlowPhaseScheduler(targetTier: tier, sourceFPS: state.sourceFPS)
                 state.awaitingClockCatchUpAfterSwitch = true
+                pruneExpiredFrames(before: readLatestAudioTime() - 0.02)
                 applyActivatedSession(activated, to: state, token: token, reason: "在线档位切换")
                 Task { @MainActor [weak self] in
                     guard let self, self.isTokenValid(token) else { return }

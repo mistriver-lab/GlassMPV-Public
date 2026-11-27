@@ -55,7 +55,7 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
     var nextLowerTier: OpticalFlowTargetFPS? {
         switch self {
         case .fps120: return .fps96
-        case .fps96: return .fps72
+        case .fps96: return .fps60
         case .fps72: return .fps60
         case .fps60: return .x2
         case .x2: return nil
@@ -84,5 +84,72 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
             return min(8, max(1, nearest - 1))
         }
         return min(8, max(1, Int(ceil(ratio))))
+    }
+
+    static func smartPresets(forSourceFPS sourceFPS: Double) -> [FrameRatePresetItem] {
+        let safeSrc = (sourceFPS.isFinite && sourceFPS > 1.0) ? sourceFPS : 24.0
+        let srcInt = max(1, Int(safeSrc.rounded()))
+        var items: [FrameRatePresetItem] = [
+            FrameRatePresetItem(target: nil, primaryTitle: "原画", subtitle: "\(srcInt)p 直通")
+        ]
+
+        if safeSrc < 27.0 {
+            let x2FPS = Int((safeSrc * 2.0).rounded())
+            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 纯净"))
+            items.append(FrameRatePresetItem(target: .fps60, primaryTitle: "60 fps", subtitle: "均衡流畅"))
+            items.append(FrameRatePresetItem(target: .fps96, primaryTitle: "96 fps", subtitle: "4× 影院"))
+            items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "120Hz 满血"))
+        } else if safeSrc < 45.0 {
+            let x2FPS = Int((safeSrc * 2.0).rounded())
+            items.append(FrameRatePresetItem(target: .x2, primaryTitle: "\(x2FPS) fps", subtitle: "2× 流畅"))
+            items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "4× 满血"))
+        } else {
+            items.append(FrameRatePresetItem(target: .fps120, primaryTitle: "120 fps", subtitle: "2× 满血"))
+        }
+        return items
+    }
+
+    static func activeCapsuleSummary(
+        isOff: Bool,
+        requested: OpticalFlowTargetFPS,
+        effective: OpticalFlowTargetFPS,
+        sourceFPS: Double,
+        spatial2x: Bool
+    ) -> (title: String, subtitle: String) {
+        let safeSrc = (sourceFPS.isFinite && sourceFPS > 1.0) ? sourceFPS : 24.0
+        let srcInt = max(1, Int(safeSrc.rounded()))
+        guard !isOff else {
+            return (title: "原画", subtitle: "\(srcInt)p")
+        }
+        if effective != requested {
+            let effFPS = Int(effective.effectiveTargetFPS(sourceFPS: safeSrc).rounded())
+            return (title: "\(requested.pillTitle)→\(effFPS)", subtitle: "自动稳帧")
+        }
+        let targetInt = Int(effective.effectiveTargetFPS(sourceFPS: safeSrc).rounded())
+        let subtitle: String
+        switch effective {
+        case .x2:
+            subtitle = spatial2x ? "2×+超分" : "2× 光流"
+        case .fps60:
+            subtitle = "均衡流畅"
+        case .fps72:
+            subtitle = "3× 光流"
+        case .fps96:
+            subtitle = "4× 影院"
+        case .fps120:
+            subtitle = "120Hz"
+        }
+        return (title: "\(targetInt) fps", subtitle: subtitle)
+    }
+}
+
+/// 基于片源原生帧率生成的智能帧率选项
+struct FrameRatePresetItem: Identifiable, Equatable, Sendable {
+    let target: OpticalFlowTargetFPS?
+    let primaryTitle: String
+    let subtitle: String
+
+    var id: String {
+        target?.rawValue ?? "off"
     }
 }

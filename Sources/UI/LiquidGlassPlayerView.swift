@@ -210,10 +210,15 @@ final class PlayerCoordinator: ObservableObject {
         }
     }
 
+    static var persistedLastReportURL: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("glassmpv_last_session_report.txt")
+    }
+
     func closeToHome() {
         if currentURL != nil {
             captureRuntimeTelemetrySample()
             lastSessionSummary = buildCurrentSessionSummary()
+            persistLastSessionReport()
         }
         recordUISwitch("closeToHome interp=\(interpolationMode.rawValue) target=\(opticalFlowTargetFPS.shortBadge)")
         stopRuntimeTelemetrySampling()
@@ -295,7 +300,62 @@ final class PlayerCoordinator: ObservableObject {
         }
         if currentURL != nil {
             lastSessionSummary = buildCurrentSessionSummary()
+            if runtimeTimeline.count == 1 || runtimeTimeline.count % 3 == 0 {
+                persistLastSessionReport()
+            }
         }
+    }
+
+    func persistLastSessionReport() {
+        let content = exportDiagnosticReportText(includePersistedFallback: false)
+        try? content.write(to: Self.persistedLastReportURL, atomically: true, encoding: .utf8)
+    }
+
+    func exportDiagnosticReportText(includePersistedFallback: Bool) -> String {
+        if selfCheckReport.isEmpty {
+            runRealDeviceSelfCheck()
+        }
+        let maxScreenFPS = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.maximumFramesPerSecond ?? 60
+        let deviceInfo = DeviceDiagnosticsSampler.deviceSummaryLine(maxScreenFPS: maxScreenFPS)
+
+        let summary: SessionDiagnosticSummary
+        var extraTelemetry: [String] = []
+        if currentURL != nil {
+            summary = buildCurrentSessionSummary()
+        } else if let cached = lastSessionSummary {
+            summary = cached
+            extraTelemetry.append("Snapshot Source: last-session (cached before closeToHome)")
+        } else {
+            summary = buildCurrentSessionSummary()
+        }
+
+        var report = DiagnosticLogExporter.buildReport(
+            version: AppReleaseInfo.displayVersion,
+            deviceInfo: deviceInfo,
+            engineName: summary.engineName,
+            playbackState: summary.playbackState,
+            resolution: summary.resolution,
+            fpsSummary: summary.fpsSummary,
+            decoderSummary: summary.decoderSummary,
+            is4KGated: summary.is4KGated,
+            telemetrySummary: summary.telemetrySummary + extraTelemetry,
+            runtimeTimeline: runtimeTimeline.map { $0.formatLogLine() },
+            uiAuditLogs: uiAuditLogs,
+            selfCheck: selfCheckReport,
+            opticalLogs: opticalFlowController.diagnosticLogs
+        )
+
+        if includePersistedFallback,
+           currentURL == nil,
+           lastSessionSummary == nil,
+           runtimeTimeline.isEmpty,
+           let persisted = try? String(contentsOf: Self.persistedLastReportURL, encoding: .utf8),
+           !persisted.isEmpty {
+            report += "\n\n--- Previous Session Backup (Before Relaunch) ---\n\(persisted)"
+        }
+        return report
     }
 
     func buildCurrentSessionSummary() -> SessionDiagnosticSummary {
@@ -518,55 +578,58 @@ final class PlayerCoordinator: ObservableObject {
     }
 }
 
-// MARK: - Shared Frame-Rate Pill Strip
+// MARK: - Smart Source-Adaptive Frame-Rate Preset Strip
 
-private struct FrameRatePillStrip: View {
+private struct FrameRatePresetStrip: View {
     @ObservedObject var coordinator: PlayerCoordinator
     @ObservedObject var optical: OpticalFlowPlayerController
     var compact: Bool = false
-    var onInteraction: () -> Void = {}
+    var onSelectPreset: () -> Void = {}
 
     var body: some View {
+        let presets = OpticalFlowTargetFPS.smartPresets(forSourceFPS: optical.sourceFPS)
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: compact ? 6 : 8) {
-                pillButton(
-                    title: "原帧",
-                    isSelected: coordinator.interpolationMode == .off,
-                    accent: .white
-                ) {
-                    coordinator.selectFrameRateOption(nil)
-                    onInteraction()
-                }
-
-                ForEach(OpticalFlowTargetFPS.allCases) { tier in
-                    let isSelected = (coordinator.interpolationMode == .vtOpticalFlow && coordinator.opticalFlowTargetFPS == tier)
+            HStack(spacing: compact ? 8 : 10) {
+                ForEach(presets) { preset in
+                    let isSelected: Bool = {
+                        if let target = preset.target {
+                            return coordinator.interpolationMode == .vtOpticalFlow && coordinator.opticalFlowTargetFPS == target
+                        }
+                        return coordinator.interpolationMode == .off
+                    }()
                     let isEffectiveLower = isSelected
+                        && preset.target != nil
                         && coordinator.currentURL != nil
-                        && optical.effectiveTargetFPS != tier
-                    let label = isEffectiveLower
-                        ? "\(tier.pillTitle)→\(optical.effectiveTargetFPS.pillTitle)"
-                        : tier.pillTitle
+                        && optical.effectiveTargetFPS != preset.target
+                    let titleText = isEffectiveLower
+                        ? "\(preset.primaryTitle)→\(Int(optical.effectiveTargetFPS.effectiveTargetFPS(sourceFPS: optical.sourceFPS).rounded()))"
+                        : preset.primaryTitle
+                    let subtitleText = isEffectiveLower
+                        ? "已自动稳帧"
+                        : preset.subtitle
 
-                    pillButton(
-                        title: label,
+                    presetCardButton(
+                        title: titleText,
+                        subtitle: subtitleText,
                         isSelected: isSelected,
-                        accent: .cyan
+                        accent: preset.target == nil ? .white : .cyan
                     ) {
-                        coordinator.selectFrameRateOption(tier)
-                        onInteraction()
+                        coordinator.selectFrameRateOption(preset.target)
+                        onSelectPreset()
                     }
                 }
 
                 if coordinator.interpolationMode == .vtOpticalFlow
                     && coordinator.opticalFlowTargetFPS.allowsSpatial2x
                     && !coordinator.isSuperResolutionDisabledBy4K {
-                    pillButton(
-                        title: "2×超分",
+                    presetCardButton(
+                        title: "2× 超分",
+                        subtitle: coordinator.vtSpatial2x ? "已开启" : "ANE 细节",
                         isSelected: coordinator.vtSpatial2x,
                         accent: .indigo
                     ) {
                         coordinator.setVTSpatial2x(!coordinator.vtSpatial2x)
-                        onInteraction()
+                        onSelectPreset()
                     }
                 }
             }
@@ -574,31 +637,37 @@ private struct FrameRatePillStrip: View {
         }
     }
 
-    private func pillButton(
+    private func presetCardButton(
         title: String,
+        subtitle: String,
         isSelected: Bool,
         accent: Color,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: compact ? 12 : 13, weight: isSelected ? .bold : .medium, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(isSelected ? .black : .white.opacity(0.88))
-                .padding(.horizontal, compact ? 11 : 13)
-                .padding(.vertical, compact ? 6 : 8)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(isSelected ? accent : Color.white.opacity(0.11))
-                )
-                .overlay(
-                    Capsule(style: .continuous)
-                        .strokeBorder(isSelected ? accent.opacity(0.9) : Color.white.opacity(0.14), lineWidth: 0.7)
-                )
-                .contentShape(Capsule())
+            VStack(spacing: 2) {
+                Text(title)
+                    .font(.system(size: compact ? 13 : 14, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                Text(subtitle)
+                    .font(.system(size: compact ? 9.5 : 10.5, weight: .medium))
+                    .opacity(isSelected ? 0.85 : 0.72)
+            }
+            .foregroundStyle(isSelected ? .black : .white.opacity(0.92))
+            .padding(.horizontal, compact ? 12 : 14)
+            .padding(.vertical, compact ? 7 : 9)
+            .background(
+                RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous)
+                    .fill(isSelected ? accent : Color.white.opacity(0.11))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous)
+                    .strokeBorder(isSelected ? accent.opacity(0.9) : Color.white.opacity(0.16), lineWidth: 0.7)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous))
         }
         .buttonStyle(.plain)
-        .contentShape(Capsule())
+        .contentShape(RoundedRectangle(cornerRadius: compact ? 13 : 15, style: .continuous))
     }
 }
 
@@ -608,6 +677,7 @@ struct LiquidGlassPlayerView: View {
 
     @State private var showHUD: Bool = true
     @State private var showStatsHUD: Bool = false
+    @State private var showFPSPicker: Bool = false
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var showURLPrompt: Bool = false
     @State private var streamURLInput: String = ""
@@ -617,6 +687,7 @@ struct LiquidGlassPlayerView: View {
     @State private var isScrubbing: Bool = false
     @State private var scrubTime: Double = 0
     @State private var hudAutoHideTask: Task<Void, Never>?
+    @State private var fpsAutoCloseTask: Task<Void, Never>?
 
     init(coordinator: PlayerCoordinator) {
         self.coordinator = coordinator
@@ -632,6 +703,14 @@ struct LiquidGlassPlayerView: View {
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture {
+                        if showFPSPicker {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                showFPSPicker = false
+                            }
+                            fpsAutoCloseTask?.cancel()
+                            scheduleHUDAutoHide()
+                            return
+                        }
                         withAnimation(.easeInOut(duration: 0.2)) {
                             showHUD.toggle()
                         }
@@ -749,6 +828,7 @@ struct LiquidGlassPlayerView: View {
         guard coordinator.currentURL != nil,
               !coordinator.activePaused,
               !isScrubbing,
+              !showFPSPicker,
               !showEnhancementSheet,
               !showDiagnosticSheet else {
             return
@@ -759,6 +839,7 @@ struct LiquidGlassPlayerView: View {
                   coordinator.currentURL != nil,
                   !coordinator.activePaused,
                   !isScrubbing,
+                  !showFPSPicker,
                   !showEnhancementSheet,
                   !showDiagnosticSheet else {
                 return
@@ -766,6 +847,18 @@ struct LiquidGlassPlayerView: View {
             withAnimation(.easeInOut(duration: 0.25)) {
                 showHUD = false
             }
+        }
+    }
+
+    private func scheduleFPSPickerAutoClose() {
+        fpsAutoCloseTask?.cancel()
+        fpsAutoCloseTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(0.65))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                showFPSPicker = false
+            }
+            scheduleHUDAutoHide()
         }
     }
 
@@ -802,7 +895,7 @@ struct LiquidGlassPlayerView: View {
 
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
-                                Text("默认补帧预设")
+                                Text("默认帧率策略")
                                     .font(.caption2.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 Spacer()
@@ -810,7 +903,7 @@ struct LiquidGlassPlayerView: View {
                                     .font(.caption2.monospacedDigit().weight(.semibold))
                                     .foregroundStyle(.cyan)
                             }
-                            FrameRatePillStrip(
+                            FrameRatePresetStrip(
                                 coordinator: coordinator,
                                 optical: optical,
                                 compact: true
@@ -918,156 +1011,231 @@ struct LiquidGlassPlayerView: View {
 
             Spacer()
 
-            VStack(spacing: 10) {
-                HStack(spacing: 10) {
-                    Text(formatTime(displayTime))
-                        .font(.caption2.monospacedDigit())
-                        .frame(width: 46, alignment: .leading)
-
-                    Slider(
-                        value: Binding(
-                            get: { displayTime },
-                            set: { newVal in
-                                isScrubbing = true
-                                scrubTime = newVal
-                                hudAutoHideTask?.cancel()
-                            }
-                        ),
-                        in: 0...max(coordinator.activeDuration, 1),
-                        onEditingChanged: { editing in
-                            if !editing {
-                                coordinator.seek(to: scrubTime)
-                                isScrubbing = false
+            VStack(spacing: 8) {
+                if showFPSPicker {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label(
+                                "源帧率 \(PlaybackHUDMetrics.formatSourceFPS(optical.sourceFPS)) fps · 120Hz ProMotion",
+                                systemImage: "sparkles"
+                            )
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                fpsAutoCloseTask?.cancel()
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                    showFPSPicker = false
+                                }
                                 scheduleHUDAutoHide()
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
+                            .buttonStyle(.plain)
                         }
-                    )
-                    .tint(.cyan)
 
-                    Text(formatTime(coordinator.activeDuration))
-                        .font(.caption2.monospacedDigit())
-                        .frame(width: 46, alignment: .trailing)
+                        FrameRatePresetStrip(
+                            coordinator: coordinator,
+                            optical: optical,
+                            compact: true
+                        ) {
+                            scheduleFPSPickerAutoClose()
+                        }
+                    }
+                    .padding(12)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                    .frame(maxWidth: 680)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                FrameRatePillStrip(
-                    coordinator: coordinator,
-                    optical: optical,
-                    compact: true
-                ) {
-                    scheduleHUDAutoHide()
-                }
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Text(formatTime(displayTime))
+                            .font(.caption2.monospacedDigit())
+                            .frame(width: 46, alignment: .leading)
 
-                HStack(spacing: 10) {
-                    Button {
-                        coordinator.seekRelative(-10)
-                        scheduleHUDAutoHide()
-                    } label: {
-                        Image(systemName: "gobackward.10")
-                            .font(.callout.weight(.semibold))
-                            .frame(width: 36, height: 36)
-                            .contentShape(Circle())
+                        Slider(
+                            value: Binding(
+                                get: { displayTime },
+                                set: { newVal in
+                                    isScrubbing = true
+                                    scrubTime = newVal
+                                    hudAutoHideTask?.cancel()
+                                }
+                            ),
+                            in: 0...max(coordinator.activeDuration, 1),
+                            onEditingChanged: { editing in
+                                if !editing {
+                                    coordinator.seek(to: scrubTime)
+                                    isScrubbing = false
+                                    scheduleHUDAutoHide()
+                                }
+                            }
+                        )
+                        .tint(.cyan)
+
+                        Text(formatTime(coordinator.activeDuration))
+                            .font(.caption2.monospacedDigit())
+                            .frame(width: 46, alignment: .trailing)
                     }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(.regular.interactive(), in: .circle)
 
-                    Button {
-                        coordinator.togglePlayPause()
-                        scheduleHUDAutoHide()
-                    } label: {
-                        Image(systemName: coordinator.activePaused ? "play.fill" : "pause.fill")
-                            .font(.title3.weight(.semibold))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(.regular.tint(.cyan).interactive(), in: .circle)
-
-                    Button {
-                        coordinator.seekRelative(10)
-                        scheduleHUDAutoHide()
-                    } label: {
-                        Image(systemName: "goforward.10")
-                            .font(.callout.weight(.semibold))
-                            .frame(width: 36, height: 36)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(.regular.interactive(), in: .circle)
-
-                    Spacer(minLength: 4)
-
-                    if optical.isHDRContent {
+                    HStack(spacing: 8) {
                         Button {
-                            coordinator.setEDREnabled(!coordinator.isEDREnabled)
+                            coordinator.seekRelative(-10)
                             scheduleHUDAutoHide()
                         } label: {
-                            Text(coordinator.isEDREnabled ? "HDR" : "SDR")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 8)
-                                .contentShape(Capsule())
+                            Image(systemName: "gobackward.10")
+                                .font(.callout.weight(.semibold))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Circle())
+                        .glassEffect(.regular.interactive(), in: .circle)
+
+                        Button {
+                            coordinator.togglePlayPause()
+                            scheduleHUDAutoHide()
+                        } label: {
+                            Image(systemName: coordinator.activePaused ? "play.fill" : "pause.fill")
+                                .font(.title3.weight(.semibold))
+                                .frame(width: 42, height: 42)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Circle())
+                        .glassEffect(.regular.tint(.cyan).interactive(), in: .circle)
+
+                        Button {
+                            coordinator.seekRelative(10)
+                            scheduleHUDAutoHide()
+                        } label: {
+                            Image(systemName: "goforward.10")
+                                .font(.callout.weight(.semibold))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Circle())
+                        .glassEffect(.regular.interactive(), in: .circle)
+
+                        Spacer(minLength: 4)
+
+                        let fpsSummary = OpticalFlowTargetFPS.activeCapsuleSummary(
+                            isOff: coordinator.interpolationMode == .off,
+                            requested: coordinator.opticalFlowTargetFPS,
+                            effective: optical.effectiveTargetFPS,
+                            sourceFPS: optical.sourceFPS,
+                            spatial2x: coordinator.vtSpatial2x
+                        )
+                        Button {
+                            fpsAutoCloseTask?.cancel()
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                showFPSPicker.toggle()
+                            }
+                            if showFPSPicker {
+                                hudAutoHideTask?.cancel()
+                            } else {
+                                scheduleHUDAutoHide()
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: coordinator.interpolationMode == .off ? "film" : "sparkles")
+                                    .font(.caption2.weight(.bold))
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text(fpsSummary.title)
+                                        .font(.caption2.monospacedDigit().weight(.bold))
+                                    Text(fpsSummary.subtitle)
+                                        .font(.system(size: 8.5, weight: .medium))
+                                        .opacity(0.75)
+                                }
+                                Image(systemName: showFPSPicker ? "chevron.down" : "chevron.up")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .opacity(0.75)
+                            }
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
                         .contentShape(Capsule())
                         .glassEffect(
-                            coordinator.isEDREnabled ? .regular.tint(.yellow).interactive() : .regular.interactive(),
+                            coordinator.interpolationMode == .vtOpticalFlow ? .regular.tint(.cyan).interactive() : .regular.interactive(),
                             in: .capsule
                         )
-                    }
 
-                    Button {
-                        coordinator.setLooping(!coordinator.isLooping)
-                        scheduleHUDAutoHide()
-                    } label: {
-                        Image(systemName: "repeat")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
-                            .frame(width: 34, height: 34)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(
-                        coordinator.isLooping ? .regular.tint(.cyan).interactive() : .regular.interactive(),
-                        in: .circle
-                    )
-
-                    Menu {
-                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
-                            Button("\(rate, specifier: "%.2g")x") {
-                                coordinator.setSpeed(rate)
+                        if optical.isHDRContent {
+                            Button {
+                                coordinator.setEDREnabled(!coordinator.isEDREnabled)
                                 scheduleHUDAutoHide()
+                            } label: {
+                                Text(coordinator.isEDREnabled ? "HDR" : "SDR")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(coordinator.isEDREnabled ? .yellow : .secondary)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 8)
+                                    .contentShape(Capsule())
                             }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
+                            .glassEffect(
+                                coordinator.isEDREnabled ? .regular.tint(.yellow).interactive() : .regular.interactive(),
+                                in: .capsule
+                            )
                         }
-                    } label: {
-                        Text("\(coordinator.speed, specifier: "%.2g")x")
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                    }
-                    .glassEffect(.regular.interactive(), in: .capsule)
 
-                    Button {
-                        hudAutoHideTask?.cancel()
-                        showEnhancementSheet = true
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.callout.weight(.semibold))
-                            .frame(width: 34, height: 34)
-                            .contentShape(Circle())
+                        Button {
+                            coordinator.setLooping(!coordinator.isLooping)
+                            scheduleHUDAutoHide()
+                        } label: {
+                            Image(systemName: "repeat")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(coordinator.isLooping ? .cyan : .secondary)
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Circle())
+                        .glassEffect(
+                            coordinator.isLooping ? .regular.tint(.cyan).interactive() : .regular.interactive(),
+                            in: .circle
+                        )
+
+                        Menu {
+                            ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { rate in
+                                Button("\(rate, specifier: "%.2g")x") {
+                                    coordinator.setSpeed(rate)
+                                    scheduleHUDAutoHide()
+                                }
+                            }
+                        } label: {
+                            Text("\(coordinator.speed, specifier: "%.2g")x")
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 8)
+                        }
+                        .glassEffect(.regular.interactive(), in: .capsule)
+
+                        Button {
+                            hudAutoHideTask?.cancel()
+                            showEnhancementSheet = true
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.callout.weight(.semibold))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .contentShape(Circle())
+                        .glassEffect(.regular.tint(.indigo).interactive(), in: .circle)
                     }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .glassEffect(.regular.tint(.indigo).interactive(), in: .circle)
                 }
+                .padding(14)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+                .frame(maxWidth: 680)
             }
-            .padding(14)
-            .glassEffect(.regular, in: .rect(cornerRadius: 24))
-            .frame(maxWidth: 680)
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
         }
@@ -1342,13 +1510,13 @@ struct EnhancementControlSheet: View {
                                 .foregroundStyle(.cyan)
                         }
 
-                        FrameRatePillStrip(
+                        FrameRatePresetStrip(
                             coordinator: coordinator,
                             optical: optical,
                             compact: false
                         )
 
-                        Text("全档位优先 LowLatency (420v) 低功耗管线；点选 2×/60/72/96/120 或「原帧」立即切换生效，无需重建音频。")
+                        Text("自动匹配片源帧率与 120Hz ProMotion 整数分频（48/60/96/120 fps）；播放中点选卡片立即原地热切换，无需重建音频。")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -1582,39 +1750,6 @@ struct DiagnosticLogSheet: View {
     }
 
     private func buildFullDiagnosticReport() -> String {
-        if coordinator.selfCheckReport.isEmpty {
-            coordinator.runRealDeviceSelfCheck()
-        }
-        let maxScreenFPS = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first?.screen.maximumFramesPerSecond ?? 60
-        let deviceInfo = DeviceDiagnosticsSampler.deviceSummaryLine(maxScreenFPS: maxScreenFPS)
-
-        let summary: SessionDiagnosticSummary
-        var extraTelemetry: [String] = []
-        if coordinator.currentURL != nil {
-            summary = coordinator.buildCurrentSessionSummary()
-        } else if let cached = coordinator.lastSessionSummary {
-            summary = cached
-            extraTelemetry.append("Snapshot Source: last-session (cached before closeToHome)")
-        } else {
-            summary = coordinator.buildCurrentSessionSummary()
-        }
-
-        return DiagnosticLogExporter.buildReport(
-            version: AppReleaseInfo.displayVersion,
-            deviceInfo: deviceInfo,
-            engineName: summary.engineName,
-            playbackState: summary.playbackState,
-            resolution: summary.resolution,
-            fpsSummary: summary.fpsSummary,
-            decoderSummary: summary.decoderSummary,
-            is4KGated: summary.is4KGated,
-            telemetrySummary: summary.telemetrySummary + extraTelemetry,
-            runtimeTimeline: coordinator.runtimeTimeline.map { $0.formatLogLine() },
-            uiAuditLogs: coordinator.uiAuditLogs,
-            selfCheck: coordinator.selfCheckReport,
-            opticalLogs: optical.diagnosticLogs
-        )
+        coordinator.exportDiagnosticReportText(includePersistedFallback: true)
     }
 }
