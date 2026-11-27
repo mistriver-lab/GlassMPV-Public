@@ -896,6 +896,10 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(coordinator.uiAuditLogs.count, 2)
 
         // 切换至原帧率直通并验证跨平台直通播放可在模拟器完成
+        let displayContainer = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        coordinator.opticalFlowController.attach(to: displayContainer)
+        defer { _ = displayContainer }
+
         coordinator.setInterpolation(.off)
         XCTAssertEqual(coordinator.interpolationMode, .off)
         XCTAssertEqual(coordinator.hudMetrics.engineBadge, "PASS")
@@ -921,6 +925,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertNil(coordinator.opticalFlowController.errorMessage)
         XCTAssertGreaterThan(coordinator.opticalFlowController.presentedFrameCount, 0)
         XCTAssertEqual(coordinator.opticalFlowController.activeBackendLabel, "原帧率直通")
+        XCTAssertFalse(coordinator.opticalFlowController.isInterpolationEnabled)
     }
 
     @MainActor
