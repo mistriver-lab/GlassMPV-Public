@@ -3714,7 +3714,7 @@ final class GlassMPVTests: XCTestCase {
         let unannouncedJump = guardState.evaluateTick(mediaClock: 1200.0, pulledSamplePTS: 1200.04, isActivelyPlaying: true)
         XCTAssertEqual(unannouncedJump, .resetPipelineAndContinue(activeClockPTS: 1200.0, shouldSubmitSample: true))
 
-        // 5. 验证新批次 120fps 插帧帧对在 pacerNow=1601.55 下零丢帧
+        // 5. 验证新批次 120fps 插帧帧对在正确重置后的 pacerNow=1601.602 下零丢帧按序出队
         var queue: [(pts: Double, buffer: Int)] = [
             (1601.600, 1),
             (1601.608, 2),
@@ -3724,7 +3724,7 @@ final class GlassMPVTests: XCTestCase {
         ]
         let paceResult = OpticalFlowFramePacer.dequeueNextFrame(
             from: &queue,
-            now: 1601.55,
+            now: 1601.602,
             isInterpolationEnabled: true,
             maxLateGraceSeconds: 0.120
         )
