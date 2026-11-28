@@ -3192,7 +3192,6 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: "夸克 · 夸克 1080P+"), "1080P+")
     }
 
-    @MainActor
     func testMetalPyramidOpticalFlowRealMotionAccuracyAndSharpness() async throws {
         guard MTLCreateSystemDefaultDevice() != nil else {
             return
@@ -3305,18 +3304,24 @@ final class GlassMPVTests: XCTestCase {
         let cutResult = try XCTUnwrap(cutRaw)
         XCTAssertTrue(cutResult.isSceneCut, "大幅切镜帧对必须触发 scene-cut 保护")
 
-        let enhancer = MetalVideoEnhancer()
-        XCTAssertNil(enhancer.shaderInitError)
-        let warpedBGRA = try XCTUnwrap(
-            enhancer.renderFlowWarpedOffscreenForTesting(
-                prevBuffer: prevBuf,
-                currBuffer: currBuf,
-                forwardFlowTexture: flowResult.forwardFlow.texture,
-                backwardFlowTexture: flowResult.backwardFlow.texture,
-                phase: 0.5,
-                isSceneCut: false
+        let prevBox = RemoteSendablePixelBuffer(buffer: prevBuf)
+        let currBox = RemoteSendablePixelBuffer(buffer: currBuf)
+        let fwdBox = flowResult.forwardFlow
+        let bwdBox = flowResult.backwardFlow
+        let warpedBGRA: [UInt8] = try await MainActor.run {
+            let enhancer = MetalVideoEnhancer()
+            XCTAssertNil(enhancer.shaderInitError)
+            return try XCTUnwrap(
+                enhancer.renderFlowWarpedOffscreenForTesting(
+                    prevBuffer: prevBox.buffer,
+                    currBuffer: currBox.buffer,
+                    forwardFlowTexture: fwdBox.texture,
+                    backwardFlowTexture: bwdBox.texture,
+                    phase: 0.5,
+                    isSceneCut: false
+                )
             )
-        )
+        }
 
         CVPixelBufferLockBaseAddress(prevBuf, .readOnly)
         CVPixelBufferLockBaseAddress(currBuf, .readOnly)
