@@ -234,6 +234,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "shouldAutoMetalFXUpscaleOpticalFlow" in metal_enhancer_src
     assert "opticalFlowDownsampleRestoreParameters" in metal_enhancer_src
     assert "displayFlowWarpYUVFragment" in metal_enhancer_src
+    assert "splatFlowToMidpoint" in metal_enhancer_src
+    assert "resolveMidpointFlowAndVisibility" in metal_enhancer_src
     assert "renderFlowWarpedToLayerStatus" in metal_enhancer_src
     assert "flowScaleX" in metal_enhancer_src
     assert "nearestSampler" in metal_enhancer_src
@@ -255,6 +257,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "parseContentRangeTotalLength" in local_proxy_src
     assert "cancelActiveChunkCaches" in local_proxy_src
     assert "hlsManifestRewriter" in local_proxy_src
+    assert "buildHLSSegmentRetryURL" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -484,9 +487,18 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testRemoteBackwardSeekResetsClockAndPreserves120FPS" in swift_test_src
     assert "testMetalPyramidFastPanNoFalseSceneCutAndWarpSharpness" in swift_test_src
     assert "testOptimizedVideoInfoHUDFormattingAndStallDecay" in swift_test_src
+    assert "testMetalPyramidMidpointSplattingZeroGhostAcross120FPSPhases" in swift_test_src
+    assert "testMemoryGuardsDrawableCapAndHLSSegment400RetryURL" in swift_test_src
+    assert "testHDR10EightBitMetalPathAndLoadPreservesFallbackCallbacks" in swift_test_src
+
+    enhancer_src = (ROOT / "Sources" / "Engine" / "MetalVideoEnhancer.swift").read_text(encoding="utf-8")
+    assert "isPQTransferBuffer" in enhancer_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src
+    assert "canUseMetalDirectPath" in engine_src
+    assert "preservingCallbacks" in engine_src
+    assert "recommendedFlowWarpMetalMaxLongSide" in engine_src
     assert "setRemoteInterpolationEnabled" in engine_src
     assert "preferredForwardBufferDuration" in engine_src
     assert "presentFlowWarpedFrame" in engine_src

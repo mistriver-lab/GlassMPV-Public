@@ -117,6 +117,7 @@ final class PlayerCoordinator: ObservableObject {
     private let powerModeToken = ThermalObserverToken()
     private let telemetryLoopToken = TelemetryLoopToken()
     private var autoFallbackAttemptedURLs: Set<URL> = []
+    private var autoFallbackAttemptedVariantIDs: Set<String> = []
     private var resumeToastTask: Task<Void, Never>?
     private var streamNoticeTask: Task<Void, Never>?
     private var pendingSeekSeconds: Double = 0
@@ -303,6 +304,7 @@ final class PlayerCoordinator: ObservableObject {
         activeMediaRequest = nil
         currentStreamVariants = []
         autoFallbackAttemptedURLs.removeAll()
+        autoFallbackAttemptedVariantIDs.removeAll()
 
         if !url.isFileURL {
             let entryID = WatchHistoryEntry.makeEntryID(sourceKind: .streamURL, streamURL: url)
@@ -575,6 +577,7 @@ final class PlayerCoordinator: ObservableObject {
     func openCloudStream(_ request: PlaybackMediaRequest, seekTo: Double = 0) {
         opticalFlowController.clearError()
         autoFallbackAttemptedURLs.removeAll()
+        autoFallbackAttemptedVariantIDs.removeAll()
         activeMediaRequest = request
         currentStreamVariants = request.alternatives
         activePlaylist = request.playlist
@@ -594,7 +597,8 @@ final class PlayerCoordinator: ObservableObject {
     }
 
     func switchStreamVariant(_ variant: StreamVariantOption) {
-        guard let currentReq = activeMediaRequest, variant.url != currentURL else { return }
+        guard let currentReq = activeMediaRequest,
+              (variant.url != currentURL || opticalFlowController.errorMessage != nil) else { return }
         let resumeTime = activeCurrentTime > 0 ? activeCurrentTime : pendingSeekSeconds
         if let accountID = currentReq.accountID,
            let account = mediaSourceStore.accounts.first(where: { $0.id == accountID }),
@@ -775,6 +779,7 @@ final class PlayerCoordinator: ObservableObject {
         activePlaylistIndex = nil
         activeDirectorySubtitles = []
         autoFallbackAttemptedURLs.removeAll()
+        autoFallbackAttemptedVariantIDs.removeAll()
         qualityCompareMode = .off
         isImportingFile = false
         OrientationController.shared.returnToHomeOrientation()
@@ -1407,11 +1412,18 @@ final class PlayerCoordinator: ObservableObject {
             guard let self else { return }
             if let current = self.currentURL {
                 self.autoFallbackAttemptedURLs.insert(current)
+                if let currentID = self.currentStreamVariants.first(where: { $0.url == current })?.id {
+                    self.autoFallbackAttemptedVariantIDs.insert(currentID)
+                }
             }
             let candidates = self.currentStreamVariants.filter {
-                $0.url != self.currentURL && !self.autoFallbackAttemptedURLs.contains($0.url)
+                $0.url != self.currentURL
+                    && !self.autoFallbackAttemptedURLs.contains($0.url)
+                    && !self.autoFallbackAttemptedVariantIDs.contains($0.id)
             }
-            if let fallback = candidates.first(where: \.isHLS) ?? candidates.first {
+            if let fallback = candidates.first(where: { !$0.isHLS && $0.id != "quark-original" })
+                ?? candidates.first(where: \.isHLS)
+                ?? candidates.first {
                 self.opticalFlowController.appendLog("[remote][fallback] \(reason)，自动切流 -> \(fallback.label)")
                 self.showStreamNotice("已自动切换至 \(fallback.label)")
                 self.switchStreamVariant(fallback)
@@ -1421,15 +1433,30 @@ final class PlayerCoordinator: ObservableObject {
         }
         opticalFlowController.onRemoteStreamFailed = { [weak self] detail in
             guard let self else { return false }
+            let failedVariant = self.currentStreamVariants.first { $0.url == self.currentURL }
+            let failedWasHLS = (failedVariant?.isHLS == true) || (self.activeMediaRequest?.isHLS == true)
             if let current = self.currentURL {
                 self.autoFallbackAttemptedURLs.insert(current)
+                if let currentID = failedVariant?.id {
+                    self.autoFallbackAttemptedVariantIDs.insert(currentID)
+                }
             }
             let candidates = self.currentStreamVariants.filter {
-                $0.url != self.currentURL && !self.autoFallbackAttemptedURLs.contains($0.url)
+                $0.url != self.currentURL
+                    && !self.autoFallbackAttemptedURLs.contains($0.url)
+                    && !self.autoFallbackAttemptedVariantIDs.contains($0.id)
             }
-            if let fallback = candidates.first(where: \.isHLS) ?? candidates.first {
+            let fallback: StreamVariantOption?
+            if failedWasHLS {
+                fallback = candidates.first(where: { !$0.isHLS && $0.id != "quark-original" }) ?? candidates.first
+            } else {
+                fallback = candidates.first(where: { !$0.isHLS && $0.id != "quark-original" })
+                    ?? candidates.first(where: \.isHLS)
+                    ?? candidates.first
+            }
+            if let fallback {
                 self.opticalFlowController.appendLog("[remote][fallback] 主流加载失败（\(detail)），自动切流 -> \(fallback.label)")
-                self.showStreamNotice("原画直链超时，已自动切换至 \(fallback.label)")
+                self.showStreamNotice("主流超时/失败，已自动切换至 \(fallback.label)")
                 self.switchStreamVariant(fallback)
                 return true
             }

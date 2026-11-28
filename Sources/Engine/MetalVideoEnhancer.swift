@@ -17,7 +17,7 @@ private struct MetalEnhanceUniforms {
     var isBT601: UInt32
     var compareMode: UInt32
     var splitX: Float
-    var padding: UInt32
+    var isPQTransfer: UInt32
 }
 
 private struct MetalDisplayVertexUniforms {
@@ -41,6 +41,23 @@ private struct MetalFlowWarpUniforms {
     var compareMode: UInt32
     var splitX: Float
     var isSceneCut: UInt32
+    var isPQTransfer: UInt32
+}
+
+private struct MetalFlowSplatUniforms {
+    var flowWidth: UInt32
+    var flowHeight: UInt32
+    var phase: Float
+    var flowScaleX: Float
+    var flowScaleY: Float
+}
+
+private struct FlowSplatSlot {
+    let width: Int
+    let height: Int
+    let splatZ0: MTLBuffer
+    let splatZ1: MTLBuffer
+    let midFlowVisTexture: MTLTexture
 }
 
 enum MetalDirectRenderResult: Equatable, Sendable {
@@ -129,6 +146,9 @@ final class MetalVideoEnhancer {
     private var enhanceBGRAPipeline: MTLComputePipelineState?
     private var yuvToBGRAPipeline: MTLComputePipelineState?
     private var bicubicBGRAPipeline: MTLComputePipelineState?
+    private var clearSplatBuffersPipeline: MTLComputePipelineState?
+    private var splatFlowToMidpointPipeline: MTLComputePipelineState?
+    private var resolveMidpointFlowPipeline: MTLComputePipelineState?
 
     private var displayYUVRenderPipeline: MTLRenderPipelineState?
     private var displayBGRARenderPipeline: MTLRenderPipelineState?
@@ -136,6 +156,8 @@ final class MetalVideoEnhancer {
 
     private var outputPool: CVPixelBufferPool?
     private var outputPoolSignature: String = ""
+    private var splatSlots: [FlowSplatSlot] = []
+    private var splatSlotCursor: Int = 0
 
 #if canImport(MetalFX) && !targetEnvironment(simulator)
     private var spatialScaler: MTLFXSpatialScaler?
@@ -159,7 +181,7 @@ final class MetalVideoEnhancer {
         uint isBT601;
         uint compareMode;
         float splitX;
-        uint padding;
+        uint isPQTransfer;
     };
 
     struct DisplayVertexUniforms {
@@ -183,6 +205,15 @@ final class MetalVideoEnhancer {
         uint compareMode;
         float splitX;
         uint isSceneCut;
+        uint isPQTransfer;
+    };
+
+    struct FlowSplatUniforms {
+        uint flowWidth;
+        uint flowHeight;
+        float phase;
+        float flowScaleX;
+        float flowScaleY;
     };
 
     struct QuadVaryings {
@@ -227,6 +258,25 @@ final class MetalVideoEnhancer {
             rgb.b = yUnit + half(1.8556h) * cb;
         }
         return clamp(rgb, half(0.0h), half(1.0h));
+    }
+
+    inline half3 toneMapPQToSDR709H(half3 rgbPQ) {
+        float3 n = clamp(float3(rgbPQ), 0.0f, 1.0f);
+        float3 np = pow(n, 1.0f / 78.84375f);
+        float3 num = max(np - 0.8359375f, 0.0f);
+        float3 den = max(18.8515625f - 18.6875f * np, 1e-4f);
+        float3 lin = pow(num / den, 1.0f / 0.1593017578125f);
+        float3 linScaled = lin * 50.0f;
+        float3 tm = linScaled / (1.0f + 0.8f * linScaled);
+        return half3(pow(clamp(tm * 1.25f, 0.0f, 1.0f), 1.0f / 2.2f));
+    }
+
+    inline half4 finalizeEnhanceRGBH(half3 rgb, constant EnhanceUniforms& u) {
+        return half4((u.isPQTransfer != 0u) ? toneMapPQToSDR709H(rgb) : rgb, half(1.0h));
+    }
+
+    inline half4 finalizeFlowWarpRGBH(half3 rgb, constant FlowWarpUniforms& u) {
+        return half4((u.isPQTransfer != 0u) ? toneMapPQToSDR709H(rgb) : rgb, half(1.0h));
     }
 
     inline float sampleMitchellWeightH(float x) {
@@ -401,11 +451,11 @@ final class MetalVideoEnhancer {
         half yCenter = toUnitLumaH(inY.sample(linearSampler, uv).r, u.isVideoRange);
 
         if (u.compareMode == 2u) {
-            return half4(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+            return finalizeEnhanceRGBH(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), u);
         }
         if (u.compareMode == 3u) {
             half yCubic = sampleLumaNeutralCubicH(inY, uv, u.isVideoRange);
-            return half4(yuvSampleToRGBH(yCubic, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+            return finalizeEnhanceRGBH(yuvSampleToRGBH(yCubic, chroma, u.isVideoRange, u.isBT601), u);
         }
         float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
         float invWidth = 1.0f / max(1.0f, float(inY.get_width()));
@@ -415,7 +465,7 @@ final class MetalVideoEnhancer {
                 return half4(half(0.25h), half(0.96h), half(0.98h), half(1.0h));
             }
             if (uv.x < splitRatio) {
-                return half4(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+                return finalizeEnhanceRGBH(yuvSampleToRGBH(yCenter, chroma, u.isVideoRange, u.isBT601), u);
             }
         }
 
@@ -434,7 +484,7 @@ final class MetalVideoEnhancer {
         half d3 = toUnitLumaH(inY.sample(linearSampler, uv + dDiagB).r, u.isVideoRange);
 
         half yOut = computeEnhancedLumaFastH(yCenter, yN, yS, yW, yE, d0, d1, d2, d3, u);
-        return half4(yuvSampleToRGBH(yOut, chroma, u.isVideoRange, u.isBT601), half(1.0h));
+        return finalizeEnhanceRGBH(yuvSampleToRGBH(yOut, chroma, u.isVideoRange, u.isBT601), u);
     }
 
     fragment half4 displayEnhanceBGRAFragment(
@@ -483,14 +533,269 @@ final class MetalVideoEnhancer {
         return half4(finalRGB, centerRGBA.a);
     }
 
+    kernel void clearSplatBuffers(
+        device uint* splatZ0 [[buffer(0)]],
+        device uint* splatZ1 [[buffer(1)]],
+        constant FlowSplatUniforms& u [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]
+    ) {
+        uint total = u.flowWidth * u.flowHeight;
+        if (gid >= total) {
+            return;
+        }
+        splatZ0[gid] = 0u;
+        splatZ1[gid] = 0u;
+    }
+
+    kernel void splatFlowToMidpoint(
+        texture2d<float, access::sample> inForwardFlow [[texture(0)]],
+        texture2d<float, access::sample> inBackwardFlow [[texture(1)]],
+        device atomic_uint* splatZ0 [[buffer(0)]],
+        device atomic_uint* splatZ1 [[buffer(1)]],
+        constant FlowSplatUniforms& u [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= u.flowWidth || gid.y >= u.flowHeight) {
+            return;
+        }
+        uint flatSrc = gid.y * u.flowWidth + gid.x;
+        if (flatSrc > 65535u) {
+            return;
+        }
+
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float2 dims = float2(max(1u, u.flowWidth), max(1u, u.flowHeight));
+        float2 uv = (float2(gid) + 0.5f) / dims;
+        float2 flowScale = float2(u.flowScaleX, u.flowScaleY);
+        float t = clamp(u.phase, 0.0f, 1.0f);
+
+        // 1. Frame 0 -> Frame t 前向泼溅
+        float2 f = inForwardFlow.sample(linearSampler, uv).rg * flowScale;
+        if (!isfinite(f.x) || !isfinite(f.y)) { f = float2(0.0f); }
+        float mag0 = length(f);
+        if (mag0 <= 0.18f) {
+            float2 pNext = uv + f;
+            bool oob0 = (pNext.x < 0.0f || pNext.x > 1.0f || pNext.y < 0.0f || pNext.y > 1.0f);
+            float2 bDest = inBackwardFlow.sample(linearSampler, clamp(pNext, float2(0.0f), float2(1.0f))).rg * flowScale;
+            if (!isfinite(bDest.x) || !isfinite(bDest.y)) { bDest = -f; }
+            float fbErr0 = length(f + bDest);
+            float occ0 = oob0 ? 1.0f : smoothstep(0.0035f, 0.014f, fbErr0);
+
+            float speed0 = clamp(mag0 * 5.0f, 0.0f, 0.55f);
+            float visBoost0 = (1.0f - occ0) * 0.45f;
+            uint prio0 = uint(clamp(speed0 + visBoost0, 0.0f, 1.0f) * 65534.0f) + 1u;
+
+            int2 dst0 = int2(round(float2(gid) + t * f * dims));
+            if (dst0.x >= 0 && dst0.x < int(u.flowWidth) && dst0.y >= 0 && dst0.y < int(u.flowHeight)) {
+                uint dstIdx0 = uint(dst0.y) * u.flowWidth + uint(dst0.x);
+                atomic_fetch_max_explicit(&splatZ0[dstIdx0], (prio0 << 16u) | flatSrc, memory_order_relaxed);
+            }
+        }
+
+        // 2. Frame 1 -> Frame t 反向泼溅
+        float2 b = inBackwardFlow.sample(linearSampler, uv).rg * flowScale;
+        if (!isfinite(b.x) || !isfinite(b.y)) { b = float2(0.0f); }
+        float mag1 = length(b);
+        if (mag1 <= 0.18f) {
+            float2 qPrev = uv + b;
+            bool oob1 = (qPrev.x < 0.0f || qPrev.x > 1.0f || qPrev.y < 0.0f || qPrev.y > 1.0f);
+            float2 fSrc = inForwardFlow.sample(linearSampler, clamp(qPrev, float2(0.0f), float2(1.0f))).rg * flowScale;
+            if (!isfinite(fSrc.x) || !isfinite(fSrc.y)) { fSrc = -b; }
+            float fbErr1 = length(b + fSrc);
+            float occ1 = oob1 ? 1.0f : smoothstep(0.0035f, 0.014f, fbErr1);
+
+            float speed1 = clamp(mag1 * 5.0f, 0.0f, 0.55f);
+            float visBoost1 = (1.0f - occ1) * 0.45f;
+            uint prio1 = uint(clamp(speed1 + visBoost1, 0.0f, 1.0f) * 65534.0f) + 1u;
+
+            int2 dst1 = int2(round(float2(gid) + (1.0f - t) * b * dims));
+            if (dst1.x >= 0 && dst1.x < int(u.flowWidth) && dst1.y >= 0 && dst1.y < int(u.flowHeight)) {
+                uint dstIdx1 = uint(dst1.y) * u.flowWidth + uint(dst1.x);
+                atomic_fetch_max_explicit(&splatZ1[dstIdx1], (prio1 << 16u) | flatSrc, memory_order_relaxed);
+            }
+        }
+    }
+
+    inline void decodeSplatVelocity0(
+        uint packed,
+        texture2d<float, access::sample> inForwardFlow,
+        texture2d<float, access::sample> inBackwardFlow,
+        float2 dims,
+        float2 flowScale,
+        thread float2& outV,
+        thread float& outOcc
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        uint flatSrc = packed & 0xFFFFu;
+        uint sx = flatSrc % uint(dims.x);
+        uint sy = flatSrc / uint(dims.x);
+        float2 uv = (float2(sx, sy) + 0.5f) / dims;
+        float2 f = inForwardFlow.sample(linearSampler, uv).rg * flowScale;
+        if (!isfinite(f.x) || !isfinite(f.y)) { f = float2(0.0f); }
+        float2 pNext = uv + f;
+        bool oob = (pNext.x < 0.0f || pNext.x > 1.0f || pNext.y < 0.0f || pNext.y > 1.0f);
+        float2 bDest = inBackwardFlow.sample(linearSampler, clamp(pNext, float2(0.0f), float2(1.0f))).rg * flowScale;
+        if (!isfinite(bDest.x) || !isfinite(bDest.y)) { bDest = -f; }
+        outV = f;
+        outOcc = oob ? 1.0f : smoothstep(0.0035f, 0.014f, length(f + bDest));
+    }
+
+    inline void decodeSplatVelocity1(
+        uint packed,
+        texture2d<float, access::sample> inForwardFlow,
+        texture2d<float, access::sample> inBackwardFlow,
+        float2 dims,
+        float2 flowScale,
+        thread float2& outV,
+        thread float& outOcc
+    ) {
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        uint flatSrc = packed & 0xFFFFu;
+        uint sx = flatSrc % uint(dims.x);
+        uint sy = flatSrc / uint(dims.x);
+        float2 uv = (float2(sx, sy) + 0.5f) / dims;
+        float2 b = inBackwardFlow.sample(linearSampler, uv).rg * flowScale;
+        if (!isfinite(b.x) || !isfinite(b.y)) { b = float2(0.0f); }
+        float2 qPrev = uv + b;
+        bool oob = (qPrev.x < 0.0f || qPrev.x > 1.0f || qPrev.y < 0.0f || qPrev.y > 1.0f);
+        float2 fSrc = inForwardFlow.sample(linearSampler, clamp(qPrev, float2(0.0f), float2(1.0f))).rg * flowScale;
+        if (!isfinite(fSrc.x) || !isfinite(fSrc.y)) { fSrc = -b; }
+        outV = -b;
+        outOcc = oob ? 1.0f : smoothstep(0.0035f, 0.014f, length(b + fSrc));
+    }
+
+    kernel void resolveMidpointFlowAndVisibility(
+        texture2d<float, access::sample> inForwardFlow [[texture(0)]],
+        texture2d<float, access::sample> inBackwardFlow [[texture(1)]],
+        device const uint* splatZ0 [[buffer(0)]],
+        device const uint* splatZ1 [[buffer(1)]],
+        texture2d<half, access::write> outMidFlowVis [[texture(2)]],
+        constant FlowSplatUniforms& u [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= u.flowWidth || gid.y >= u.flowHeight) {
+            return;
+        }
+        float2 dims = float2(max(1u, u.flowWidth), max(1u, u.flowHeight));
+        float2 flowScale = float2(u.flowScaleX, u.flowScaleY);
+        uint idx = gid.y * u.flowWidth + gid.x;
+        uint p0 = splatZ0[idx];
+        uint p1 = splatZ1[idx];
+
+        float2 outV = float2(0.0f);
+        float vis0 = 0.0f;
+        float vis1 = 0.0f;
+
+        if (p0 != 0u && p1 != 0u) {
+            float2 v0, v1;
+            float occ0, occ1;
+            decodeSplatVelocity0(p0, inForwardFlow, inBackwardFlow, dims, flowScale, v0, occ0);
+            decodeSplatVelocity1(p1, inForwardFlow, inBackwardFlow, dims, flowScale, v1, occ1);
+
+            if (length(v0 - v1) <= 0.012f && occ0 < 0.65f && occ1 < 0.65f) {
+                outV = 0.5f * (v0 + v1);
+                vis0 = 1.0f;
+                vis1 = 1.0f;
+            } else if (occ0 + 0.18f < occ1) {
+                outV = v0;
+                vis0 = 1.0f;
+                vis1 = 0.0f;
+            } else if (occ1 + 0.18f < occ0) {
+                outV = v1;
+                vis0 = 0.0f;
+                vis1 = 1.0f;
+            } else if (length(v0) >= length(v1)) {
+                outV = v0;
+                vis0 = 1.0f;
+                vis1 = (occ1 < 0.45f && length(v0 - v1) <= 0.018f) ? 1.0f : 0.0f;
+            } else {
+                outV = v1;
+                vis0 = (occ0 < 0.45f && length(v0 - v1) <= 0.018f) ? 1.0f : 0.0f;
+                vis1 = 1.0f;
+            }
+        } else if (p0 != 0u) {
+            float occ0;
+            decodeSplatVelocity0(p0, inForwardFlow, inBackwardFlow, dims, flowScale, outV, occ0);
+            vis0 = 1.0f;
+            vis1 = 0.0f;
+        } else if (p1 != 0u) {
+            float occ1;
+            decodeSplatVelocity1(p1, inForwardFlow, inBackwardFlow, dims, flowScale, outV, occ1);
+            vis0 = 0.0f;
+            vis1 = 1.0f;
+        } else {
+            // 空洞背景填充：5×5 搜索最慢（偏静态背景）的有效泼溅速度并记录真实单向可见性
+            float bestBgSpeed = 1e9f;
+            bool foundAny = false;
+            bool hasV0 = false;
+            bool hasV1 = false;
+            float2 bgV0 = float2(0.0f);
+            float2 bgV1 = float2(0.0f);
+
+            for (int dy = -2; dy <= 2; ++dy) {
+                int ny = clamp(int(gid.y) + dy, 0, int(u.flowHeight) - 1);
+                for (int dx = -2; dx <= 2; ++dx) {
+                    int nx = clamp(int(gid.x) + dx, 0, int(u.flowWidth) - 1);
+                    uint nIdx = uint(ny) * u.flowWidth + uint(nx);
+                    uint np0 = splatZ0[nIdx];
+                    uint np1 = splatZ1[nIdx];
+                    if (np0 != 0u) {
+                        float2 cv0;
+                        float cocc0;
+                        decodeSplatVelocity0(np0, inForwardFlow, inBackwardFlow, dims, flowScale, cv0, cocc0);
+                        float sp = length(cv0) + float(abs(dx) + abs(dy)) * 0.0005f;
+                        if (sp < bestBgSpeed) {
+                            bestBgSpeed = sp;
+                            outV = cv0;
+                            foundAny = true;
+                        }
+                        if (!hasV0 || length(cv0) < length(bgV0)) {
+                            bgV0 = cv0;
+                            hasV0 = true;
+                        }
+                    }
+                    if (np1 != 0u) {
+                        float2 cv1;
+                        float cocc1;
+                        decodeSplatVelocity1(np1, inForwardFlow, inBackwardFlow, dims, flowScale, cv1, cocc1);
+                        float sp = length(cv1) + float(abs(dx) + abs(dy)) * 0.0005f;
+                        if (sp < bestBgSpeed) {
+                            bestBgSpeed = sp;
+                            outV = cv1;
+                            foundAny = true;
+                        }
+                        if (!hasV1 || length(cv1) < length(bgV1)) {
+                            bgV1 = cv1;
+                            hasV1 = true;
+                        }
+                    }
+                }
+            }
+
+            if (foundAny) {
+                vis0 = (hasV0 && length(bgV0 - outV) <= 0.008f) ? 1.0f : 0.0f;
+                vis1 = (hasV1 && length(bgV1 - outV) <= 0.008f) ? 1.0f : 0.0f;
+                if (vis0 < 0.5f && vis1 < 0.5f) {
+                    vis0 = (u.phase < 0.5f) ? 1.0f : 0.0f;
+                    vis1 = 1.0f - vis0;
+                }
+            } else {
+                outV = float2(0.0f);
+                vis0 = (u.phase < 0.5f) ? 1.0f : 0.0f;
+                vis1 = 1.0f - vis0;
+            }
+        }
+
+        outMidFlowVis.write(half4(half(outV.x), half(outV.y), half(vis0), half(vis1)), gid);
+    }
+
     fragment half4 displayFlowWarpYUVFragment(
         QuadVaryings in [[stage_in]],
         texture2d<half, access::sample> inPrevY [[texture(0)]],
         texture2d<half, access::sample> inPrevUV [[texture(1)]],
         texture2d<half, access::sample> inCurrY [[texture(2)]],
         texture2d<half, access::sample> inCurrUV [[texture(3)]],
-        texture2d<float, access::sample> inForwardFlow [[texture(4)]],
-        texture2d<float, access::sample> inBackwardFlow [[texture(5)]],
+        texture2d<half, access::sample> inMidFlowVis [[texture(4)]],
         constant FlowWarpUniforms& u [[buffer(0)]]
     ) {
         constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
@@ -508,7 +813,7 @@ final class MetalVideoEnhancer {
             half2 refUV = (t < 0.5f)
                 ? inPrevUV.sample(linearSampler, uv).rg
                 : inCurrUV.sample(linearSampler, uv).rg;
-            return half4(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), half(1.0h));
+            return finalizeFlowWarpRGBH(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), u);
         }
 
         float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
@@ -523,39 +828,34 @@ final class MetalVideoEnhancer {
                 half2 refUV = (t < 0.5f)
                     ? inPrevUV.sample(linearSampler, uv).rg
                     : inCurrUV.sample(linearSampler, uv).rg;
-                return half4(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), half(1.0h));
+                return finalizeFlowWarpRGBH(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), u);
             }
         }
 
-        half rawPrevCenter = toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange);
-        half rawCurrCenter = toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
-        half nearestY = (t < 0.5f) ? rawPrevCenter : rawCurrCenter;
-        float staticDiff = abs(float(rawPrevCenter) - float(rawCurrCenter));
-
-        float2 flowScale = float2(u.flowScaleX, u.flowScaleY);
         float2 flowStep = float2(u.flowTexelX, u.flowTexelY);
-        float2 f0 = inForwardFlow.sample(linearSampler, uv).rg * flowScale;
-        float2 b0 = inBackwardFlow.sample(linearSampler, uv).rg * flowScale;
-        if (!isfinite(f0.x) || !isfinite(f0.y)) { f0 = float2(0.0f); }
-        if (!isfinite(b0.x) || !isfinite(b0.y)) { b0 = float2(0.0f); }
+        float4 midNear = float4(inMidFlowVis.sample(nearestSampler, uv));
+        float4 midLin = float4(inMidFlowVis.sample(linearSampler, uv));
+        if (!isfinite(midNear.x) || !isfinite(midNear.y)) { midNear = float4(0.0f, 0.0f, (t < 0.5f ? 1.0f : 0.0f), (t < 0.5f ? 0.0f : 1.0f)); }
+        if (!isfinite(midLin.x) || !isfinite(midLin.y)) { midLin = midNear; }
 
-        // 零运动快速路径：静止区 5 次采样直出原画，跳过中点与遮挡搜索
-        if (dot(f0, f0) < 1.6e-7f && dot(b0, b0) < 1.6e-7f) {
-            half2 nearestUV = (t < 0.5f)
+        bool isBoundary = (length(midNear.rg - midLin.rg) > 0.0015f)
+            || (abs(midNear.b - midLin.b) > 0.15f)
+            || (abs(midNear.a - midLin.a) > 0.15f);
+
+        float2 bestFlow = isBoundary ? midNear.rg : midLin.rg;
+        float vis0 = isBoundary ? midNear.b : midLin.b;
+        float vis1 = isBoundary ? midNear.a : midLin.a;
+
+        // 零运动静止区 4 次采样直出原生 4K 像素
+        if (dot(bestFlow, bestFlow) < 1.6e-7f && vis0 > 0.5f && vis1 > 0.5f) {
+            half refY = (t < 0.5f)
+                ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
+                : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+            half2 refUV = (t < 0.5f)
                 ? inPrevUV.sample(linearSampler, uv).rg
                 : inCurrUV.sample(linearSampler, uv).rg;
-            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+            return finalizeFlowWarpRGBH(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), u);
         }
-
-        float2 uv0Rough = clamp(uv - t * f0, float2(0.0f), float2(1.0f));
-        float2 uv1Rough = clamp(uv - (1.0f - t) * b0, float2(0.0f), float2(1.0f));
-        float2 fRef = inForwardFlow.sample(linearSampler, uv0Rough).rg * flowScale;
-        float2 bRef = inBackwardFlow.sample(linearSampler, uv1Rough).rg * flowScale;
-        if (!isfinite(fRef.x) || !isfinite(fRef.y)) { fRef = f0; }
-        if (!isfinite(bRef.x) || !isfinite(bRef.y)) { bRef = b0; }
-
-        float2 bestFlow = 0.5f * (fRef - bRef);
-        float fbErr = length(fRef + bRef);
 
         float2 bestUV0Raw = uv - t * bestFlow;
         float2 bestUV1Raw = uv + (1.0f - t) * bestFlow;
@@ -565,27 +865,38 @@ final class MetalVideoEnhancer {
         half bestY1 = toUnitLumaH(inCurrY.sample(linearSampler, bestUV1).r, u.isVideoRange);
         float bestDiff = abs(float(bestY0) - float(bestY1));
 
-        // 仅在真正的高光度误差/双向不一致遮挡边缘触发离散候选（平顺高速运动零额外开销）
-        if (bestDiff > 0.026f || fbErr > 0.0045f) {
-            // 1. 静态零矢量候选（复用 center Y，0 额外采样）
-            if (staticDiff + 0.003f < bestDiff) {
+        // 边缘像素级离散吸附：在 Frame-t 边界区用 4K 自身亮度从 4 邻域与静态零矢量择优对齐，消除低分网格轮廓虚影
+        if (isBoundary || (vis0 > 0.5f && vis1 > 0.5f && bestDiff > 0.028f)) {
+            half rawPrevCenter = toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange);
+            half rawCurrCenter = toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+            float staticDiff = abs(float(rawPrevCenter) - float(rawCurrCenter));
+            if (staticDiff < 0.022f && staticDiff + 0.004f < bestDiff) {
                 bestDiff = staticDiff;
                 bestFlow = float2(0.0f);
+                vis0 = 1.0f;
+                vis1 = 1.0f;
                 bestUV0Raw = uv;
                 bestUV1Raw = uv;
                 bestUV0 = uv;
                 bestUV1 = uv;
                 bestY0 = rawPrevCenter;
                 bestY1 = rawCurrCenter;
-                fbErr = 0.0f;
             }
 
-            // 2. 单侧 fRef / -bRef 候选（0 额外光流采样，拯救单侧可见遮挡边）
-            if (bestDiff > 0.026f) {
-                float2 oneSided[2] = { fRef, -bRef };
-                for (int s = 0; s < 2; ++s) {
-                    float2 candFlow = oneSided[s];
-                    if (dot(candFlow, candFlow) > 0.0256f) { continue; }
+            if (bestDiff > 0.028f) {
+                float2 offsets[4] = {
+                    float2(-flowStep.x, 0.0f),
+                    float2( flowStep.x, 0.0f),
+                    float2(0.0f, -flowStep.y),
+                    float2(0.0f,  flowStep.y)
+                };
+                for (int k = 0; k < 4; ++k) {
+                    float2 nUV = clamp(uv + offsets[k], float2(0.0f), float2(1.0f));
+                    float4 candMid = float4(inMidFlowVis.sample(nearestSampler, nUV));
+                    if (!isfinite(candMid.x) || !isfinite(candMid.y)) { continue; }
+                    if (candMid.b <= 0.5f || candMid.a <= 0.5f) { continue; }
+                    float2 candFlow = candMid.rg;
+                    if (dot(candFlow, candFlow) > 0.0324f) { continue; }
                     float2 cuv0Raw = uv - t * candFlow;
                     float2 cuv1Raw = uv + (1.0f - t) * candFlow;
                     float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
@@ -593,9 +904,11 @@ final class MetalVideoEnhancer {
                     half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
                     half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
                     float candDiff = abs(float(cy0) - float(cy1));
-                    if (candDiff + 0.003f < bestDiff) {
+                    if (candDiff + 0.004f < bestDiff) {
                         bestDiff = candDiff;
                         bestFlow = candFlow;
+                        vis0 = candMid.b;
+                        vis1 = candMid.a;
                         bestUV0Raw = cuv0Raw;
                         bestUV1Raw = cuv1Raw;
                         bestUV0 = cuv0;
@@ -605,126 +918,48 @@ final class MetalVideoEnhancer {
                     }
                 }
             }
-
-            // 3. 中心 nearest 离散光流（避免线性过滤混叠前背景向量）
-            if (bestDiff > 0.032f) {
-                float2 fn = inForwardFlow.sample(nearestSampler, uv).rg * flowScale;
-                float2 bn = inBackwardFlow.sample(nearestSampler, uv).rg * flowScale;
-                if (isfinite(fn.x) && isfinite(fn.y)) {
-                    if (!isfinite(bn.x) || !isfinite(bn.y)) { bn = -fn; }
-                    float2 candFlow = 0.5f * (fn - bn);
-                    if (dot(candFlow, candFlow) <= 0.0256f) {
-                        float2 cuv0Raw = uv - t * candFlow;
-                        float2 cuv1Raw = uv + (1.0f - t) * candFlow;
-                        float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
-                        float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
-                        half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
-                        half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
-                        float candDiff = abs(float(cy0) - float(cy1));
-                        if (candDiff + 0.003f < bestDiff) {
-                            bestDiff = candDiff;
-                            bestFlow = candFlow;
-                            bestUV0Raw = cuv0Raw;
-                            bestUV1Raw = cuv1Raw;
-                            bestUV0 = cuv0;
-                            bestUV1 = cuv1;
-                            bestY0 = cy0;
-                            bestY1 = cy1;
-                            fbErr = length(fn + bn);
-                        }
-                    }
-                }
-            }
-
-            // 4. 主运动轴两侧 nearest 邻域锐选（仅极高误差边界执行）
-            if (bestDiff > 0.040f) {
-                float2 dom = (dot(bestFlow, bestFlow) > 1e-8f) ? bestFlow : f0;
-                float2 axisStep = (abs(dom.x) >= abs(dom.y))
-                    ? float2(flowStep.x, 0.0f)
-                    : float2(0.0f, flowStep.y);
-                for (int k = -1; k <= 1; k += 2) {
-                    float2 nUV = clamp(uv + float(k) * axisStep, float2(0.0f), float2(1.0f));
-                    float2 fn = inForwardFlow.sample(nearestSampler, nUV).rg * flowScale;
-                    float2 bn = inBackwardFlow.sample(nearestSampler, nUV).rg * flowScale;
-                    if (!isfinite(fn.x) || !isfinite(fn.y)) { continue; }
-                    if (!isfinite(bn.x) || !isfinite(bn.y)) { bn = -fn; }
-                    float2 candFlow = 0.5f * (fn - bn);
-                    if (dot(candFlow, candFlow) > 0.0256f) { continue; }
-                    float2 cuv0Raw = uv - t * candFlow;
-                    float2 cuv1Raw = uv + (1.0f - t) * candFlow;
-                    float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
-                    float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
-                    half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
-                    half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
-                    float candDiff = abs(float(cy0) - float(cy1));
-                    if (candDiff + 0.003f < bestDiff) {
-                        bestDiff = candDiff;
-                        bestFlow = candFlow;
-                        bestUV0Raw = cuv0Raw;
-                        bestUV1Raw = cuv1Raw;
-                        bestUV0 = cuv0;
-                        bestUV1 = cuv1;
-                        bestY0 = cy0;
-                        bestY1 = cy1;
-                        fbErr = length(fn + bn);
-                    }
-                }
-            }
-        }
-
-        // 静态背景零模糊保护：前景运动掠过导致误差高于原地静态差时，直接无损直出静态原始像素
-        if (staticDiff < 0.018f && bestDiff > 0.024f) {
-            half2 nearestUV = (t < 0.5f)
-                ? inPrevUV.sample(linearSampler, uv).rg
-                : inCurrUV.sample(linearSampler, uv).rg;
-            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
 
         float flowMag = length(bestFlow);
-        if (flowMag < 0.00025f) {
-            half2 nearestUV = (t < 0.5f)
+        if (flowMag > 0.18f) {
+            half refY = (t < 0.5f)
+                ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
+                : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+            half2 refUV = (t < 0.5f)
                 ? inPrevUV.sample(linearSampler, uv).rg
                 : inCurrUV.sample(linearSampler, uv).rg;
-            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
-        }
-        // 转场/极端运动保护：避免整帧撕裂重影，直接输出最近原生高分辨率参考帧
-        if (flowMag > 0.16f || (fbErr > 0.025f && bestDiff > 0.08f)) {
-            half2 nearestUV = (t < 0.5f)
-                ? inPrevUV.sample(linearSampler, uv).rg
-                : inCurrUV.sample(linearSampler, uv).rg;
-            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+            return finalizeFlowWarpRGBH(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), u);
         }
 
         bool oob0 = (bestUV0Raw.x < 0.0f || bestUV0Raw.x > 1.0f || bestUV0Raw.y < 0.0f || bestUV0Raw.y > 1.0f);
         bool oob1 = (bestUV1Raw.x < 0.0f || bestUV1Raw.x > 1.0f || bestUV1Raw.y < 0.0f || bestUV1Raw.y > 1.0f);
+
+        // 物理方向性可见性混合：前遮挡区全相位锁定 Frame 0，后露出区全相位锁定 Frame 1，彻底根除高刷 t<0.5 反转重影
+        float w1 = t;
+        if ((vis0 > 0.5f && vis1 <= 0.5f) || (oob1 && !oob0)) {
+            w1 = 0.0f;
+        } else if ((vis1 > 0.5f && vis0 <= 0.5f) || (oob0 && !oob1)) {
+            w1 = 1.0f;
+        } else {
+            float occConf = smoothstep(0.032f, 0.065f, bestDiff);
+            if (bestDiff > 0.065f) {
+                occConf = 1.0f;
+            }
+            float hardPick = (vis1 > vis0 + 0.05f) ? 1.0f : ((vis0 > vis1 + 0.05f) ? 0.0f : ((t < 0.5f) ? 0.0f : 1.0f));
+            w1 = mix(t, hardPick, occConf);
+        }
+
         float2 uv0 = bestUV0;
         float2 uv1 = bestUV1;
         half y0 = bestY0;
         half y1 = bestY1;
-        half2 c0 = inPrevUV.sample(linearSampler, uv0).rg;
-        half2 c1 = inCurrUV.sample(linearSampler, uv1).rg;
-
-        // 严格防人物虚影：将遮挡判定收紧至像素级尺度，遮挡区硬切换至单帧清晰像素（禁止 50/50 叠影）
-        float occConf = smoothstep(0.0025f, 0.0075f, fbErr) * 0.80f + smoothstep(0.022f, 0.055f, bestDiff);
-        if (bestDiff > 0.055f || fbErr > 0.0075f) {
-            occConf = 1.0f;
-        }
-        occConf = clamp(occConf, 0.0f, 1.0f);
-
-        float w1 = t;
-        if (oob0 && !oob1) {
-            w1 = 1.0f;
-        } else if (oob1 && !oob0) {
-            w1 = 0.0f;
-        } else {
-            float hardPick = (t < 0.5f) ? 0.0f : 1.0f;
-            w1 = mix(t, hardPick, occConf);
-        }
+        half2 c0 = (w1 < 0.999f) ? inPrevUV.sample(linearSampler, uv0).rg : half2(0.0h);
+        half2 c1 = (w1 > 0.001f) ? inCurrUV.sample(linearSampler, uv1).rg : half2(0.0h);
 
         half hw1 = half(w1);
         half hw0 = half(1.0h) - hw1;
         half yWarp = y0 * hw0 + y1 * hw1;
-        half2 cWarp = c0 * hw0 + c1 * hw1;
+        half2 cWarp = (w1 >= 0.999f) ? c1 : ((w1 <= 0.001f) ? c0 : (c0 * hw0 + c1 * hw1));
 
         if (u.deblurStrength > 0.001f || u.casStrength > 0.001f || u.lineDarken > 0.001f || u.clarityStrength > 0.001f) {
             float2 dx = float2(invWidth, 0.0f);
@@ -744,7 +979,7 @@ final class MetalVideoEnhancer {
             );
         }
 
-        return half4(yuvSampleToRGBH(yWarp, cWarp, u.isVideoRange, u.isBT601), half(1.0h));
+        return finalizeFlowWarpRGBH(yuvSampleToRGBH(yWarp, cWarp, u.isVideoRange, u.isBT601), u);
     }
 
     kernel void enhanceLuma(
@@ -881,7 +1116,7 @@ final class MetalVideoEnhancer {
         float2 normCoord = (float2(gid) + 0.5f) / float2(float(outColor.get_width()), float(outColor.get_height()));
         half2 uvRaw = inUV.sample(chromaSampler, normCoord).rg;
         half3 rgb = yuvSampleToRGBH(yUnit, uvRaw, u.isVideoRange, u.isBT601);
-        outColor.write(half4(rgb, 1.0h), gid);
+        outColor.write(finalizeEnhanceRGBH(rgb, u), gid);
     }
 
     inline float catmullRomWeight(float x) {
@@ -957,6 +1192,15 @@ final class MetalVideoEnhancer {
                 if let fn = library.makeFunction(name: "bicubicUpscaleBGRA") {
                     self.bicubicBGRAPipeline = try dev.makeComputePipelineState(function: fn)
                 }
+                if let fn = library.makeFunction(name: "clearSplatBuffers") {
+                    self.clearSplatBuffersPipeline = try dev.makeComputePipelineState(function: fn)
+                }
+                if let fn = library.makeFunction(name: "splatFlowToMidpoint") {
+                    self.splatFlowToMidpointPipeline = try dev.makeComputePipelineState(function: fn)
+                }
+                if let fn = library.makeFunction(name: "resolveMidpointFlowAndVisibility") {
+                    self.resolveMidpointFlowPipeline = try dev.makeComputePipelineState(function: fn)
+                }
 
                 if let vertexFn = library.makeFunction(name: "fullscreenQuadVertex") {
                     if let yuvFrag = library.makeFunction(name: "displayEnhanceYUVFragment") {
@@ -988,6 +1232,9 @@ final class MetalVideoEnhancer {
                 self.enhanceBGRAPipeline = nil
                 self.yuvToBGRAPipeline = nil
                 self.bicubicBGRAPipeline = nil
+                self.clearSplatBuffersPipeline = nil
+                self.splatFlowToMidpointPipeline = nil
+                self.resolveMidpointFlowPipeline = nil
                 self.displayYUVRenderPipeline = nil
                 self.displayBGRARenderPipeline = nil
                 self.displayFlowWarpYUVRenderPipeline = nil
@@ -1005,6 +1252,8 @@ final class MetalVideoEnhancer {
         scalerOutputTexture = nil
         scalerSignature = ""
         isUsingHardwareMetalFX = false
+        splatSlots.removeAll()
+        splatSlotCursor = 0
         activePipelineLabel = "关闭"
         averageProcessMs = 0
         enhancedFrameCount = 0
@@ -1167,6 +1416,113 @@ final class MetalVideoEnhancer {
         )
     }
 
+    private func ensureFlowSplatSlot(device: MTLDevice, width: Int, height: Int) -> FlowSplatSlot? {
+        let splatW = max(16, min(256, width))
+        let splatH = max(16, min(144, height))
+        if splatSlots.count == 3,
+           let first = splatSlots.first,
+           first.width == splatW,
+           first.height == splatH {
+            let slot = splatSlots[splatSlotCursor % 3]
+            splatSlotCursor &+= 1
+            return slot
+        }
+        splatSlots.removeAll()
+        let count = splatW * splatH
+        let byteCount = count * MemoryLayout<UInt32>.size
+        for _ in 0..<3 {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float,
+                width: splatW,
+                height: splatH,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead, .shaderWrite]
+            desc.storageMode = .private
+            guard let z0 = device.makeBuffer(length: byteCount, options: .storageModePrivate),
+                  let z1 = device.makeBuffer(length: byteCount, options: .storageModePrivate),
+                  let midTex = device.makeTexture(descriptor: desc) else {
+                splatSlots.removeAll()
+                return nil
+            }
+            splatSlots.append(
+                FlowSplatSlot(
+                    width: splatW,
+                    height: splatH,
+                    splatZ0: z0,
+                    splatZ1: z1,
+                    midFlowVisTexture: midTex
+                )
+            )
+        }
+        splatSlotCursor = 1
+        return splatSlots[0]
+    }
+
+    private func encodeMidpointFlowSplatting(
+        device: MTLDevice,
+        commandBuffer: MTLCommandBuffer,
+        forwardFlow fwdTex: MTLTexture,
+        backwardFlow bwdTex: MTLTexture,
+        phase: Float,
+        flowScaleX: Float,
+        flowScaleY: Float
+    ) -> MTLTexture? {
+        guard let clearPipeline = clearSplatBuffersPipeline,
+              let splatPipeline = splatFlowToMidpointPipeline,
+              let resolvePipeline = resolveMidpointFlowPipeline,
+              let slot = ensureFlowSplatSlot(device: device, width: fwdTex.width, height: fwdTex.height) else {
+            return nil
+        }
+
+        var u = MetalFlowSplatUniforms(
+            flowWidth: UInt32(slot.width),
+            flowHeight: UInt32(slot.height),
+            phase: max(0.0, min(1.0, phase)),
+            flowScaleX: flowScaleX,
+            flowScaleY: flowScaleY
+        )
+
+        let total = slot.width * slot.height
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(clearPipeline)
+            enc.setBuffer(slot.splatZ0, offset: 0, index: 0)
+            enc.setBuffer(slot.splatZ1, offset: 0, index: 1)
+            enc.setBytes(&u, length: MemoryLayout<MetalFlowSplatUniforms>.size, index: 2)
+            let tgW = max(1, min(256, clearPipeline.maxTotalThreadsPerThreadgroup))
+            enc.dispatchThreadgroups(
+                MTLSize(width: (total + tgW - 1) / tgW, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1)
+            )
+            enc.endEncoding()
+        }
+
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(splatPipeline)
+            enc.setTexture(fwdTex, index: 0)
+            enc.setTexture(bwdTex, index: 1)
+            enc.setBuffer(slot.splatZ0, offset: 0, index: 0)
+            enc.setBuffer(slot.splatZ1, offset: 0, index: 1)
+            enc.setBytes(&u, length: MemoryLayout<MetalFlowSplatUniforms>.size, index: 2)
+            dispatch2D(encoder: enc, pipeline: splatPipeline, width: slot.width, height: slot.height)
+            enc.endEncoding()
+        }
+
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(resolvePipeline)
+            enc.setTexture(fwdTex, index: 0)
+            enc.setTexture(bwdTex, index: 1)
+            enc.setBuffer(slot.splatZ0, offset: 0, index: 0)
+            enc.setBuffer(slot.splatZ1, offset: 0, index: 1)
+            enc.setTexture(slot.midFlowVisTexture, index: 2)
+            enc.setBytes(&u, length: MemoryLayout<MetalFlowSplatUniforms>.size, index: 2)
+            dispatch2D(encoder: enc, pipeline: resolvePipeline, width: slot.width, height: slot.height)
+            enc.endEncoding()
+        }
+
+        return slot.midFlowVisTexture
+    }
+
     private func renderFlowWarpedTexturesToLayerStatus(
         prevBuffer: CVPixelBuffer,
         currBuffer: CVPixelBuffer,
@@ -1188,7 +1544,8 @@ final class MetalVideoEnhancer {
     ) -> MetalDirectRenderResult {
         _ = outputFPS
         _ = thermalState
-        guard let commandQueue,
+        guard let device,
+              let commandQueue,
               let textureCache,
               let displayFlowWarpYUVRenderPipeline else {
             return .unavailable
@@ -1236,15 +1593,27 @@ final class MetalVideoEnhancer {
             return .unavailable
         }
 
+        let scaleX = flowSignX * (isNormalizedUV ? 1.0 : (1.0 / Float(max(1, flowW))))
+        let scaleY = flowSignY * (isNormalizedUV ? 1.0 : (1.0 / Float(max(1, flowH))))
+        guard let midFlowVis = encodeMidpointFlowSplatting(
+            device: device,
+            commandBuffer: commandBuffer,
+            forwardFlow: fwdTex,
+            backwardFlow: bwdTex,
+            phase: phase,
+            flowScaleX: scaleX,
+            flowScaleY: scaleY
+        ) else {
+            return .unavailable
+        }
+
         let params = (preset != .off && compareMode != .original)
             ? VideoEnhancementPlanner.parameters(for: preset, strength: strength)
             : VideoEnhancementPlanner.parameters(for: .off, strength: strength)
         let isVideoRange: UInt32 = (currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: currBuffer) ? 1 : 0
-        let texelW = 1.0 / Float(max(1, flowW))
-        let texelH = 1.0 / Float(max(1, flowH))
-        let scaleX = flowSignX * (isNormalizedUV ? 1.0 : texelW)
-        let scaleY = flowSignY * (isNormalizedUV ? 1.0 : texelH)
+        let texelW = 1.0 / Float(max(1, midFlowVis.width))
+        let texelH = 1.0 / Float(max(1, midFlowVis.height))
         var warpUniforms = MetalFlowWarpUniforms(
             phase: max(0.0, min(1.0, phase)),
             flowScaleX: scaleX,
@@ -1260,7 +1629,8 @@ final class MetalVideoEnhancer {
             isBT601: isBT601,
             compareMode: compareMode.uniformValue,
             splitX: 0.5,
-            isSceneCut: isSceneCut ? 1 : 0
+            isSceneCut: isSceneCut ? 1 : 0,
+            isPQTransfer: Self.isPQTransferBuffer(currBuffer) ? 1 : 0
         )
 
         let scaleVec = Self.aspectVertexScale(
@@ -1288,8 +1658,7 @@ final class MetalVideoEnhancer {
         renderEncoder.setFragmentTexture(prevUV, index: 1)
         renderEncoder.setFragmentTexture(currY, index: 2)
         renderEncoder.setFragmentTexture(currUV, index: 3)
-        renderEncoder.setFragmentTexture(fwdTex, index: 4)
-        renderEncoder.setFragmentTexture(bwdTex, index: 5)
+        renderEncoder.setFragmentTexture(midFlowVis, index: 4)
         renderEncoder.setFragmentBytes(&warpUniforms, length: MemoryLayout<MetalFlowWarpUniforms>.size, index: 0)
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         renderEncoder.endEncoding()
@@ -1315,7 +1684,7 @@ final class MetalVideoEnhancer {
         if snapMs > 0 {
             averageProcessMs = snapMs
         }
-        if enhancedFrameCount % 60 == 0 {
+        if enhancedFrameCount % 12 == 0 {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
         return .rendered
@@ -1359,7 +1728,16 @@ final class MetalVideoEnhancer {
               let prevUV = makeTexture(from: prevBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
               let currY = makeTexture(from: currBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
               let currUV = makeTexture(from: currBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
-              let commandBuffer = commandQueue.makeCommandBuffer() else {
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let midFlowVis = encodeMidpointFlowSplatting(
+                  device: device,
+                  commandBuffer: commandBuffer,
+                  forwardFlow: forwardFlowTexture,
+                  backwardFlow: backwardFlowTexture,
+                  phase: phase,
+                  flowScaleX: 1.0,
+                  flowScaleY: 1.0
+              ) else {
             return nil
         }
 
@@ -1367,8 +1745,8 @@ final class MetalVideoEnhancer {
             phase: max(0.0, min(1.0, phase)),
             flowScaleX: 1.0,
             flowScaleY: 1.0,
-            flowTexelX: 1.0 / Float(max(1, flowW)),
-            flowTexelY: 1.0 / Float(max(1, flowH)),
+            flowTexelX: 1.0 / Float(max(1, midFlowVis.width)),
+            flowTexelY: 1.0 / Float(max(1, midFlowVis.height)),
             deblurStrength: 0,
             casStrength: 0,
             lineDarken: 0,
@@ -1378,7 +1756,8 @@ final class MetalVideoEnhancer {
             isBT601: isBT601,
             compareMode: 0,
             splitX: 0.5,
-            isSceneCut: isSceneCut ? 1 : 0
+            isSceneCut: isSceneCut ? 1 : 0,
+            isPQTransfer: Self.isPQTransferBuffer(currBuffer) ? 1 : 0
         )
         var vertexUniforms = MetalDisplayVertexUniforms(scaleX: 1.0, scaleY: 1.0)
 
@@ -1397,8 +1776,7 @@ final class MetalVideoEnhancer {
         renderEncoder.setFragmentTexture(prevUV, index: 1)
         renderEncoder.setFragmentTexture(currY, index: 2)
         renderEncoder.setFragmentTexture(currUV, index: 3)
-        renderEncoder.setFragmentTexture(forwardFlowTexture, index: 4)
-        renderEncoder.setFragmentTexture(backwardFlowTexture, index: 5)
+        renderEncoder.setFragmentTexture(midFlowVis, index: 4)
         renderEncoder.setFragmentBytes(&warpUniforms, length: MemoryLayout<MetalFlowWarpUniforms>.size, index: 0)
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         renderEncoder.endEncoding()
@@ -1508,12 +1886,14 @@ final class MetalVideoEnhancer {
         let params = VideoEnhancementPlanner.parameters(for: preset, strength: strength)
         let isVideoRange: UInt32 = (pixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: sourceBuffer) ? 1 : 0
+        let isPQTransfer: UInt32 = Self.isPQTransferBuffer(sourceBuffer) ? 1 : 0
         let effectiveCompareUniform: UInt32 = useHighFPSNeutralCubic ? 3 : (isPassthroughDraw ? 2 : compareMode.uniformValue)
         var uniforms = makeUniforms(
             params: params,
             isVideoRange: isVideoRange,
             isBT601: isBT601,
-            compareUniform: effectiveCompareUniform
+            compareUniform: effectiveCompareUniform,
+            isPQTransfer: isPQTransfer
         )
 
         let scaleVec = Self.aspectVertexScale(
@@ -1559,7 +1939,8 @@ final class MetalVideoEnhancer {
                             params: params,
                             isVideoRange: isVideoRange,
                             isBT601: isBT601,
-                            compareUniform: 0
+                            compareUniform: 0,
+                            isPQTransfer: isPQTransfer
                         )
                         preEncoder.setComputePipelineState(yuvToBGRAPipeline)
                         preEncoder.setTexture(yTex, index: 0)
@@ -1607,6 +1988,7 @@ final class MetalVideoEnhancer {
                     if encodedScale {
                         renderedBGRAInput = upscaledTex
                         uniforms.isVideoRange = 0
+                        uniforms.isPQTransfer = 0
                         let prefix = isUsingHardwareMetalFX ? "MetalFX直绘" : "超分直绘"
                         nextLabel = "\(prefix) \(srcW)×\(srcH)→\(outDims.width)×\(outDims.height)"
                     }
@@ -1637,7 +2019,8 @@ final class MetalVideoEnhancer {
                                 params: params,
                                 isVideoRange: isVideoRange,
                                 isBT601: isBT601,
-                                compareUniform: 0
+                                compareUniform: 0,
+                                isPQTransfer: isPQTransfer
                             )
                             preEncoder.setComputePipelineState(yuvToBGRAPipeline)
                             preEncoder.setTexture(yTex, index: 0)
@@ -1679,7 +2062,8 @@ final class MetalVideoEnhancer {
                 params: restoreParams,
                 isVideoRange: isVideoRange,
                 isBT601: isBT601,
-                compareUniform: 0
+                compareUniform: 0,
+                isPQTransfer: isPQTransfer
             )
         }
 
@@ -1759,7 +2143,7 @@ final class MetalVideoEnhancer {
         if snapMs > 0 {
             averageProcessMs = snapMs
         }
-        if enhancedFrameCount % 60 == 0 {
+        if enhancedFrameCount % 12 == 0 {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
         return .rendered
@@ -1922,7 +2306,8 @@ final class MetalVideoEnhancer {
         params: VideoEnhancementParameters,
         isVideoRange: UInt32,
         isBT601: UInt32,
-        compareUniform: UInt32
+        compareUniform: UInt32,
+        isPQTransfer: UInt32 = 0
     ) -> MetalEnhanceUniforms {
         MetalEnhanceUniforms(
             deblurStrength: params.deblurStrength,
@@ -1934,7 +2319,7 @@ final class MetalVideoEnhancer {
             isBT601: isBT601,
             compareMode: compareUniform,
             splitX: 0.5,
-            padding: 0
+            isPQTransfer: isPQTransfer
         )
     }
 
@@ -1975,7 +2360,8 @@ final class MetalVideoEnhancer {
                 params: params,
                 isVideoRange: isVideoRange,
                 isBT601: isBT601,
-                compareUniform: 0
+                compareUniform: 0,
+                isPQTransfer: Self.isPQTransferBuffer(sourceBuffer) ? 1 : 0
             )
             preEncoder.setComputePipelineState(yuvToBGRAPipeline)
             preEncoder.setTexture(yTex, index: 0)
@@ -2268,6 +2654,14 @@ final class MetalVideoEnhancer {
             depth: 1
         )
         encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: tgSize)
+    }
+
+    nonisolated static func isPQTransferBuffer(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        guard let transfer = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String else {
+            return false
+        }
+        return transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+            || transfer.contains("2084")
     }
 
     private static func isBT601Matrix(on pixelBuffer: CVPixelBuffer) -> Bool {

@@ -2,6 +2,22 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.17] - 2026-11-29
+
+### 算法升级与内存专项治理 (Algorithm Upgrade & Memory Fixes)
+- **算法级根治高刷（60/96/120fps）「人物与运动物体边缘虚影」(`MetalVideoEnhancer`)**：
+  - 根因定位：此前的 `displayFlowWarpYUVFragment` 在未知中间时刻 `t` 的第 0/1 帧坐标系直接采样 `F` / `B` 光流并做 `0.5*(fRef - bRef)` 平均，在运动轮廓处形成半速光环；同时 `hardPick = (t < 0.5 ? 0 : 1)` 会在 `t=0.2/0.4` 对后方露出区错选第 0 帧、在 `t=0.6/0.8` 对前方遮挡区错选第 1 帧，帧率越高可见残影帧占比越多（4/5 帧）。
+  - 方案：在 GPU 上引入 3-Pass 轻量级 **中点时刻 Z-Order 前向泼溅 (`clearSplatBuffers` + `splatFlowToMidpoint` + `resolveMidpointFlowAndVisibility`)**，将第 0/1 帧向量按前景速度和无遮挡度从 `0/1` 投影至真实中间帧 `t` 坐标系并填充 `vis0 / vis1` 物理单向可见性；前后遮挡/露出区全相位严格锁定唯一无遮挡参考帧（不再按 `t<0.5` 反转），4K 边界再用 4 邻域 `nearest` + 静态矢量像素吸附对齐。
+- **根治「切换 1440×810 画质后内存飙升至 748MB」(`VTOpticalFlowEngine` + `MetalPyramidOpticalFlow` + `MetalVideoEnhancer` + `LocalHTTPStreamProxy`)**：
+  - `CVMetalTextureCacheFlush` 清洗周期由 `32/60` 加密至 `4 对光流 / 12 帧呈现`，立即释放滞留的视频解码 `IOSurface`。
+  - `VTOpticalFlowEngine` 收紧远端前向缓冲 `preferredForwardBufferDuration` 至 `10s`，`stop()` 移除 `AVPlayerItemVideoOutput` 并 `replaceCurrentItem(with: nil)`，并为 `1440×810` 等非 4K 原画 GPU 光流新增 `recommendedFlowWarpMetalMaxLongSide` 按原分辨率 `1440px` 封顶绘制，避免分配 `2560×1440` 三重画布。
+  - `LocalHTTPStreamProxy` 切流立即通过 `cancelActiveChunkCaches()` 终止残留 `UpstreamStreamRelay`/`ParallelChunkedStreamRelay` 连接并仅保留当前流 20MB (`10×2MB`) 缓存。
+- **增强「夸克 4K」HLS 分片 `HTTP 400` 恢复与 4K 超大文件自动降级能力 (`LocalHTTPStreamProxy` + `VTOpticalFlowEngine` + `LiquidGlassPlayerView`)**：
+  - 子分片遭遇 `HTTP 400/403` 时自动借助 `buildHLSSegmentRetryURL` 继承父 `.m3u8` 鉴权参数或剥离冗余 Cookie 执行 1 次无感重试；并发预取块升至 5 块 / 单块超时放宽至 20s。
+  - 修复 `OpticalFlowPlayerController.load(...)` 误清空 `onRemoteStreamFailed` / `onRemoteVideoTrackUnplayable` 回调导致 `-1001` 超时后自动切换清晰度完全不触发的问题，并按版本 ID 精确去重降级。
+- **修复 4K HDR10 (`SMPTE_ST_2084_PQ` + `420v`) 补帧与画质失效并消除双重 Seek 重置 (`VTOpticalFlowEngine` + `MetalVideoEnhancer`)**：
+  - 新增 `canUseMetalDirectPath` 放行 8-bit 420v/420f HDR10 走 GPU 光流变形与高刷直绘，并在 Metal 着色器内对 `SMPTE_ST_2084_PQ` 执行 PQ→SDR 709 色调映射，彻底解决 `60/96/120fps` 补帧帧无渲染的问题；同时守卫 `audioPlayer.seek` 完成回调仅在 `isSeekPending` 时清理一次时钟，杜绝双重跳变清空队列。
+
 ## [v0.1.0-beta.16] - 2026-11-29
 
 ### 修复与体验优化 (Fixed & Optimized)

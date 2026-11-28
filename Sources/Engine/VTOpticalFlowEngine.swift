@@ -165,6 +165,27 @@ final class SampleBufferDisplayContainerView: UIView {
         (outputFPS > 65.0 && !allowSpatialUpscale) ? 1600.0 : 2560.0
     }
 
+    /// 原画 GPU 光流变形绘制分辨率封顶：1440×810 等非 4K 转码流在不开启超分时按原分辨（至少 1280px）绘制，避免膨胀为 2560×1440 三重缓冲占用显存
+    nonisolated static func recommendedFlowWarpMetalMaxLongSide(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        outputFPS: Double,
+        hasQualityEnhancement: Bool
+    ) -> CGFloat {
+        _ = outputFPS
+        if hasQualityEnhancement {
+            return 2560.0
+        }
+        let longSide = max(sourceWidth, sourceHeight)
+        guard longSide > 0 else {
+            return 1920.0
+        }
+        if longSide >= 2560 {
+            return 2560.0
+        }
+        return CGFloat(max(1280, min(longSide, 2560)))
+    }
+
     func applyVideoTransform(_ transform: CGAffineTransform) {
         guard videoTransform != transform else { return }
         videoTransform = transform
@@ -2122,6 +2143,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         (0.004...0.5).contains(deltaSeconds)
     }
 
+    static func canUseMetalDirectPath(
+        isDolbyVision: Bool,
+        isHDRContent: Bool,
+        pixelFormat: OSType
+    ) -> Bool {
+        guard !isDolbyVision else { return false }
+        let is8BitBiPlanar = (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        return !isHDRContent || is8BitBiPlanar
+    }
+
     static func shouldDecayStaleOutputFPS(
         isRemoteStream: Bool,
         isPaused: Bool,
@@ -2259,7 +2291,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 20.0
+        item.preferredForwardBufferDuration = 10.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -2431,6 +2463,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     if self.onRemoteStreamFailed?(detail) == true {
                         return
                     }
+                    LocalHTTPStreamProxy.shared.cancelActiveChunkCaches()
+                    if let out = self.remoteVideoOutput {
+                        self.audioPlayer?.currentItem?.remove(out)
+                    }
+                    self.audioPlayer?.pause()
+                    self.audioPlayer?.replaceCurrentItem(with: nil)
                     self.isLoadingPipeline = false
                     self.pipelineStatusText = ""
                     self.isPaused = true
@@ -2600,7 +2638,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         streamLabel: String = "",
         isHLS: Bool = false
     ) {
-        stopInternal()
+        stopInternal(preservingCallbacks: true)
         currentURL = url
         let remoteStream = !url.isFileURL
         isRemoteStream = remoteStream
@@ -2994,16 +3032,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         guard let self,
                               self.remoteSeekGeneration == seekGen,
                               self.isTokenValid(token) else { return }
-                        if finished || self.remoteClockGuard.isSeekPending {
+                        if self.remoteClockGuard.isSeekPending {
                             self.remoteClockGuard.completeSeek()
+                            self.lastRemoteSamplePTS = -1
+                            self.lastRemoteClockPTS = -1
+                            self.lastRemotePresentedHostTime = 0
+                            self.clearBufferedFrames()
+                            self.remoteCadenceGuard.reset()
+                            self.remoteFlowWorker?.reset()
+                            self.flushPublishedTelemetryIfNeeded(force: true)
                         }
-                        self.lastRemoteSamplePTS = -1
-                        self.lastRemoteClockPTS = -1
-                        self.lastRemotePresentedHostTime = 0
-                        self.clearBufferedFrames()
-                        self.remoteCadenceGuard.reset()
-                        self.remoteFlowWorker?.reset()
-                        self.flushPublishedTelemetryIfNeeded(force: true)
                     }
                 }
             } else {
@@ -3104,11 +3142,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     func stop() {
-        stopInternal()
+        stopInternal(preservingCallbacks: false)
     }
 
     @MainActor
-    private func stopInternal() {
+    private func stopInternal(preservingCallbacks: Bool = false) {
         let hadActiveSession = (
             currentURL != nil
             || displayLink != nil
@@ -3125,7 +3163,11 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             audioPlayer?.removeTimeObserver(observer)
             timeObserver = nil
         }
+        if let out = remoteVideoOutput {
+            audioPlayer?.currentItem?.remove(out)
+        }
         audioPlayer?.pause()
+        audioPlayer?.replaceCurrentItem(with: nil)
         audioPlayer = nil
         syntheticClock.reset(to: 0)
         usesSyntheticClock = false
@@ -3191,8 +3233,10 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         remoteClockGuard.reset()
         remoteSeekGeneration &+= 1
         didLogFirstRemoteFrame = false
-        onRemoteVideoTrackUnplayable = nil
-        onRemoteStreamFailed = nil
+        if !preservingCallbacks {
+            onRemoteVideoTrackUnplayable = nil
+            onRemoteStreamFailed = nil
+        }
         currentHTTPHeaders = [:]
         if isRemoteStream {
             LocalHTTPStreamProxy.shared.cancelActiveChunkCaches()
@@ -4658,13 +4702,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             activeCompareMode = qualityCompareMode
         }
 
-        if !isDolbyVisionContent,
-           !isHDRContent,
+        if Self.canUseMetalDirectPath(
+            isDolbyVision: isDolbyVisionContent,
+            isHDRContent: isHDRContent,
+            pixelFormat: CVPixelBufferGetPixelFormatType(currBuffer)
+        ),
            let container = displayContainer {
             let liveOutputFPS = max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 60.0)
-            let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
+            let metalCap = SampleBufferDisplayContainerView.recommendedFlowWarpMetalMaxLongSide(
+                sourceWidth: CVPixelBufferGetWidth(currBuffer),
+                sourceHeight: CVPixelBufferGetHeight(currBuffer),
                 outputFPS: liveOutputFPS,
-                allowSpatialUpscale: true
+                hasQualityEnhancement: videoEnhancementPreset != .off
             )
             container.updateMetalMaxLongSide(metalCap)
             let status = metalEnhancer.renderFlowWarpedToLayerStatus(
@@ -4724,13 +4773,18 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             activeCompareMode = qualityCompareMode
         }
 
-        if !isDolbyVisionContent,
-           !isHDRContent,
+        if Self.canUseMetalDirectPath(
+            isDolbyVision: isDolbyVisionContent,
+            isHDRContent: isHDRContent,
+            pixelFormat: CVPixelBufferGetPixelFormatType(currBuffer)
+        ),
            let container = displayContainer {
             let liveOutputFPS = max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 60.0)
-            let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
+            let metalCap = SampleBufferDisplayContainerView.recommendedFlowWarpMetalMaxLongSide(
+                sourceWidth: CVPixelBufferGetWidth(currBuffer),
+                sourceHeight: CVPixelBufferGetHeight(currBuffer),
                 outputFPS: liveOutputFPS,
-                allowSpatialUpscale: true
+                hasQualityEnhancement: videoEnhancementPreset != .off
             )
             container.updateMetalMaxLongSide(metalCap)
             let status = metalEnhancer.renderFlowWarpedToLayerStatus(
@@ -4784,8 +4838,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         let origLong = max(videoWidth, videoHeight)
         let isDownsampledOpticalFlow = isInterpolationEnabled && origLong > 0 && (bufLong * 100 < origLong * 85)
 
-        let wantsHighFPSMetalPassthrough = !isDolbyVisionContent
-            && !isHDRContent
+        let allowMetalBuffer = Self.canUseMetalDirectPath(
+            isDolbyVision: isDolbyVisionContent,
+            isHDRContent: isHDRContent,
+            pixelFormat: CVPixelBufferGetPixelFormatType(buffer)
+        )
+        let wantsHighFPSMetalPassthrough = allowMetalBuffer
             && isInterpolationEnabled
             && (isDownsampledOpticalFlow || effectiveTargetFPS == .fps60 || effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
 
@@ -4800,8 +4858,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 thermalState: thermalNow
             )
 
-            if !isDolbyVisionContent,
-               !isHDRContent,
+            if allowMetalBuffer,
                (activeCompareMode != .original || wantsHighFPSMetalPassthrough),
                let container = displayContainer {
                 let allowMetalCapRaise = (videoEnhancementPreset == .lowResSuperRes && upscaleBudget.allowSpatialUpscale)

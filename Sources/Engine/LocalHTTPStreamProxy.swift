@@ -11,8 +11,21 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let upstreamURL: URL
         var headers: [String: String]
         let isHLS: Bool
+        var fallbackQuery: String? = nil
+        var isSubResource: Bool = false
         let onCookieUpdate: (@Sendable (String) -> Void)?
         let onLog: (@Sendable (String) -> Void)?
+    }
+
+    static var maxCachedChunksPolicy: Int {
+        ProxyRouteChunkCache.maxCachedChunks
+    }
+
+    private final class WeakStreamRelayBox: @unchecked Sendable {
+        weak var relay: (any CancellableProxyRelay)?
+        init(_ relay: any CancellableProxyRelay) {
+            self.relay = relay
+        }
     }
 
     private let lock = NSLock()
@@ -23,6 +36,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     private var routeNormalLogCounts: [String: Int] = [:]
     private var chunkCaches: [String: ProxyRouteChunkCache] = [:]
     private var chunkCacheOrder: [String] = []
+    private var activeRelays: [ObjectIdentifier: WeakStreamRelayBox] = [:]
 
     private init() {}
 
@@ -164,7 +178,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                         }
                     )
                     chunkCacheOrder.append(cacheKey)
-                    while chunkCacheOrder.count > 2 {
+                    while chunkCacheOrder.count > 1 {
                         let oldestKey = chunkCacheOrder.removeFirst()
                         if let removed = chunkCaches.removeValue(forKey: oldestKey) {
                             evictedCaches.append(removed)
@@ -185,6 +199,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     func registerSubResource(
         url: URL,
         inheritingFrom route: ProxyRoute,
+        fallbackQuery: String? = nil,
         port: UInt16
     ) -> URL {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
@@ -199,6 +214,8 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             upstreamURL: url,
             headers: route.headers,
             isHLS: ext.lowercased() == "m3u8",
+            fallbackQuery: fallbackQuery,
+            isSubResource: true,
             onCookieUpdate: route.onCookieUpdate,
             onLog: route.onLog
         )
@@ -211,9 +228,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let caches = Array(chunkCaches.values)
         chunkCaches.removeAll()
         chunkCacheOrder.removeAll()
+        let relays = activeRelays.values.compactMap(\.relay)
+        activeRelays.removeAll()
         lock.unlock()
         for cache in caches {
             cache.invalidate()
+        }
+        for relay in relays {
+            relay.cancelRelay()
         }
     }
 
@@ -224,9 +246,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let caches = Array(chunkCaches.values)
         chunkCaches.removeAll()
         chunkCacheOrder.removeAll()
+        let relays = activeRelays.values.compactMap(\.relay)
+        activeRelays.removeAll()
         lock.unlock()
         for cache in caches {
             cache.invalidate()
+        }
+        for relay in relays {
+            relay.cancelRelay()
         }
     }
 
@@ -240,11 +267,24 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let caches = Array(chunkCaches.values)
         chunkCaches.removeAll()
         chunkCacheOrder.removeAll()
+        let relays = activeRelays.values.compactMap(\.relay)
+        activeRelays.removeAll()
         lock.unlock()
         for cache in caches {
             cache.invalidate()
         }
+        for relay in relays {
+            relay.cancelRelay()
+        }
         active?.cancel()
+    }
+
+    private func trackRelay(_ relay: any CancellableProxyRelay) {
+        let key = ObjectIdentifier(relay)
+        lock.lock()
+        activeRelays = activeRelays.filter { $0.value.relay != nil }
+        activeRelays[key] = WeakStreamRelayBox(relay)
+        lock.unlock()
     }
 
     private func chunkCache(for route: ProxyRoute) -> ProxyRouteChunkCache? {
@@ -355,6 +395,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                     self?.emitRouteLog(token: token, route: matchedRoute, important: important, message: msg)
                 }
             )
+            trackRelay(parallelRelay)
             parallelRelay.start()
             return
         }
@@ -363,8 +404,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         if isManifest && parsed.method != "HEAD" {
             manifestRewriter = { [weak self] (rawManifest: String, resolvedBaseURL: URL) -> String in
                 guard let self else { return rawManifest }
+                let parentQuery = resolvedBaseURL.query
                 return Self.rewriteHLSManifest(rawManifest, baseURL: resolvedBaseURL) { childURL in
-                    self.registerSubResource(url: childURL, inheritingFrom: matchedRoute, port: activePort)
+                    self.registerSubResource(
+                        url: childURL,
+                        inheritingFrom: matchedRoute,
+                        fallbackQuery: parentQuery,
+                        port: activePort
+                    )
                 }
             }
         } else {
@@ -373,11 +420,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         let matchedCache = isManifest ? nil : chunkCache(for: matchedRoute)
         let streamRelay = UpstreamStreamRelay(
             connection: connection,
+            upstreamURL: matchedRoute.upstreamURL,
             headers: matchedRoute.headers,
             rangeHeader: parsed.rangeHeader,
             requestMethod: parsed.method,
             upstreamHost: upstreamHost,
             enableMP4HEV1Patch: parsed.method != "HEAD",
+            isSubResource: matchedRoute.isSubResource,
+            fallbackQuery: matchedRoute.fallbackQuery,
             chunkCache: matchedCache,
             hlsManifestRewriter: manifestRewriter,
             onResponse: { [weak self] http in
@@ -387,6 +437,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
                 self?.emitRouteLog(token: token, route: matchedRoute, important: important, message: msg)
             }
         )
+        trackRelay(streamRelay)
         streamRelay.start(with: upstreamReq)
     }
 
@@ -416,7 +467,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         if !important {
             lock.lock()
             let count = routeNormalLogCounts[token, default: 0]
-            if count >= 2 {
+            if count >= 5 {
                 lock.unlock()
                 return
             }
@@ -528,6 +579,17 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         return order.compactMap { k in map[k].map { "\(k)=\($0)" } }.joined(separator: "; ")
     }
 
+    static func buildHLSSegmentRetryURL(originalURL: URL, fallbackQuery: String?) -> URL? {
+        guard originalURL.query?.isEmpty != false,
+              let rawQuery = fallbackQuery?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawQuery.isEmpty else {
+            return nil
+        }
+        var comps = URLComponents(url: originalURL, resolvingAgainstBaseURL: false)
+        comps?.percentEncodedQuery = rawQuery
+        return comps?.url
+    }
+
     static func rewriteHLSManifest(
         _ manifest: String,
         baseURL: URL,
@@ -535,7 +597,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
     ) -> String {
         let lines = manifest.components(separatedBy: .newlines)
         let rewritten = lines.map { line -> String in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return line }
             if trimmed.hasPrefix("#") {
                 return rewriteURIAttributes(inTagLine: line, baseURL: baseURL, rewriteURL: rewriteURL)
@@ -911,6 +973,10 @@ struct MP4HEV1StreamPatcher: Sendable {
     }
 }
 
+private protocol CancellableProxyRelay: AnyObject, Sendable {
+    func cancelRelay()
+}
+
 private protocol ProxySessionTaskHandler: AnyObject, Sendable {
     func handleRedirect(newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void)
     func handleResponse(_ response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void)
@@ -930,7 +996,7 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
         config.timeoutIntervalForResource = 1800
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 10
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
@@ -998,15 +1064,18 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
     }
 }
 
-private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sendable {
+private final class UpstreamStreamRelay: ProxySessionTaskHandler, CancellableProxyRelay, @unchecked Sendable {
     private static let maxManifestBytes: Int = 4 * 1024 * 1024
 
     private let connection: NWConnection
+    private let upstreamURL: URL
     private let headers: [String: String]
     private let rangeHeader: String?
     private let requestMethod: String
     private let upstreamHost: String
     private let enableMP4HEV1Patch: Bool
+    private let isSubResource: Bool
+    private let fallbackQuery: String?
     private weak var chunkCache: ProxyRouteChunkCache?
     private let hlsManifestRewriter: (@Sendable (String, URL) -> String)?
     private let onResponse: @Sendable (HTTPURLResponse) -> Void
@@ -1016,6 +1085,7 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
     private var dataTask: URLSessionDataTask?
     private var didFinish = false
     private var didSendHeaders = false
+    private var subResourceRetryAttempt = 0
     private var shouldPatchMP4Stream = false
     private var mp4Patcher = MP4HEV1StreamPatcher()
     private var isBufferingManifest = false
@@ -1030,26 +1100,37 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
 
     init(
         connection: NWConnection,
+        upstreamURL: URL,
         headers: [String: String],
         rangeHeader: String?,
         requestMethod: String = "GET",
         upstreamHost: String = "upstream",
         enableMP4HEV1Patch: Bool = true,
+        isSubResource: Bool = false,
+        fallbackQuery: String? = nil,
         chunkCache: ProxyRouteChunkCache? = nil,
         hlsManifestRewriter: (@Sendable (String, URL) -> String)? = nil,
         onResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
         onLog: @escaping @Sendable (Bool, String) -> Void
     ) {
         self.connection = connection
+        self.upstreamURL = upstreamURL
         self.headers = headers
         self.rangeHeader = rangeHeader
         self.requestMethod = requestMethod
         self.upstreamHost = upstreamHost
         self.enableMP4HEV1Patch = enableMP4HEV1Patch
+        self.isSubResource = isSubResource
+        self.fallbackQuery = fallbackQuery
         self.chunkCache = chunkCache
         self.hlsManifestRewriter = hlsManifestRewriter
         self.onResponse = onResponse
         self.onLog = onLog
+    }
+
+    func cancelRelay() {
+        cancelAll()
+        connection.cancel()
     }
 
     func start(with request: URLRequest) {
@@ -1103,6 +1184,59 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         completionHandler(next)
     }
 
+    private func retrySubResourceOnce(failedStatus: Int, responseURL: URL?) {
+        let baseTarget = responseURL ?? upstreamURL
+        let retryURL = LocalHTTPStreamProxy.buildHLSSegmentRetryURL(
+            originalURL: baseTarget,
+            fallbackQuery: fallbackQuery
+        )
+        let targetURL = retryURL ?? baseTarget
+        let strippedCookie = (retryURL == nil)
+
+        var req = URLRequest(url: targetURL, timeoutInterval: 12)
+        req.httpMethod = requestMethod
+        for (k, v) in headers {
+            if strippedCookie && k.caseInsensitiveCompare("Cookie") == .orderedSame {
+                continue
+            }
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        if let rangeHeader {
+            req.setValue(rangeHeader, forHTTPHeaderField: "Range")
+        }
+
+        lock.lock()
+        guard !didFinish else {
+            lock.unlock()
+            return
+        }
+        let prevTask = dataTask
+        dataTask = nil
+        subResourceRetryAttempt = 1
+        didSendHeaders = false
+        isBufferingManifest = false
+        manifestData.removeAll(keepingCapacity: false)
+        manifestHeaderPacket = nil
+        lock.unlock()
+
+        if let prevTask {
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: prevTask.taskIdentifier)
+            prevTask.cancel()
+        }
+
+        onLog(true, "[proxy][retry] HLS分片 HTTP \(failedStatus) 自动重试 (appendQuery=\(retryURL != nil), stripCookie=\(strippedCookie))")
+        let nextTask = ProxyUpstreamSessionPool.shared.startTask(with: req, handler: self)
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: nextTask.taskIdentifier)
+            nextTask.cancel()
+            return
+        }
+        self.dataTask = nextTask
+        lock.unlock()
+    }
+
     func handleResponse(
         _ response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
@@ -1111,6 +1245,19 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
             completionHandler(.cancel)
             connection.cancel()
             return
+        }
+        if isSubResource && (http.statusCode == 400 || http.statusCode == 403) {
+            lock.lock()
+            let canRetry = !didFinish && subResourceRetryAttempt == 0
+            if canRetry {
+                subResourceRetryAttempt = 1
+            }
+            lock.unlock()
+            if canRetry {
+                completionHandler(.cancel)
+                retrySubResourceOnce(failedStatus: http.statusCode, responseURL: http.url)
+                return
+            }
         }
         onResponse(http)
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
@@ -1510,8 +1657,8 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
 
 private final class ProxyRouteChunkCache: @unchecked Sendable {
     static let chunkSize: Int = 2 * 1024 * 1024
-    static let maxCachedChunks: Int = 16
-    static let prefetchAheadCount: Int = 3
+    static let maxCachedChunks: Int = 10
+    static let prefetchAheadCount: Int = 5
 
     private let upstreamURL: URL
     private let onCookieResponse: @Sendable (HTTPURLResponse) -> Void
@@ -1676,7 +1823,7 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         let currentHeaders = headers
         lock.unlock()
 
-        var req = URLRequest(url: upstreamURL, timeoutInterval: 15)
+        var req = URLRequest(url: upstreamURL, timeoutInterval: 20)
         req.httpMethod = "GET"
         for (k, v) in currentHeaders {
             req.setValue(v, forHTTPHeaderField: k)
@@ -1759,7 +1906,7 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
     }
 }
 
-private final class ParallelChunkedStreamRelay: @unchecked Sendable {
+private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecked Sendable {
     private let connection: NWConnection
     private let chunkCache: ProxyRouteChunkCache
     private let rangeStart: Int64
@@ -1844,6 +1991,11 @@ private final class ParallelChunkedStreamRelay: @unchecked Sendable {
         isCancelled = true
         selfRetain = nil
         lock.unlock()
+    }
+
+    func cancelRelay() {
+        markCancelledAndRelease()
+        connection.cancel()
     }
 
     private func readCancelled() -> Bool {

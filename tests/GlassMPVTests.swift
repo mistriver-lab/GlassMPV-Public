@@ -3939,4 +3939,263 @@ final class GlassMPVTests: XCTestCase {
             )
         )
     }
+
+    func testMetalPyramidMidpointSplattingZeroGhostAcross120FPSPhases() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            return
+        }
+        let width = 640
+        let height = 360
+        let ioAttrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        func makeFullRangeBuffer() throws -> CVPixelBuffer {
+            var pb: CVPixelBuffer?
+            let st = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                ioAttrs as CFDictionary,
+                &pb
+            )
+            XCTAssertEqual(st, kCVReturnSuccess)
+            return try XCTUnwrap(pb)
+        }
+
+        func fillSilhouette(_ buf: CVPixelBuffer, centerX: Float, centerY: Float) {
+            CVPixelBufferLockBaseAddress(buf, [])
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            let yBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+            let uvBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 1)
+            let uvW = CVPixelBufferGetWidthOfPlane(buf, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(buf, 1)
+            if let yPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 0)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let dx = Float(x) - centerX
+                        let dy = Float(y) - centerY
+                        let val: Float
+                        if abs(dx) <= 80.0 && abs(dy) <= 60.0 {
+                            let nx = dx / 80.0
+                            let ny = dy / 60.0
+                            val = 185.0 + 30.0 * (nx * 0.65 - ny * 0.35)
+                        } else {
+                            val = 30.0 + 8.0 * sin(Float(x) * 0.05) * cos(Float(y) * 0.05)
+                        }
+                        yPtr[y * yBPR + x] = UInt8(max(0, min(255, Int(val.rounded()))))
+                    }
+                }
+            }
+            if let uvPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 1)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<uvH {
+                    for x in 0..<uvW {
+                        uvPtr[y * uvBPR + x * 2] = 128
+                        uvPtr[y * uvBPR + x * 2 + 1] = 128
+                    }
+                }
+            }
+        }
+
+        let prevBuf = try makeFullRangeBuffer()
+        let currBuf = try makeFullRangeBuffer()
+        fillSilhouette(prevBuf, centerX: 248, centerY: 180)
+        fillSilhouette(currBuf, centerX: 288, centerY: 180)
+
+        let flowEngine = MetalPyramidOpticalFlowEngine()
+        XCTAssertNil(flowEngine.shaderInitError)
+        let flowRaw = await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: currBuf)
+        let flowResult = try XCTUnwrap(flowRaw)
+
+        let prevBox = RemoteSendablePixelBuffer(buffer: prevBuf)
+        let currBox = RemoteSendablePixelBuffer(buffer: currBuf)
+        let fwdBox = flowResult.forwardFlow
+        let bwdBox = flowResult.backwardFlow
+
+        for phase in [Float(0.2), Float(0.4), Float(0.6), Float(0.8)] {
+            let warpedBGRA: [UInt8] = try await MainActor.run {
+                let enhancer = MetalVideoEnhancer()
+                XCTAssertNil(enhancer.shaderInitError)
+                return try XCTUnwrap(
+                    enhancer.renderFlowWarpedOffscreenForTesting(
+                        prevBuffer: prevBox.buffer,
+                        currBuffer: currBox.buffer,
+                        forwardFlowTexture: fwdBox.texture,
+                        backwardFlowTexture: bwdBox.texture,
+                        phase: phase,
+                        isSceneCut: false
+                    )
+                )
+            }
+
+            let leftEdge = Int((168.0 + 40.0 * Double(phase)).rounded())
+            let rightEdge = Int((328.0 + 40.0 * Double(phase)).rounded())
+            let centerX = Int((248.0 + 40.0 * Double(phase)).rounded())
+
+            // 1. 运动物体中心保持清晰高亮
+            var centerSum = 0.0
+            var centerCnt = 0
+            for y in 150..<210 {
+                for x in (centerX - 10)..<(centerX + 10) {
+                    centerSum += Double(warpedBGRA[(y * width + x) * 4 + 1])
+                    centerCnt += 1
+                }
+            }
+            XCTAssertGreaterThan(centerSum / Double(max(1, centerCnt)), 155.0, "phase=\(phase) 运动前景中心需精确随动")
+
+            // 2. 右侧前遮挡静态背景（curr 已被人物吞没，prev 仍清晰）：即便在 phase=0.6/0.8 也必须取 prev 清晰背景
+            if rightEdge + 5 < 366 {
+                var leadSum = 0.0
+                var leadCnt = 0
+                for y in 140..<220 {
+                    for x in (rightEdge + 4)..<366 {
+                        leadSum += Double(warpedBGRA[(y * width + x) * 4 + 1])
+                        leadCnt += 1
+                    }
+                }
+                XCTAssertLessThan(leadSum / Double(max(1, leadCnt)), 55.0, "phase=\(phase) 右前沿遮挡区不得出现前景反叠重影")
+            }
+
+            // 3. 左侧后露出静态背景（prev 曾被人物遮挡，curr 已露出背景）：即便在 phase=0.2/0.4 也必须取 curr 清晰背景
+            if 170 < leftEdge - 4 {
+                var trailSum = 0.0
+                var trailCnt = 0
+                for y in 140..<220 {
+                    for x in 170..<(leftEdge - 4) {
+                        trailSum += Double(warpedBGRA[(y * width + x) * 4 + 1])
+                        trailCnt += 1
+                    }
+                }
+                XCTAssertLessThan(trailSum / Double(max(1, trailCnt)), 55.0, "phase=\(phase) 左后沿露出区不得出现残留半透明虚影")
+            }
+
+            // 4. 边界锐度检查
+            var maxEdgeStep = 0
+            for y in 140..<220 {
+                for x in (rightEdge - 10)..<(rightEdge + 10) {
+                    let lumA = Int(warpedBGRA[(y * width + x) * 4 + 1])
+                    let lumB = Int(warpedBGRA[(y * width + x + 2) * 4 + 1])
+                    maxEdgeStep = max(maxEdgeStep, abs(lumA - lumB))
+                }
+            }
+            XCTAssertGreaterThanOrEqual(maxEdgeStep, 90, "phase=\(phase) 运动轮廓边界必须保持陡峭清晰")
+        }
+    }
+
+    func testMemoryGuardsDrawableCapAndHLSSegment400RetryURL() {
+        // 1. 1440×810 无画质增强不膨胀 2560px 画布，4K 保持 2560px
+        XCTAssertEqual(
+            SampleBufferDisplayContainerView.recommendedFlowWarpMetalMaxLongSide(
+                sourceWidth: 1440,
+                sourceHeight: 810,
+                outputFPS: 120.0,
+                hasQualityEnhancement: false
+            ),
+            1440.0
+        )
+        XCTAssertEqual(
+            SampleBufferDisplayContainerView.recommendedFlowWarpMetalMaxLongSide(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                outputFPS: 120.0,
+                hasQualityEnhancement: false
+            ),
+            2560.0
+        )
+        XCTAssertEqual(
+            SampleBufferDisplayContainerView.recommendedFlowWarpMetalMaxLongSide(
+                sourceWidth: 1440,
+                sourceHeight: 810,
+                outputFPS: 120.0,
+                hasQualityEnhancement: true
+            ),
+            2560.0
+        )
+
+        // 2. 分块 LRU 内存上限收缩至 <= 10 chunks (20MB)
+        XCTAssertLessThanOrEqual(LocalHTTPStreamProxy.maxCachedChunksPolicy, 10)
+
+        // 3. HLS .ts 分片 HTTP 400 重试 URL 补全父清单鉴权参数
+        let tsNoQuery = URL(string: "https://video-play-h-zb.drive.quark.cn/abc/media-0.ts")!
+        let retried = LocalHTTPStreamProxy.buildHLSSegmentRetryURL(
+            originalURL: tsNoQuery,
+            fallbackQuery: "auth_key=1764000-0-0-deadbeef&di=test"
+        )
+        XCTAssertEqual(retried?.absoluteString, "https://video-play-h-zb.drive.quark.cn/abc/media-0.ts?auth_key=1764000-0-0-deadbeef&di=test")
+
+        let tsWithQuery = URL(string: "https://video-play-h-zb.drive.quark.cn/abc/media-0.ts?sign=xyz")!
+        XCTAssertNil(
+            LocalHTTPStreamProxy.buildHLSSegmentRetryURL(
+                originalURL: tsWithQuery,
+                fallbackQuery: "auth_key=1764000"
+            )
+        )
+    }
+
+    @MainActor
+    func testHDR10EightBitMetalPathAndLoadPreservesFallbackCallbacks() {
+        // 1. 8-bit 420v/420f HDR10 允许走 Metal 直绘/光流变形并触发内置 PQ Tone-Mapping；10-bit 与杜比视界保持直通边界
+        XCTAssertTrue(
+            OpticalFlowPlayerController.canUseMetalDirectPath(
+                isDolbyVision: false,
+                isHDRContent: true,
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            )
+        )
+        XCTAssertTrue(
+            OpticalFlowPlayerController.canUseMetalDirectPath(
+                isDolbyVision: false,
+                isHDRContent: true,
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            )
+        )
+        XCTAssertFalse(
+            OpticalFlowPlayerController.canUseMetalDirectPath(
+                isDolbyVision: false,
+                isHDRContent: true,
+                pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            )
+        )
+        XCTAssertFalse(
+            OpticalFlowPlayerController.canUseMetalDirectPath(
+                isDolbyVision: true,
+                isHDRContent: true,
+                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            )
+        )
+        XCTAssertTrue(
+            OpticalFlowPlayerController.canUseMetalDirectPath(
+                isDolbyVision: false,
+                isHDRContent: false,
+                pixelFormat: kCVPixelFormatType_32BGRA
+            )
+        )
+
+        // 2. load() 切换流前只应清理播放器实例，绝不能抹除上层挂载的自动降级回调；stop() 退出才全清
+        let controller = OpticalFlowPlayerController()
+        var streamFailedFired = false
+        var trackUnplayableFired = false
+        controller.onRemoteStreamFailed = { _ in streamFailedFired = true }
+        controller.onRemoteVideoTrackUnplayable = { _ in trackUnplayableFired = true }
+
+        controller.load(
+            url: URL(string: "https://example.com/test_4k.mp4")!,
+            spatial2x: false,
+            targetFPS: .fps60,
+            autoPlay: false,
+            enableInterpolation: true
+        )
+        XCTAssertNotNil(controller.onRemoteStreamFailed, "load() 切换清晰度时必须保留 onRemoteStreamFailed 自动降级回调")
+        XCTAssertNotNil(controller.onRemoteVideoTrackUnplayable, "load() 切换清晰度时必须保留 onRemoteVideoTrackUnplayable 回调")
+        controller.onRemoteStreamFailed?("probe")
+        controller.onRemoteVideoTrackUnplayable?("probe")
+        XCTAssertTrue(streamFailedFired)
+        XCTAssertTrue(trackUnplayableFired)
+
+        controller.stop()
+        XCTAssertNil(controller.onRemoteStreamFailed, "stop() 销毁播放会话时才应释放回调")
+        XCTAssertNil(controller.onRemoteVideoTrackUnplayable, "stop() 销毁播放会话时才应释放回调")
+    }
 }

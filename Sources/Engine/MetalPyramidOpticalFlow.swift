@@ -649,7 +649,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
             statsEnc.endEncoding()
         }
 
-        if ringCursor % 32 == 0 {
+        if ringCursor % 4 == 0 {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
 

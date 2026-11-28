@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.16"
+    static let releaseTag = "0.1.0-beta.17"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,16 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.17",
+            date: "2026-11-29",
+            highlights: [
+                "算法级根治 120fps「人物与运动边缘虚影」：升级「中点时刻 Z-Order 前向泼溅 (Midpoint Splatting) + 真方向性可见性遮罩 (vis0, vis1)」+ 边界像素吸附，彻底消灭以 0/1 帧网格互采导致的半透明轮廓及 t<0.5 错选被遮挡帧的双边残影",
+                "根治「切换画质 1440×810 后内存飙升至 748MB 与卡顿掉帧」：1440×810 原画 GPU 光流不再膨胀 2560px 画布、Metal 纹理缓存清洗频次加密（4对/12帧及时归还视频解码 IOSurface）、切流即时取消旧 HTTP 代理在途连接与收缩 LRU 缓冲、停播移除 output 并清空 AVPlayerItem",
+                "彻底修复 4K HDR10 (`SMPTE_ST_2084_PQ` / `420v`) 60/96/120fps 补帧不生效问题：放行 8-bit 420v/420f HDR10 走 Metal 直绘/光流变形并内置 PQ→SDR 709 色调映射，同时修复重复 seek 时钟二次清零导致的瞬时掉帧",
+                "修复超大 4K 原盘 (-1001 超时) 自动降级与「夸克 4K」HLS 分片 HTTP 400 失效问题：load() 切换清晰度保留自动降级回调、按版本 ID 去重防止漏切换、代理预取升至 5 并发 (20s 超时) 且分片 400/403 自动补全父清单鉴权参数单次重试"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.16",
             date: "2026-11-29",
