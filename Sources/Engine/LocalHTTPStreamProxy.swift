@@ -119,10 +119,14 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
             let urlLower = url.absoluteString.lowercased()
             let rawExt = url.pathExtension
-            let resolvedIsHLS = isHLS || rawExt.lowercased() == "m3u8" || urlLower.contains(".m3u8")
+            let urlLooksLikeM3U8 = (rawExt.lowercased() == "m3u8" || urlLower.contains(".m3u8"))
+            let resolvedIsHLS = isHLS || urlLooksLikeM3U8
             let safeExt: String
-            if resolvedIsHLS {
+            if urlLooksLikeM3U8 {
                 safeExt = "m3u8"
+            } else if isHLS && rawExt.isEmpty {
+                // 扩展名缺失但标记 HLS 的入口不强行拼接 .m3u8 后缀，避免上游实为 fmp4/mp4 时触发 AVPlayer -1002
+                safeExt = "stream"
             } else if rawExt.isEmpty || rawExt.lowercased() == "m3u8" {
                 safeExt = "mp4"
             } else {
