@@ -946,7 +946,7 @@ final class GlassMPVTests: XCTestCase {
             maxScreenFPS: 120
         )
         XCTAssertEqual(rangePassthrough.maximum, 60)
-        XCTAssertEqual(rangePassthrough.preferred, 48)
+        XCTAssertEqual(rangePassthrough.preferred, 60)
 
         XCTAssertEqual(
             OpticalFlowResolutionPlanner.effectivePowerThermalCap(active: .fps120, thermalState: .nominal, isLowPowerMode: true)?.tier,
@@ -3549,6 +3549,133 @@ final class GlassMPVTests: XCTestCase {
         let snap = recorder.snapshot()
         XCTAssertGreaterThanOrEqual(snap.batches, 4, "60/120fps 跨分辨率切换后必须稳定输出 Metal GPU 原生光流变形帧")
         XCTAssertGreaterThan(snap.interpolated, 10)
-        XCTAssertTrue(snap.monotonic, "跨分辨率重配后的输出帧时间戳必须严格递增")
+        XCTAssertTrue(monotonicSnapshotIfNeeded(snap.monotonic), "跨分辨率重配后的输出帧时间戳必须严格递增")
+    }
+
+    private func monotonicSnapshotIfNeeded(_ v: Bool) -> Bool { v }
+
+    func testNonInterpolatedDisplayRatePreventsLTPOFrameDrop() {
+        for srcFPS in [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 60.0] {
+            let range = OpticalFlowResolutionPlanner.recommendedDisplayFrameRateRange(
+                targetFPS: srcFPS,
+                isInterpolationEnabled: false,
+                maxScreenFPS: 120,
+                isLowPowerMode: false
+            )
+            XCTAssertEqual(range.minimum, 60, "关闭补帧轮询 \(srcFPS)fps 时最低刷新率必须锁定 60Hz，防止 ProMotion LTPO 跌至 13-16fps")
+            XCTAssertEqual(range.maximum, 60)
+            XCTAssertEqual(range.preferred, 60)
+        }
+    }
+
+    func testMetalPyramidAntiGhostingAndSharpMovingEdge() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            return
+        }
+        let width = 640
+        let height = 360
+        let ioAttrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        func makeFullRangeBuffer() throws -> CVPixelBuffer {
+            var pb: CVPixelBuffer?
+            let st = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                ioAttrs as CFDictionary,
+                &pb
+            )
+            XCTAssertEqual(st, kCVReturnSuccess)
+            return try XCTUnwrap(pb)
+        }
+
+        func fillSilhouette(_ buf: CVPixelBuffer, centerX: Float, centerY: Float) {
+            CVPixelBufferLockBaseAddress(buf, [])
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            let yBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+            let uvBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 1)
+            let uvW = CVPixelBufferGetWidthOfPlane(buf, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(buf, 1)
+            if let yPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 0)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let dx = Float(x) - centerX
+                        let dy = Float(y) - centerY
+                        let val: Float
+                        if abs(dx) <= 80.0 && abs(dy) <= 60.0 {
+                            let nx = dx / 80.0
+                            let ny = dy / 60.0
+                            val = 180.0 + 35.0 * (nx * 0.65 - ny * 0.35)
+                        } else {
+                            val = 30.0 + 8.0 * sin(Float(x) * 0.05) * cos(Float(y) * 0.05)
+                        }
+                        yPtr[y * yBPR + x] = UInt8(max(0, min(255, Int(val.rounded()))))
+                    }
+                }
+            }
+            if let uvPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 1)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<uvH {
+                    for x in 0..<uvW {
+                        uvPtr[y * uvBPR + x * 2] = 128
+                        uvPtr[y * uvBPR + x * 2 + 1] = 128
+                    }
+                }
+            }
+        }
+
+        let prevBuf = try makeFullRangeBuffer()
+        let currBuf = try makeFullRangeBuffer()
+        fillSilhouette(prevBuf, centerX: 260, centerY: 180)
+        fillSilhouette(currBuf, centerX: 280, centerY: 180)
+
+        let flowEngine = MetalPyramidOpticalFlowEngine()
+        XCTAssertNil(flowEngine.shaderInitError)
+        let flowRaw = await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: currBuf)
+        let flowResult = try XCTUnwrap(flowRaw)
+
+        let prevBox = RemoteSendablePixelBuffer(buffer: prevBuf)
+        let currBox = RemoteSendablePixelBuffer(buffer: currBuf)
+        let fwdBox = flowResult.forwardFlow
+        let bwdBox = flowResult.backwardFlow
+        let warpedBGRA: [UInt8] = try await MainActor.run {
+            let enhancer = MetalVideoEnhancer()
+            XCTAssertNil(enhancer.shaderInitError)
+            return try XCTUnwrap(
+                enhancer.renderFlowWarpedOffscreenForTesting(
+                    prevBuffer: prevBox.buffer,
+                    currBuffer: currBox.buffer,
+                    forwardFlowTexture: fwdBox.texture,
+                    backwardFlowTexture: bwdBox.texture,
+                    phase: 0.5,
+                    isSceneCut: false
+                )
+            )
+        }
+
+        // 检查右前沿与左后沿遮挡带 (x in 332..<368, y in 140..<220) 的虚影比例与边缘锐度
+        var ghostPixels = 0
+        var totalBandPixels = 0
+        var maxEdgeStep = 0
+        for y in 140..<220 {
+            for x in 332..<368 {
+                let lum = Int(warpedBGRA[(y * width + x) * 4 + 1])
+                if lum >= 75 && lum <= 155 {
+                    ghostPixels += 1
+                }
+                totalBandPixels += 1
+            }
+            for x in 342..<358 {
+                let lumA = Int(warpedBGRA[(y * width + x) * 4 + 1])
+                let lumB = Int(warpedBGRA[(y * width + x + 2) * 4 + 1])
+                maxEdgeStep = max(maxEdgeStep, abs(lumA - lumB))
+            }
+        }
+        let ghostRatio = Double(ghostPixels) / Double(max(1, totalBandPixels))
+        XCTAssertLessThan(ghostRatio, 0.10, "遮挡过渡带不应出现大面积 50/50 人物虚影")
+        XCTAssertGreaterThanOrEqual(maxEdgeStep, 90, "运动物体边缘在 t=0.5 必须保持陡峭清晰而非拖尾模糊")
     }
 }

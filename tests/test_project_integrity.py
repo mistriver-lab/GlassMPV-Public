@@ -236,6 +236,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "displayFlowWarpYUVFragment" in metal_enhancer_src
     assert "renderFlowWarpedToLayerStatus" in metal_enhancer_src
     assert "flowScaleX" in metal_enhancer_src
+    assert "nearestSampler" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -303,6 +304,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "final class MetalPyramidOpticalFlowEngine" in metal_flow_src
     assert "computeSceneCutStats" in metal_flow_src
     assert "bilateralSmoothFlow" in metal_flow_src
+    assert "buildFeatureFromLuma" in metal_flow_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src
@@ -477,6 +479,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testMetalPyramidOpticalFlowRealMotionAccuracyAndSharpness" in swift_test_src
     assert "testRemoteDisplayCadenceGuardAndHighFPSQueueCapNoDrops" in swift_test_src
     assert "testRemoteSourceNormalizationAndVariantSwitchMetalFlow" in swift_test_src
+    assert "testNonInterpolatedDisplayRatePreventsLTPOFrameDrop" in swift_test_src
+    assert "testMetalPyramidAntiGhostingAndSharpMovingEdge" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src

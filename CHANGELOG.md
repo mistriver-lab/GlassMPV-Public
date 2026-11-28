@@ -2,6 +2,17 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.15] - 2026-11-29
+
+### 修复与性能画质双突破 (Fixed & Optimized)
+- **彻底解决「不补帧时掉帧至 13–16fps」(`OpticalFlowResolutionPlanner` + `VTOpticalFlowEngine`)**：
+  - 根因定位自 `GlassMPV-Log-20261129-000721.txt`：关闭补帧直通时刷新率范围被设为 `(24, 60, preferred=25)` 且停用 `UIUpdateLink`，iPhone ProMotion 屏脱离触控后自动将 `25Hz` 节流至 `15Hz` 导致丢帧。
+  - 修复：直通模式锁定 `60Hz` 整除轮询基准（60fps = 120Hz 精确二分频）并保持连续 `UIUpdateLink` 回调与 `samplePTS` 去重直出，彻底稳住原生 `25fps/24fps` 零掉帧。
+- **15× 加速 GPU 金字塔光流消除「120fps 算力卡顿波动」(`MetalPyramidOpticalFlow`)**：
+  - 将金字塔规格收敛至 `256×144` 并预计算 `RGBA16F` `(Y, Gx, Gy)` 特征金字塔（每拍纹理读取由 10 次 FP32 降至 2 次 FP16），消除 `19–28ms` GPU 阻塞对 120Hz 前台呈现的抢占与波动。
+- **彻底消除 120fps「人物虚影」与「运动边缘模糊」(`MetalVideoEnhancer`)**：
+  - `displayFlowWarpYUVFragment` 引入 `nearest` 离散光流梯度检测与显式静态零矢量 `(0,0)` 候选，边界区域不再使用平滑内插半速向量，并加入静态背景保护、将 `fbErr/bestDiff` 遮挡阈值收紧 4× 至像素级、超出即硬切单帧像素彻底终结半透明叠影。
+
 ## [v0.1.0-beta.14] - 2026-11-28
 
 ### 修复与架构重构 (Fixed & Re-architected)

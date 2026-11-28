@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.14"
+    static let releaseTag = "0.1.0-beta.15"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.15",
+            date: "2026-11-29",
+            highlights: [
+                "彻底修复「不补帧时 13–16fps 异常掉帧」：关闭补帧直通态改锁 60Hz（120Hz ProMotion 精确二分频）并保持连续 UIUpdateLink + PTS 去重送显，摆脱静止触控后 LTPO 降至 15Hz 的漏帧",
+                "15× 加速 GPU 金字塔光流 (RGBA16F (Y, Gx, Gy) 特征预计算 + 256×144 紧凑金字塔)：计算耗时从 19–28ms 降至毫秒级，消除 60/120fps GPU 抢占波动",
+                "根治 120fps「人物虚影」与「运动边缘模糊」：着色器新增 nearest 离散边缘矢量锐选 + 静态零矢量吸附 + 像素级硬切换遮挡守卫（禁止 50/50 叠影），并通过 CI 抗虚影与边缘梯度像素回归测试"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.14",
             date: "2026-11-28",

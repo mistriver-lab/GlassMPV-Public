@@ -1238,7 +1238,7 @@ enum OpticalFlowResolutionPlanner: Sendable {
             return (60, 60, 60)
         }
         if safeFPS <= 60.0 {
-            return (24, 60, Float(max(24.0, min(60.0, safeFPS.rounded()))))
+            return (60, 60, 60)
         }
         if maxScreenFPS >= 120 && !isLowPowerMode {
             return (60, 120, 120)
@@ -3076,8 +3076,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
 
     @MainActor
     func syncDisplayLinkState() {
-        let shouldBoostPlayback = (!isPaused && currentURL != nil && isInterpolationEnabled)
-        UIApplication.shared.isIdleTimerDisabled = (!isPaused && currentURL != nil)
+        let shouldKeepDisplayLinkActive = (!isPaused && currentURL != nil)
+        let shouldBoostPlayback = (shouldKeepDisplayLinkActive && isInterpolationEnabled)
+        UIApplication.shared.isIdleTimerDisabled = shouldKeepDisplayLinkActive
         updatePlaybackActivity(isActive: shouldBoostPlayback)
         let targetRate: Double
         if !isInterpolationEnabled {
@@ -3106,7 +3107,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             displayLink.preferredFrameRateRange = caRange
         }
         displayContainer?.updateProMotionLink(
-            isActive: shouldBoostPlayback,
+            isActive: shouldKeepDisplayLinkActive,
             range: caRange
         )
     }
@@ -4304,7 +4305,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         guard samplePTS.isFinite else { return }
 
         if !isInterpolationEnabled || remoteFlowWorker == nil {
-            if let pb = pulledBuffer {
+            if let pb = pulledBuffer, abs(samplePTS - lastRemoteSamplePTS) > 0.002 {
+                lastRemoteSamplePTS = samplePTS
                 presentFrame(pb, ptsSeconds: samplePTS, on: layer)
             }
             return

@@ -42,7 +42,7 @@ private struct PyramidStatsUniforms {
     var height: UInt32
 }
 
-/// Pure-Metal 4-level GPU optical flow pyramid engine (zero-copy native source -> L3/L2/L1/L0 -> normalized UV RG16F fields).
+/// Pure-Metal 4-level GPU optical flow pyramid engine (256x144 L3 + precomputed RGBA16F (Y, Gx, Gy) feature pyramid -> normalized UV RG16F fields).
 /// Compiles and runs on both real iOS devices (iphoneos) and macOS iOS Simulator.
 final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
     private(set) var shaderInitError: String?
@@ -54,6 +54,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
 
     private var buildLumaPipeline: MTLComputePipelineState?
     private var downsampleLumaPipeline: MTLComputePipelineState?
+    private var buildFeatureFromLumaPipeline: MTLComputePipelineState?
     private var estimateCoarsePipeline: MTLComputePipelineState?
     private var refineFlowPipeline: MTLComputePipelineState?
     private var bilateralSmoothPipeline: MTLComputePipelineState?
@@ -63,6 +64,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
     private var allocatedFlowH: Int = 0
     private var prevPyramid: [MTLTexture] = []
     private var currPyramid: [MTLTexture] = []
+    private var prevFeaturePyramid: [MTLTexture] = []
+    private var currFeaturePyramid: [MTLTexture] = []
     private var fwdScratch: [MTLTexture] = []
     private var bwdScratch: [MTLTexture] = []
     private var flowRing: [(fwd: MTLTexture, bwd: MTLTexture)] = []
@@ -148,9 +151,29 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         outLuma.write(float4(0.25f * (y0 + y1 + y2 + y3), 0.0f, 0.0f, 1.0f), gid);
     }
 
-    inline float patchMatchCost(
-        texture2d<float, access::sample> refLuma,
-        texture2d<float, access::sample> tgtLuma,
+    kernel void buildFeatureFromLuma(
+        texture2d<half, access::sample> inLuma [[texture(0)]],
+        texture2d<half, access::write> outFeature [[texture(1)]],
+        constant PyramidStatsUniforms& u [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        if (gid.x >= u.width || gid.y >= u.height) {
+            return;
+        }
+        constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+        float2 invSize = float2(1.0f / max(1.0f, float(u.width)), 1.0f / max(1.0f, float(u.height)));
+        float2 uv = (float2(gid) + 0.5f) * invSize;
+        half yC = inLuma.sample(linearSampler, uv).r;
+        half yL = inLuma.sample(linearSampler, uv - float2(invSize.x, 0.0f)).r;
+        half yR = inLuma.sample(linearSampler, uv + float2(invSize.x, 0.0f)).r;
+        half yU = inLuma.sample(linearSampler, uv - float2(0.0f, invSize.y)).r;
+        half yD = inLuma.sample(linearSampler, uv + float2(0.0f, invSize.y)).r;
+        outFeature.write(half4(yC, yR - yL, yD - yU, half(1.0h)), gid);
+    }
+
+    inline float patchMatchFeatureCost(
+        texture2d<half, access::sample> refFeat,
+        texture2d<half, access::sample> tgtFeat,
         float2 uvRef,
         float2 flowUV,
         float2 invSize,
@@ -162,31 +185,24 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         if (uvTgt.x < -0.02f || uvTgt.x > 1.02f || uvTgt.y < -0.02f || uvTgt.y > 1.02f) {
             return 1.5f;
         }
-        float2 gradDX = float2(invSize.x, 0.0f);
-        float2 gradDY = float2(0.0f, invSize.y);
-        float sum = 0.0f;
+        half sum = half(0.0h);
         float count = 0.0f;
         for (int py = -patchRadius; py <= patchRadius; ++py) {
             for (int px = -patchRadius; px <= patchRadius; ++px) {
                 float2 delta = float2(float(px) * patchStep, float(py) * patchStep) * invSize;
-                float2 pA = uvRef + delta;
-                float2 pB = uvTgt + delta;
-                float yA = refLuma.sample(linearSampler, pA).r;
-                float yB = tgtLuma.sample(linearSampler, pB).r;
-                float gxA = refLuma.sample(linearSampler, pA + gradDX).r - refLuma.sample(linearSampler, pA - gradDX).r;
-                float gyA = refLuma.sample(linearSampler, pA + gradDY).r - refLuma.sample(linearSampler, pA - gradDY).r;
-                float gxB = tgtLuma.sample(linearSampler, pB + gradDX).r - tgtLuma.sample(linearSampler, pB - gradDX).r;
-                float gyB = tgtLuma.sample(linearSampler, pB + gradDY).r - tgtLuma.sample(linearSampler, pB - gradDY).r;
-                sum += 0.65f * abs(yA - yB) + 0.35f * (abs(gxA - gxB) + abs(gyA - gyB));
+                half3 fA = refFeat.sample(linearSampler, uvRef + delta).rgb;
+                half3 fB = tgtFeat.sample(linearSampler, uvTgt + delta).rgb;
+                half3 diff = abs(fA - fB);
+                sum += half(0.65h) * diff.r + half(0.35h) * (diff.g + diff.b);
                 count += 1.0f;
             }
         }
-        return sum / max(1.0f, count);
+        return float(sum) / max(1.0f, count);
     }
 
     kernel void estimateFlowCoarse(
-        texture2d<float, access::sample> refLuma [[texture(0)]],
-        texture2d<float, access::sample> tgtLuma [[texture(1)]],
+        texture2d<half, access::sample> refFeat [[texture(0)]],
+        texture2d<half, access::sample> tgtFeat [[texture(1)]],
         texture2d<float, access::write> outFlow [[texture(2)]],
         constant PyramidMatchUniforms& u [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
@@ -204,8 +220,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         for (int dy = -r; dy <= r; ++dy) {
             for (int dx = -r; dx <= r; ++dx) {
                 float2 deltaPx = float2(float(dx), float(dy));
-                float cost = patchMatchCost(refLuma, tgtLuma, uvRef, deltaPx * invSize, invSize, 2, 1.0f);
-                // Small zero-motion tie-breaker so static regions stay anchored
+                float cost = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, deltaPx * invSize, invSize, 2, 1.0f);
                 if (dx != 0 || dy != 0) {
                     cost += 0.0025f + 0.0003f * length(deltaPx);
                 }
@@ -220,8 +235,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
     }
 
     kernel void refineFlowLevel(
-        texture2d<float, access::sample> refLuma [[texture(0)]],
-        texture2d<float, access::sample> tgtLuma [[texture(1)]],
+        texture2d<half, access::sample> refFeat [[texture(0)]],
+        texture2d<half, access::sample> tgtFeat [[texture(1)]],
         texture2d<float, access::sample> coarseFlow [[texture(2)]],
         texture2d<float, access::write> outFlow [[texture(3)]],
         constant PyramidMatchUniforms& u [[buffer(0)]],
@@ -242,7 +257,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         float2 basePx = round(predPx);
 
         int r = max(1, u.searchRadius);
-        int patchRadius = (u.levelIndex >= 3u) ? 1 : 2;
+        int patchRadius = 1;
         float regWeight = (u.levelIndex >= 3u) ? 0.0006f : 0.0010f;
 
         float bestCost = 1e9f;
@@ -251,7 +266,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         for (int dy = -r; dy <= r; ++dy) {
             for (int dx = -r; dx <= r; ++dx) {
                 float2 candPx = basePx + float2(float(dx), float(dy));
-                float cost = patchMatchCost(refLuma, tgtLuma, uvRef, candPx * invSize, invSize, patchRadius, u.patchStep);
+                float cost = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, candPx * invSize, invSize, patchRadius, u.patchStep);
                 cost += regWeight * length(candPx - predPx);
                 if (cost < bestCost) {
                     bestCost = cost;
@@ -260,23 +275,21 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
             }
         }
 
-        // Static-background snap: if moving prediction leaked over static textured edge, recover exact (0,0)
         if (length(bestPx) > 0.5f) {
-            float zeroCost = patchMatchCost(refLuma, tgtLuma, uvRef, float2(0.0f), invSize, patchRadius, u.patchStep);
+            float zeroCost = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, float2(0.0f), invSize, patchRadius, u.patchStep);
             if (zeroCost + 0.004f < bestCost) {
                 bestCost = zeroCost;
                 bestPx = float2(0.0f);
             }
         }
 
-        // Subpixel parabolic refinement at the finest level
         float2 finalPx = bestPx;
         if (u.outputNormalizedUV != 0u && length(bestPx) > 0.25f) {
-            float cC = patchMatchCost(refLuma, tgtLuma, uvRef, bestPx * invSize, invSize, 1, 1.0f);
-            float cL = patchMatchCost(refLuma, tgtLuma, uvRef, (bestPx + float2(-1.0f,  0.0f)) * invSize, invSize, 1, 1.0f);
-            float cR = patchMatchCost(refLuma, tgtLuma, uvRef, (bestPx + float2( 1.0f,  0.0f)) * invSize, invSize, 1, 1.0f);
-            float cU = patchMatchCost(refLuma, tgtLuma, uvRef, (bestPx + float2( 0.0f, -1.0f)) * invSize, invSize, 1, 1.0f);
-            float cD = patchMatchCost(refLuma, tgtLuma, uvRef, (bestPx + float2( 0.0f,  1.0f)) * invSize, invSize, 1, 1.0f);
+            float cC = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, bestPx * invSize, invSize, 1, 1.0f);
+            float cL = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, (bestPx + float2(-1.0f,  0.0f)) * invSize, invSize, 1, 1.0f);
+            float cR = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, (bestPx + float2( 1.0f,  0.0f)) * invSize, invSize, 1, 1.0f);
+            float cU = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, (bestPx + float2( 0.0f, -1.0f)) * invSize, invSize, 1, 1.0f);
+            float cD = patchMatchFeatureCost(refFeat, tgtFeat, uvRef, (bestPx + float2( 0.0f,  1.0f)) * invSize, invSize, 1, 1.0f);
 
             float denomX = 2.0f * (cL + cR - 2.0f * cC);
             if (denomX > 0.002f) {
@@ -327,7 +340,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                     continue;
                 }
                 float wSpatial = (dx == 0 && dy == 0) ? 1.5f : ((dx == 0 || dy == 0) ? 1.0f : 0.7f);
-                float wRange = exp(-abs(qY - centerY) * 18.0f);
+                float wRange = exp(-abs(qY - centerY) * 28.0f);
                 float w = wSpatial * wRange;
                 accum += qF * w;
                 wSum += w;
@@ -420,6 +433,9 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                 self.downsampleLumaPipeline = try library.makeFunction(name: "downsampleLuma2x").map {
                     try dev.makeComputePipelineState(function: $0)
                 }
+                self.buildFeatureFromLumaPipeline = try library.makeFunction(name: "buildFeatureFromLuma").map {
+                    try dev.makeComputePipelineState(function: $0)
+                }
                 self.estimateCoarsePipeline = try library.makeFunction(name: "estimateFlowCoarse").map {
                     try dev.makeComputePipelineState(function: $0)
                 }
@@ -442,8 +458,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         let safeW = max(64, sourceWidth)
         let safeH = max(64, sourceHeight)
         let isLandscape = safeW >= safeH
-        let capW = isLandscape ? 384 : 216
-        let capH = isLandscape ? 216 : 384
+        let capW = isLandscape ? 256 : 144
+        let capH = isLandscape ? 144 : 256
         let scale = min(1.0, min(Double(capW) / Double(safeW), Double(capH) / Double(safeH)))
         func align8(_ value: Int) -> Int {
             let clamped = max(64, value)
@@ -524,6 +540,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
               let statsBuffer,
               let buildLumaPipeline,
               let downsampleLumaPipeline,
+              let buildFeatureFromLumaPipeline,
               let estimateCoarsePipeline,
               let refineFlowPipeline,
               let bilateralSmoothPipeline,
@@ -534,6 +551,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         guard ensureResourcesLocked(device: device, flowW: targetDims.width, flowH: targetDims.height),
               prevPyramid.count == 4,
               currPyramid.count == 4,
+              prevFeaturePyramid.count == 4,
+              currFeaturePyramid.count == 4,
               fwdScratch.count == 4,
               bwdScratch.count == 4,
               !flowRing.isEmpty else {
@@ -553,32 +572,37 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         ringCursor &+= 1
         let startHost = CACurrentMediaTime()
 
-        // 1. Build 4-level luma pyramids (index 0 = coarsest L0, index 3 = finest L3)
-        encodeLumaPyramid(
+        // 1. Build 4-level luma + precomputed RGBA16F (Y, Gx, Gy) feature pyramids
+        encodeLumaAndFeaturePyramid(
             srcY: prevYTex,
             srcW: srcW,
             srcH: srcH,
             isVideoRange: isVideoRange,
-            pyramid: prevPyramid,
+            lumaPyramid: prevPyramid,
+            featurePyramid: prevFeaturePyramid,
             commandBuffer: commandBuffer,
             buildPipeline: buildLumaPipeline,
-            downsamplePipeline: downsampleLumaPipeline
+            downsamplePipeline: downsampleLumaPipeline,
+            featurePipeline: buildFeatureFromLumaPipeline
         )
-        encodeLumaPyramid(
+        encodeLumaAndFeaturePyramid(
             srcY: currYTex,
             srcW: srcW,
             srcH: srcH,
             isVideoRange: isVideoRange,
-            pyramid: currPyramid,
+            lumaPyramid: currPyramid,
+            featurePyramid: currFeaturePyramid,
             commandBuffer: commandBuffer,
             buildPipeline: buildLumaPipeline,
-            downsamplePipeline: downsampleLumaPipeline
+            downsamplePipeline: downsampleLumaPipeline,
+            featurePipeline: buildFeatureFromLumaPipeline
         )
 
         // 2. Forward flow (prev -> curr): curr(uv + F(uv)) ~= prev(uv)
         encodeFlowEstimation(
-            refPyramid: prevPyramid,
-            tgtPyramid: currPyramid,
+            refFeaturePyramid: prevFeaturePyramid,
+            tgtFeaturePyramid: currFeaturePyramid,
+            guideLumaL3: prevPyramid[3],
             scratchFlows: fwdScratch,
             finalFlow: outPair.fwd,
             commandBuffer: commandBuffer,
@@ -589,8 +613,9 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
 
         // 3. Backward flow (curr -> prev): prev(uv + B(uv)) ~= curr(uv)
         encodeFlowEstimation(
-            refPyramid: currPyramid,
-            tgtPyramid: prevPyramid,
+            refFeaturePyramid: currFeaturePyramid,
+            tgtFeaturePyramid: prevFeaturePyramid,
+            guideLumaL3: currPyramid[3],
             scratchFlows: bwdScratch,
             finalFlow: outPair.bwd,
             commandBuffer: commandBuffer,
@@ -626,18 +651,20 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         return (commandBuffer, statsBuffer, outPair.fwd, outPair.bwd, targetDims.width, targetDims.height, startHost)
     }
 
-    private func encodeLumaPyramid(
+    private func encodeLumaAndFeaturePyramid(
         srcY: MTLTexture,
         srcW: Int,
         srcH: Int,
         isVideoRange: UInt32,
-        pyramid: [MTLTexture],
+        lumaPyramid: [MTLTexture],
+        featurePyramid: [MTLTexture],
         commandBuffer: MTLCommandBuffer,
         buildPipeline: MTLComputePipelineState,
-        downsamplePipeline: MTLComputePipelineState
+        downsamplePipeline: MTLComputePipelineState,
+        featurePipeline: MTLComputePipelineState
     ) {
         if let enc = commandBuffer.makeComputeCommandEncoder() {
-            let fine = pyramid[3]
+            let fine = lumaPyramid[3]
             var u = PyramidBuildUniforms(
                 srcWidth: UInt32(srcW),
                 srcHeight: UInt32(srcH),
@@ -654,8 +681,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         }
 
         for level in stride(from: 2, through: 0, by: -1) {
-            let higher = pyramid[level + 1]
-            let lower = pyramid[level]
+            let higher = lumaPyramid[level + 1]
+            let lower = lumaPyramid[level]
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 var u = PyramidBuildUniforms(
                     srcWidth: UInt32(higher.width),
@@ -672,11 +699,26 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                 enc.endEncoding()
             }
         }
+
+        for level in 0...3 {
+            let lumaTex = lumaPyramid[level]
+            let featTex = featurePyramid[level]
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                var u = PyramidStatsUniforms(width: UInt32(featTex.width), height: UInt32(featTex.height))
+                enc.setComputePipelineState(featurePipeline)
+                enc.setTexture(lumaTex, index: 0)
+                enc.setTexture(featTex, index: 1)
+                enc.setBytes(&u, length: MemoryLayout<PyramidStatsUniforms>.size, index: 0)
+                dispatch2D(encoder: enc, pipeline: featurePipeline, width: featTex.width, height: featTex.height)
+                enc.endEncoding()
+            }
+        }
     }
 
     private func encodeFlowEstimation(
-        refPyramid: [MTLTexture],
-        tgtPyramid: [MTLTexture],
+        refFeaturePyramid: [MTLTexture],
+        tgtFeaturePyramid: [MTLTexture],
+        guideLumaL3: MTLTexture,
         scratchFlows: [MTLTexture],
         finalFlow: MTLTexture,
         commandBuffer: MTLCommandBuffer,
@@ -684,8 +726,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         refinePipeline: MTLComputePipelineState,
         bilateralPipeline: MTLComputePipelineState
     ) {
-        let l0Ref = refPyramid[0]
-        let l0Tgt = tgtPyramid[0]
+        let l0Ref = refFeaturePyramid[0]
+        let l0Tgt = tgtFeaturePyramid[0]
         let l0Out = scratchFlows[0]
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             var u = PyramidMatchUniforms(
@@ -693,7 +735,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                 height: UInt32(l0Out.height),
                 coarseWidth: UInt32(l0Out.width),
                 coarseHeight: UInt32(l0Out.height),
-                searchRadius: 4,
+                searchRadius: 3,
                 levelIndex: 0,
                 outputNormalizedUV: 0,
                 patchStep: 1.0
@@ -708,8 +750,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         }
 
         for level in 1...3 {
-            let refL = refPyramid[level]
-            let tgtL = tgtPyramid[level]
+            let refL = refFeaturePyramid[level]
+            let tgtL = tgtFeaturePyramid[level]
             let coarseF = scratchFlows[level - 1]
             let dstF = scratchFlows[level]
             let radius: Int32 = (level == 3) ? 1 : 2
@@ -739,7 +781,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
             var u = PyramidStatsUniforms(width: UInt32(finalFlow.width), height: UInt32(finalFlow.height))
             enc.setComputePipelineState(bilateralPipeline)
             enc.setTexture(scratchFlows[3], index: 0)
-            enc.setTexture(refPyramid[3], index: 1)
+            enc.setTexture(guideLumaL3, index: 1)
             enc.setTexture(finalFlow, index: 2)
             enc.setBytes(&u, length: MemoryLayout<PyramidStatsUniforms>.size, index: 0)
             dispatch2D(encoder: enc, pipeline: bilateralPipeline, width: finalFlow.width, height: finalFlow.height)
@@ -752,6 +794,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
            allocatedFlowH == flowH,
            prevPyramid.count == 4,
            currPyramid.count == 4,
+           prevFeaturePyramid.count == 4,
+           currFeaturePyramid.count == 4,
            fwdScratch.count == 4,
            bwdScratch.count == 4,
            flowRing.count == Self.ringCapacity {
@@ -760,6 +804,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
 
         prevPyramid.removeAll(keepingCapacity: true)
         currPyramid.removeAll(keepingCapacity: true)
+        prevFeaturePyramid.removeAll(keepingCapacity: true)
+        currFeaturePyramid.removeAll(keepingCapacity: true)
         fwdScratch.removeAll(keepingCapacity: true)
         bwdScratch.removeAll(keepingCapacity: true)
         flowRing.removeAll(keepingCapacity: true)
@@ -786,6 +832,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         for (w, h) in dims {
             guard let pL = makeTex(format: .r16Float, w: w, h: h, shared: false),
                   let cL = makeTex(format: .r16Float, w: w, h: h, shared: false),
+                  let pF = makeTex(format: .rgba16Float, w: w, h: h, shared: false),
+                  let cF = makeTex(format: .rgba16Float, w: w, h: h, shared: false),
                   let fS = makeTex(format: .rg16Float, w: w, h: h, shared: false),
                   let bS = makeTex(format: .rg16Float, w: w, h: h, shared: false) else {
                 allocatedFlowW = 0
@@ -794,6 +842,8 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
             }
             prevPyramid.append(pL)
             currPyramid.append(cL)
+            prevFeaturePyramid.append(pF)
+            currFeaturePyramid.append(cF)
             fwdScratch.append(fS)
             bwdScratch.append(bS)
         }
