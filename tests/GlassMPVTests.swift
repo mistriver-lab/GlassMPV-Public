@@ -3915,7 +3915,7 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(stalledMetrics.fpsSummary, "25.0 → 缓冲中")
 
         XCTAssertFalse(
-            VTOpticalFlowEngine.shouldDecayStaleOutputFPS(
+            OpticalFlowPlayerController.shouldDecayStaleOutputFPS(
                 isRemoteStream: true,
                 isPaused: false,
                 lastPresentedHostTime: 100.0,
@@ -3923,7 +3923,7 @@ final class GlassMPVTests: XCTestCase {
             )
         )
         XCTAssertTrue(
-            VTOpticalFlowEngine.shouldDecayStaleOutputFPS(
+            OpticalFlowPlayerController.shouldDecayStaleOutputFPS(
                 isRemoteStream: true,
                 isPaused: false,
                 lastPresentedHostTime: 100.0,
@@ -3931,7 +3931,7 @@ final class GlassMPVTests: XCTestCase {
             )
         )
         XCTAssertFalse(
-            VTOpticalFlowEngine.shouldDecayStaleOutputFPS(
+            OpticalFlowPlayerController.shouldDecayStaleOutputFPS(
                 isRemoteStream: true,
                 isPaused: true,
                 lastPresentedHostTime: 100.0,
