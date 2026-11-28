@@ -15,7 +15,10 @@ enum RemoteOpticalFlowPayload: @unchecked Sendable {
         currBuffer: CVPixelBuffer,
         forwardFlow: CVPixelBuffer,
         backwardFlow: CVPixelBuffer,
-        phase: Float
+        phase: Float,
+        flowSignX: Float = 1.0,
+        flowSignY: Float = 1.0,
+        isNormalizedUV: Bool = false
     )
 }
 
@@ -37,9 +40,252 @@ struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
         switch payload {
         case .pixelBuffer(let buffer):
             return buffer
-        case .flowWarped(_, let currBuffer, _, _, _):
+        case .flowWarped(_, let currBuffer, _, _, _, _, _, _):
             return currBuffer
         }
+    }
+}
+
+struct FlowVectorCalibration: Equatable, Sendable {
+    var signX: Float = 1.0
+    var signY: Float = 1.0
+    var isNormalizedUV: Bool = false
+    var isLocked: Bool = false
+    var baselineSAD: Float = 0
+    var calibratedSAD: Float = 0
+    var rawP90: Float = 0
+}
+
+enum FlowVectorCalibrator: Sendable {
+    static func decodeFloat16(_ bits: UInt16) -> Float {
+        let sign = UInt32(bits & 0x8000) << 16
+        let exp = Int((bits >> 10) & 0x1F)
+        let frac = UInt32(bits & 0x03FF)
+        if exp == 0 {
+            if frac == 0 {
+                return Float(bitPattern: sign)
+            }
+            var val = Float(frac) / 1024.0 * powf(2.0, -14.0)
+            if sign != 0 { val = -val }
+            return val
+        } else if exp == 31 {
+            if frac == 0 {
+                return Float(bitPattern: sign | 0x7F800000)
+            }
+            return Float.nan
+        }
+        let f32Exp = UInt32(exp + 112) << 23
+        let f32Mant = frac << 13
+        return Float(bitPattern: sign | f32Exp | f32Mant)
+    }
+
+    static func encodeFloat16(_ value: Float) -> UInt16 {
+        if value.isNaN { return 0x7E00 }
+        let bits = value.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        let exp = Int((bits >> 23) & 0xFF) - 127
+        let mant = bits & 0x007FFFFF
+        if exp > 15 { return sign | 0x7C00 }
+        if exp < -14 {
+            if exp < -24 { return sign }
+            let shifted = (0x00800000 | mant) >> UInt32(-14 - exp + 13)
+            return sign | UInt16(shifted & 0x03FF)
+        }
+        let hExp = UInt16((exp + 15) & 0x1F) << 10
+        let hMant = UInt16((mant >> 13) & 0x03FF)
+        return sign | hExp | hMant
+    }
+
+    static func selectOptimalFlowSourceFormat(from supportedFormats: [OSType]) -> OSType {
+        let priority: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_32BGRA,
+            kCVPixelFormatType_32ARGB
+        ]
+        for candidate in priority where supportedFormats.contains(candidate) {
+            return candidate
+        }
+        return supportedFormats.first ?? kCVPixelFormatType_32BGRA
+    }
+
+    private static func sampleLuma(
+        base: UnsafePointer<UInt8>,
+        bpr: Int,
+        width: Int,
+        height: Int,
+        u: Float,
+        v: Float
+    ) -> Float {
+        let px = max(0.0, min(Float(width - 1), u * Float(width - 1)))
+        let py = max(0.0, min(Float(height - 1), v * Float(height - 1)))
+        let x0 = Int(floor(px))
+        let y0 = Int(floor(py))
+        let x1 = min(width - 1, x0 + 1)
+        let y1 = min(height - 1, y0 + 1)
+        let fx = px - Float(x0)
+        let fy = py - Float(y0)
+        let p00 = Float(base[y0 * bpr + x0])
+        let p10 = Float(base[y0 * bpr + x1])
+        let p01 = Float(base[y1 * bpr + x0])
+        let p11 = Float(base[y1 * bpr + x1])
+        let top = p00 + (p10 - p00) * fx
+        let bot = p01 + (p11 - p01) * fx
+        return top + (bot - top) * fy
+    }
+
+    static func calibrate(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: CVPixelBuffer
+    ) -> FlowVectorCalibration? {
+        let prevW = CVPixelBufferGetWidth(prevBuffer)
+        let prevH = CVPixelBufferGetHeight(prevBuffer)
+        let currW = CVPixelBufferGetWidth(currBuffer)
+        let currH = CVPixelBufferGetHeight(currBuffer)
+        let flowW = CVPixelBufferGetWidth(forwardFlow)
+        let flowH = CVPixelBufferGetHeight(forwardFlow)
+        guard prevW >= 32, prevH >= 32, currW == prevW, currH == prevH, flowW >= 8, flowH >= 8 else {
+            return nil
+        }
+
+        let flowFmt = CVPixelBufferGetPixelFormatType(forwardFlow)
+        let isHalfFlow = (flowFmt == kCVPixelFormatType_TwoComponent16Half)
+        let isFloatFlow = (flowFmt == kCVPixelFormatType_TwoComponent32Float)
+        guard isHalfFlow || isFloatFlow else {
+            return nil
+        }
+
+        let prevFmt = CVPixelBufferGetPixelFormatType(prevBuffer)
+        let currFmt = CVPixelBufferGetPixelFormatType(currBuffer)
+        let prevIsYUV = RemoteOpticalFlowBudgetPlanner.is8BitSDRBiPlanarFormat(prevFmt)
+        let currIsYUV = RemoteOpticalFlowBudgetPlanner.is8BitSDRBiPlanarFormat(currFmt)
+        guard prevIsYUV, currIsYUV else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(prevBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(currBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(forwardFlow, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(forwardFlow, .readOnly)
+            CVPixelBufferUnlockBaseAddress(currBuffer, .readOnly)
+            CVPixelBufferUnlockBaseAddress(prevBuffer, .readOnly)
+        }
+
+        guard let prevBaseRaw = CVPixelBufferGetBaseAddressOfPlane(prevBuffer, 0),
+              let currBaseRaw = CVPixelBufferGetBaseAddressOfPlane(currBuffer, 0) else {
+            return nil
+        }
+        let flowBaseRaw = (CVPixelBufferGetPlaneCount(forwardFlow) > 0)
+            ? CVPixelBufferGetBaseAddressOfPlane(forwardFlow, 0)
+            : CVPixelBufferGetBaseAddress(forwardFlow)
+        guard let flowBaseRaw else {
+            return nil
+        }
+
+        let prevBase = prevBaseRaw.assumingMemoryBound(to: UInt8.self)
+        let currBase = currBaseRaw.assumingMemoryBound(to: UInt8.self)
+        let prevBPR = CVPixelBufferGetBytesPerRowOfPlane(prevBuffer, 0)
+        let currBPR = CVPixelBufferGetBytesPerRowOfPlane(currBuffer, 0)
+        let flowBPR = (CVPixelBufferGetPlaneCount(forwardFlow) > 0)
+            ? CVPixelBufferGetBytesPerRowOfPlane(forwardFlow, 0)
+            : CVPixelBufferGetBytesPerRow(forwardFlow)
+
+        let gridX = 24
+        let gridY = 14
+        struct SamplePoint {
+            let u: Float
+            let v: Float
+            let y0: Float
+            let dx: Float
+            let dy: Float
+        }
+        var samples: [SamplePoint] = []
+        samples.reserveCapacity(gridX * gridY)
+        var mags: [Float] = []
+        mags.reserveCapacity(gridX * gridY)
+        var baselineSum: Float = 0
+
+        for iy in 0..<gridY {
+            let v = 0.1 + 0.8 * (Float(iy) / Float(max(1, gridY - 1)))
+            let fy = max(0, min(flowH - 1, Int((v * Float(flowH - 1)).rounded())))
+            for ix in 0..<gridX {
+                let u = 0.1 + 0.8 * (Float(ix) / Float(max(1, gridX - 1)))
+                let fx = max(0, min(flowW - 1, Int((u * Float(flowW - 1)).rounded())))
+                let dx: Float
+                let dy: Float
+                if isHalfFlow {
+                    let rowPtr = flowBaseRaw.advanced(by: fy * flowBPR + fx * 4).assumingMemoryBound(to: UInt16.self)
+                    dx = decodeFloat16(rowPtr[0])
+                    dy = decodeFloat16(rowPtr[1])
+                } else {
+                    let ptr = flowBaseRaw.advanced(by: fy * flowBPR + fx * 8)
+                    dx = ptr.loadUnaligned(as: Float.self)
+                    dy = ptr.advanced(by: 4).loadUnaligned(as: Float.self)
+                }
+                guard dx.isFinite, dy.isFinite else { continue }
+                let y0 = sampleLuma(base: prevBase, bpr: prevBPR, width: prevW, height: prevH, u: u, v: v)
+                let y1Zero = sampleLuma(base: currBase, bpr: currBPR, width: currW, height: currH, u: u, v: v)
+                baselineSum += abs(y0 - y1Zero)
+                let mag = hypotf(dx, dy)
+                mags.append(mag)
+                samples.append(SamplePoint(u: u, v: v, y0: y0, dx: dx, dy: dy))
+            }
+        }
+
+        guard !samples.isEmpty else { return nil }
+        let baselineSAD = baselineSum / Float(samples.count)
+        let sortedMags = mags.sorted()
+        let rawP90 = sortedMags[min(sortedMags.count - 1, Int(Float(sortedMags.count) * 0.9))]
+        guard baselineSAD >= 2.5, rawP90 >= 0.002 else {
+            return nil
+        }
+
+        var unitCandidates: [(isNormalized: Bool, sxScale: Float, syScale: Float)] = [
+            (false, 1.0 / Float(flowW), 1.0 / Float(flowH))
+        ]
+        if rawP90 < 0.25 {
+            unitCandidates.append((true, 1.0, 1.0))
+        }
+        let signPairs: [(Float, Float)] = [(1, 1), (-1, -1), (1, -1), (-1, 1)]
+
+        var bestSAD = Float.greatestFiniteMagnitude
+        var bestSignX: Float = 1.0
+        var bestSignY: Float = 1.0
+        var bestNormalized = false
+
+        for unit in unitCandidates {
+            for (sx, sy) in signPairs {
+                var sadSum: Float = 0
+                for s in samples {
+                    let nu = max(0.0, min(1.0, s.u + sx * s.dx * unit.sxScale))
+                    let nv = max(0.0, min(1.0, s.v + sy * s.dy * unit.syScale))
+                    let y1 = sampleLuma(base: currBase, bpr: currBPR, width: currW, height: currH, u: nu, v: nv)
+                    sadSum += abs(s.y0 - y1)
+                }
+                let meanSAD = sadSum / Float(samples.count)
+                if meanSAD < bestSAD {
+                    bestSAD = meanSAD
+                    bestSignX = sx
+                    bestSignY = sy
+                    bestNormalized = unit.isNormalized
+                }
+            }
+        }
+
+        guard bestSAD < baselineSAD * 0.90 else {
+            return nil
+        }
+        return FlowVectorCalibration(
+            signX: bestSignX,
+            signY: bestSignY,
+            isNormalizedUV: bestNormalized,
+            isLocked: true,
+            baselineSAD: baselineSAD,
+            calibratedSAD: bestSAD,
+            rawP90: rawP90
+        )
     }
 }
 
@@ -57,7 +303,7 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
         isHDR: Bool,
         isDolbyVision: Bool,
         is8BitSDRPixelFormat: Bool = true,
-        allowExperimentalFlowWarp: Bool = false
+        allowExperimentalFlowWarp: Bool = true
     ) -> Bool {
         guard allowExperimentalFlowWarp else {
             return false
@@ -72,10 +318,8 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
     }
 
     static func flowResolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
-        if maxInterp <= 3 {
-            return [(854, 480), (640, 360)]
-        }
-        return [(640, 360), (512, 288)]
+        _ = maxInterp
+        return [(960, 540), (640, 360)]
     }
 
     static func buildHybridFlowCandidates(
@@ -232,6 +476,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     private var activeFlowPixelFormat: OSType = kCVPixelFormatType_TwoComponent16Half
     private var flowDestPool: CVPixelBufferPool?
     private var flowWarpNeedsRandomSubmission: Bool = true
+    private var flowCalibration = FlowVectorCalibration()
     private var hybridFlowWarpFailedForSession: Bool = false
     private var activeCandidate: OpticalFlowCandidate?
     private var candidates: [OpticalFlowCandidate] = []
@@ -359,6 +604,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 flowPlanSignature = ""
                 hybridFlowWarpFailedForSession = false
                 flowWarpNeedsRandomSubmission = true
+                flowCalibration = FlowVectorCalibration()
                 teardownSession()
 #endif
             }
@@ -485,6 +731,16 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                         batchCount += 1
                         let avgMs = totalInterpolationMs / Double(max(1, batchCount))
 
+                        if !flowCalibration.isLocked,
+                           let calibrated = FlowVectorCalibrator.calibrate(
+                               prevBuffer: prev.rawBuffer,
+                               currBuffer: currBuffer,
+                               forwardFlow: fwdBuf
+                           ) {
+                            flowCalibration = calibrated
+                            onLog?("[remote][ane] 4K光流向量自校准锁定: sign=(\(Int(calibrated.signX)),\(Int(calibrated.signY))), unit=\(calibrated.isNormalizedUV ? "uv" : "px"), rawP90=\(String(format: "%.2f", calibrated.rawP90)), SAD \(String(format: "%.1f", calibrated.baselineSAD))->\(String(format: "%.1f", calibrated.calibratedSAD))")
+                        }
+
                         var outFrames: [RemoteOpticalFlowOutputFrame] = []
                         outFrames.reserveCapacity(step.interpolatedSlots.count + 1)
                         for slot in step.interpolatedSlots {
@@ -496,7 +752,10 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                                         currBuffer: currBuffer,
                                         forwardFlow: fwdBuf,
                                         backwardFlow: bwdBuf,
-                                        phase: slot.phase
+                                        phase: slot.phase,
+                                        flowSignX: flowCalibration.signX,
+                                        flowSignY: flowCalibration.signY,
+                                        isNormalizedUV: flowCalibration.isNormalizedUV
                                     )
                                 )
                             )
@@ -831,9 +1090,8 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             }
 
             let supportedSourceFormats = Self.extractPixelFormatTypes(from: config.sourcePixelBufferAttributes)
-            let chosenSourceFormat: OSType = supportedSourceFormats.isEmpty
-                ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                : OpticalFlowResolutionPlanner.selectOptimalPixelFormat(from: supportedSourceFormats, prefer10Bit: false)
+            let chosenSourceFormat: OSType = FlowVectorCalibrator.selectOptimalFlowSourceFormat(from: supportedSourceFormats)
+            let supportedSrcDesc = supportedSourceFormats.map { HEVCFormatNormalizer.fourCCString($0) }.joined(separator: ",")
 
             let supportedFlowFormats = Self.extractPixelFormatTypes(from: config.destinationPixelBufferAttributes)
             let chosenFlowFormat: OSType
@@ -904,9 +1162,10 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             self.sourceTransferSession = xfer
             self.flowDestPool = flowPool
             self.flowWarpNeedsRandomSubmission = true
+            self.flowCalibration = FlowVectorCalibration()
             self.activeSignature = "\(planSig):idx\(index)"
             self.warmupPairsRemaining = 8
-            onLog?("[remote][ane] 已激活4K原生光流变形会话: FlowWarp \(flowDims.width)×\(flowDims.height) -> \(srcWidth)×\(srcHeight) (flowFmt=\(HEVCFormatNormalizer.fourCCString(chosenFlowFormat)), srcFmt=\(HEVCFormatNormalizer.fourCCString(chosenSourceFormat)))")
+            onLog?("[remote][ane] 已激活4K原生光流变形会话 v2: FlowWarp \(flowDims.width)×\(flowDims.height) -> \(srcWidth)×\(srcHeight) (flowFmt=\(HEVCFormatNormalizer.fourCCString(chosenFlowFormat)), srcFmt=\(HEVCFormatNormalizer.fourCCString(chosenSourceFormat)), supportedSrc=[\(supportedSrcDesc)])")
             return true
         }
         return false

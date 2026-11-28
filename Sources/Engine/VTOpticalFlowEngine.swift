@@ -2314,9 +2314,14 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         token: UUID
     ) {
         guard isTokenValid(token) else { return }
+        let hasFlowWarped = frames.contains {
+            if case .flowWarped = $0.payload { return true }
+            return false
+        }
         bufferLock.lock()
+        let queueCap = hasFlowWarped ? min(maxQueuedFrames, 14) : maxQueuedFrames
         for item in frames {
-            if remoteFrameQueue.count >= maxQueuedFrames {
+            if remoteFrameQueue.count >= queueCap {
                 remoteFrameQueue.removeFirst()
             }
             remoteFrameQueue.append((pts: item.pts, buffer: item.payload))
@@ -2338,7 +2343,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                         averageInterpolationMs: avgMs,
                         targetFPS: self.effectiveTargetFPS
                     )
-                    self.remotePacerLagSeconds = self.remotePacerLagSeconds * 0.8 + targetLag * 0.2
+                    let clampedLag = hasFlowWarped ? min(targetLag, 0.110) : targetLag
+                    self.remotePacerLagSeconds = self.remotePacerLagSeconds * 0.8 + clampedLag * 0.2
                 }
                 self.flushPublishedTelemetryIfNeeded()
             }
@@ -4283,13 +4289,16 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             switch payload {
             case .pixelBuffer(let buffer):
                 presentFrame(buffer, ptsSeconds: hostTime, on: layer)
-            case .flowWarped(let prevBuffer, let currBuffer, let forwardFlow, let backwardFlow, let phase):
+            case .flowWarped(let prevBuffer, let currBuffer, let forwardFlow, let backwardFlow, let phase, let flowSignX, let flowSignY, let isNormalizedUV):
                 presentFlowWarpedFrame(
                     prevBuffer: prevBuffer,
                     currBuffer: currBuffer,
                     forwardFlow: forwardFlow,
                     backwardFlow: backwardFlow,
                     phase: phase,
+                    flowSignX: flowSignX,
+                    flowSignY: flowSignY,
+                    isNormalizedUV: isNormalizedUV,
                     ptsSeconds: hostTime,
                     on: layer
                 )
@@ -4335,6 +4344,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         forwardFlow: CVPixelBuffer,
         backwardFlow: CVPixelBuffer,
         phase: Float,
+        flowSignX: Float = 1.0,
+        flowSignY: Float = 1.0,
+        isNormalizedUV: Bool = false,
         ptsSeconds: Double,
         on layer: AVSampleBufferDisplayLayer
     ) {
@@ -4363,6 +4375,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 forwardFlow: forwardFlow,
                 backwardFlow: backwardFlow,
                 phase: phase,
+                flowSignX: flowSignX,
+                flowSignY: flowSignY,
+                isNormalizedUV: isNormalizedUV,
                 on: container.metalLayer,
                 preset: videoEnhancementPreset,
                 strength: videoEnhancementStrength,
@@ -4377,10 +4392,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 if activeQualityPipelineLabel != metalEnhancer.activePipelineLabel {
                     activeQualityPipelineLabel = metalEnhancer.activePipelineLabel
                 }
-                let reportedEnhanceMs = (videoEnhancementPreset == .off || activeCompareMode == .original)
-                    ? 0
-                    : metalEnhancer.averageProcessMs
-                updatePresentedFrameMetrics(isRefresh: false, enhanceMs: reportedEnhanceMs)
+                updatePresentedFrameMetrics(isRefresh: false, enhanceMs: metalEnhancer.averageProcessMs)
                 return
             case .skippedBusy:
                 container.setMetalOverlayActive(true)

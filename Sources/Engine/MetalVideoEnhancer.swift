@@ -27,8 +27,10 @@ private struct MetalDisplayVertexUniforms {
 
 private struct MetalFlowWarpUniforms {
     var phase: Float
-    var invFlowWidth: Float
-    var invFlowHeight: Float
+    var flowScaleX: Float
+    var flowScaleY: Float
+    var flowTexelX: Float
+    var flowTexelY: Float
     var deblurStrength: Float
     var casStrength: Float
     var lineDarken: Float
@@ -166,8 +168,10 @@ final class MetalVideoEnhancer {
 
     struct FlowWarpUniforms {
         float phase;
-        float invFlowWidth;
-        float invFlowHeight;
+        float flowScaleX;
+        float flowScaleY;
+        float flowTexelX;
+        float flowTexelY;
         float deblurStrength;
         float casStrength;
         float lineDarken;
@@ -513,42 +517,84 @@ final class MetalVideoEnhancer {
             }
         }
 
-        float2 invFlow = float2(u.invFlowWidth, u.invFlowHeight);
-        float2 f0 = inForwardFlow.sample(linearSampler, uv).rg * invFlow;
-        float2 b0 = inBackwardFlow.sample(linearSampler, uv).rg * invFlow;
+        float2 flowScale = float2(u.flowScaleX, u.flowScaleY);
+        float2 flowStep = float2(u.flowTexelX, u.flowTexelY);
+        float2 f0 = inForwardFlow.sample(linearSampler, uv).rg * flowScale;
+        float2 b0 = inBackwardFlow.sample(linearSampler, uv).rg * flowScale;
         if (!isfinite(f0.x) || !isfinite(f0.y)) { f0 = float2(0.0f); }
         if (!isfinite(b0.x) || !isfinite(b0.y)) { b0 = float2(0.0f); }
 
         float2 uv0Rough = clamp(uv - t * f0, float2(0.0f), float2(1.0f));
         float2 uv1Rough = clamp(uv - (1.0f - t) * b0, float2(0.0f), float2(1.0f));
-        float2 fRef = inForwardFlow.sample(linearSampler, uv0Rough).rg * invFlow;
-        float2 bRef = inBackwardFlow.sample(linearSampler, uv1Rough).rg * invFlow;
+        float2 fRef = inForwardFlow.sample(linearSampler, uv0Rough).rg * flowScale;
+        float2 bRef = inBackwardFlow.sample(linearSampler, uv1Rough).rg * flowScale;
         if (!isfinite(fRef.x) || !isfinite(fRef.y)) { fRef = f0; }
         if (!isfinite(bRef.x) || !isfinite(bRef.y)) { bRef = b0; }
 
-        float2 flow = 0.5f * (fRef - bRef);
+        float2 bestFlow = 0.5f * (fRef - bRef);
         float fbErr = length(fRef + bRef);
-        float flowMag = length(flow);
 
+        float2 bestUV0Raw = uv - t * bestFlow;
+        float2 bestUV1Raw = uv + (1.0f - t) * bestFlow;
+        float2 bestUV0 = clamp(bestUV0Raw, float2(0.0f), float2(1.0f));
+        float2 bestUV1 = clamp(bestUV1Raw, float2(0.0f), float2(1.0f));
+        half bestY0 = toUnitLumaH(inPrevY.sample(linearSampler, bestUV0).r, u.isVideoRange);
+        half bestY1 = toUnitLumaH(inCurrY.sample(linearSampler, bestUV1).r, u.isVideoRange);
+        float bestDiff = abs(float(bestY0) - float(bestY1));
+
+        // 5-tap 联合光度边缘吸附：在前景/背景边缘与遮挡区从上下左右邻域光流中选择光度匹配最佳的清晰向量，消除轮廓模糊
+        if (bestDiff > 0.035f || fbErr > 0.008f) {
+            float2 offsets[4] = {
+                float2(-flowStep.x, 0.0f),
+                float2( flowStep.x, 0.0f),
+                float2(0.0f, -flowStep.y),
+                float2(0.0f,  flowStep.y)
+            };
+            for (int k = 0; k < 4; ++k) {
+                float2 nUV = clamp(uv + offsets[k], float2(0.0f), float2(1.0f));
+                float2 fn = inForwardFlow.sample(linearSampler, nUV).rg * flowScale;
+                float2 bn = inBackwardFlow.sample(linearSampler, nUV).rg * flowScale;
+                if (!isfinite(fn.x) || !isfinite(fn.y)) { continue; }
+                if (!isfinite(bn.x) || !isfinite(bn.y)) { bn = -fn; }
+                float2 candFlow = 0.5f * (fn - bn);
+                if (length(candFlow) > 0.16f) { continue; }
+                float2 cuv0Raw = uv - t * candFlow;
+                float2 cuv1Raw = uv + (1.0f - t) * candFlow;
+                float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
+                float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
+                half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
+                half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
+                float candDiff = abs(float(cy0) - float(cy1));
+                if (candDiff < bestDiff * 0.85f) {
+                    bestDiff = candDiff;
+                    bestFlow = candFlow;
+                    bestUV0Raw = cuv0Raw;
+                    bestUV1Raw = cuv1Raw;
+                    bestUV0 = cuv0;
+                    bestUV1 = cuv1;
+                    bestY0 = cy0;
+                    bestY1 = cy1;
+                    fbErr = length(fn + bn);
+                }
+            }
+        }
+
+        float flowMag = length(bestFlow);
         // 转场/极端运动保护：避免整帧撕裂重影，直接输出最近原生高分辨率参考帧
-        if (flowMag > 0.18f || fbErr > 0.045f) {
+        if (flowMag > 0.18f || (fbErr > 0.045f && bestDiff > 0.12f)) {
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
 
-        float2 uv0Raw = uv - t * flow;
-        float2 uv1Raw = uv + (1.0f - t) * flow;
-        bool oob0 = (uv0Raw.x < 0.0f || uv0Raw.x > 1.0f || uv0Raw.y < 0.0f || uv0Raw.y > 1.0f);
-        bool oob1 = (uv1Raw.x < 0.0f || uv1Raw.x > 1.0f || uv1Raw.y < 0.0f || uv1Raw.y > 1.0f);
-        float2 uv0 = clamp(uv0Raw, float2(0.0f), float2(1.0f));
-        float2 uv1 = clamp(uv1Raw, float2(0.0f), float2(1.0f));
-
-        half y0 = toUnitLumaH(inPrevY.sample(linearSampler, uv0).r, u.isVideoRange);
+        bool oob0 = (bestUV0Raw.x < 0.0f || bestUV0Raw.x > 1.0f || bestUV0Raw.y < 0.0f || bestUV0Raw.y > 1.0f);
+        bool oob1 = (bestUV1Raw.x < 0.0f || bestUV1Raw.x > 1.0f || bestUV1Raw.y < 0.0f || bestUV1Raw.y > 1.0f);
+        float2 uv0 = bestUV0;
+        float2 uv1 = bestUV1;
+        half y0 = bestY0;
+        half y1 = bestY1;
         half2 c0 = inPrevUV.sample(linearSampler, uv0).rg;
-        half y1 = toUnitLumaH(inCurrY.sample(linearSampler, uv1).r, u.isVideoRange);
         half2 c1 = inCurrUV.sample(linearSampler, uv1).rg;
 
-        float lumaDiff = abs(float(y0) - float(y1));
-        float occConf = smoothstep(0.008f, 0.032f, fbErr) * 0.65f + smoothstep(0.09f, 0.24f, lumaDiff) * 0.65f;
+        float occConf = smoothstep(0.010f, 0.032f, fbErr) * 0.55f + smoothstep(0.055f, 0.14f, bestDiff) * 0.85f;
         occConf = clamp(occConf, 0.0f, 1.0f);
 
         float w1 = t;
@@ -929,6 +975,9 @@ final class MetalVideoEnhancer {
         forwardFlow: CVPixelBuffer,
         backwardFlow: CVPixelBuffer,
         phase: Float,
+        flowSignX: Float = 1.0,
+        flowSignY: Float = 1.0,
+        isNormalizedUV: Bool = false,
         on metalLayer: CAMetalLayer,
         preset: VideoEnhancementPreset,
         strength: VideoEnhancementStrength,
@@ -997,10 +1046,16 @@ final class MetalVideoEnhancer {
             : VideoEnhancementPlanner.parameters(for: .off, strength: strength)
         let isVideoRange: UInt32 = (currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
         let isBT601: UInt32 = Self.isBT601Matrix(on: currBuffer) ? 1 : 0
+        let texelW = 1.0 / Float(max(1, flowW))
+        let texelH = 1.0 / Float(max(1, flowH))
+        let scaleX = flowSignX * (isNormalizedUV ? 1.0 : texelW)
+        let scaleY = flowSignY * (isNormalizedUV ? 1.0 : texelH)
         var warpUniforms = MetalFlowWarpUniforms(
             phase: max(0.0, min(1.0, phase)),
-            invFlowWidth: 1.0 / Float(max(1, flowW)),
-            invFlowHeight: 1.0 / Float(max(1, flowH)),
+            flowScaleX: scaleX,
+            flowScaleY: scaleY,
+            flowTexelX: texelW,
+            flowTexelY: texelH,
             deblurStrength: params.deblurStrength,
             casStrength: params.casStrength,
             lineDarken: params.lineDarken,

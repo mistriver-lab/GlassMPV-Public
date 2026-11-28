@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.12"
+    static let releaseTag = "0.1.0-beta.13"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.13",
+            date: "2026-11-28",
+            highlights: [
+                "全新原生 4K 120fps Flow-Warp v2 架构：60 / 96 / 120fps 全程保留 100% 原生 3840×2160 输出（告别降分辨率 720p/1080p 与 120fps 自动跌档 96fps）—— ANE 每对源码帧仅算 1 次 960×540 双向光流场，源像素格式切换高速 32BGRA（带宽砍半，摆脱 64-bit RGhA 拖慢）",
+                "运行时真机光流向量自校准 (FlowVectorCalibrator)：首次出现动态帧即自动实测前后帧 SAD，实时锁定光流分量符号与像素/归一化单位，彻底根治向量轴向偏差引发的轮廓模糊",
+                "Metal 5-tap 联合光度边缘吸附着色器 + 14 帧紧凑 4K 解码缓冲上限：边缘与遮挡区域自动对齐前景/背景最清晰原始 4K 纹理消除光晕重影，并释放空闲 4K 硬解表面彻底消除卡顿，日志实测上报真实 GPU 耗时"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.12",
             date: "2026-11-28",

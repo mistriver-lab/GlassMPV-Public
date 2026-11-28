@@ -235,6 +235,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "opticalFlowDownsampleRestoreParameters" in metal_enhancer_src
     assert "displayFlowWarpYUVFragment" in metal_enhancer_src
     assert "renderFlowWarpedToLayerStatus" in metal_enhancer_src
+    assert "flowScaleX" in metal_enhancer_src
 
     local_proxy = ROOT / "Sources" / "Engine" / "LocalHTTPStreamProxy.swift"
     assert local_proxy.is_file(), f"Missing {local_proxy}"
@@ -290,6 +291,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "VTFrameProcessorOpticalFlow" in remote_worker_src
     assert "shouldUseHybridFlowWarp" in remote_worker_src
     assert "flowResolutionCaps" in remote_worker_src
+    assert "FlowVectorCalibrator" in remote_worker_src
+    assert "selectOptimalFlowSourceFormat" in remote_worker_src
+    assert "decodeFloat16" in remote_worker_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src

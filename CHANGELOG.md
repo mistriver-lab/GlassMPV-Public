@@ -2,6 +2,14 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.13] - 2026-11-28
+
+### 重大架构演进 (Major Architecture Upgrade)
+- **原生 4K 120fps Flow-Warp v2（无损原分辨率 + 120fps 满血稳帧）**：
+  - **运行时光流向量自校准 (`FlowVectorCalibrator`)**：首次检测到动态画面时即对 `prev / curr` 原始亮度网格与 `forwardFlow` 联合计算最小 SAD，自动锁定精确 `(signX, signY)` 与坐标单位，彻底消除此前坐标系正负号未知导致的运动重影发糊。
+  - **ANE 源格式减半 + 960×540 高精度单次光流**：优先选择 `420v` / `32BGRA` 替代 64-bit `RGhA`（带宽减半）并将光流场精度升至 `960×540`，每对帧仅需 1 次 ANE 调用，彻底突破 `120fps` 算力瓶颈、不再跌档至 `96fps`。
+  - **Metal 5-tap 联合光度边缘吸附 Warp + 紧凑 14 帧队列 (`MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：在运动轮廓/遮挡像素从邻域挑选光度最佳向量采样原生 `3840×2160` 纹理，同步将 `remoteFrameQueue` 收紧至 `14` 帧释放 4K 硬解 Surface 池消除卡顿，并向黑匣子日志上报真实 GPU 耗时。
+
 ## [v0.1.0-beta.12] - 2026-11-28
 
 ### 修复与架构稳态升级 (Fixed & Stabilized)

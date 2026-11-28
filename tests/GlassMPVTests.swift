@@ -2606,7 +2606,7 @@ final class GlassMPVTests: XCTestCase {
 
     @MainActor
     func testHybrid4KFlowWarpPlannerAndMetalRender() throws {
-        XCTAssertFalse(
+        XCTAssertTrue(
             RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
                 sourceWidth: 3840,
                 sourceHeight: 2160,
@@ -2615,9 +2615,9 @@ final class GlassMPVTests: XCTestCase {
                 isDolbyVision: false,
                 is8BitSDRPixelFormat: true
             ),
-            "默认应走稳定清晰的低延迟 ANE + MetalFX 通道，防止试验性 FlowWarp 引起边沿重影模糊"
+            "4K 120fps SDR 默认开启原生光流变形 v2 以保留真 4K 分辨率并突破 ANE 40ms 墙"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
                 sourceWidth: 3840,
                 sourceHeight: 2160,
@@ -2625,7 +2625,7 @@ final class GlassMPVTests: XCTestCase {
                 isHDR: false,
                 isDolbyVision: false,
                 is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                allowExperimentalFlowWarp: false
             )
         )
         XCTAssertTrue(
@@ -2635,8 +2635,7 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps96,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: true
             )
         )
         XCTAssertTrue(
@@ -2646,8 +2645,7 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps60,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: true
             )
         )
         XCTAssertFalse(
@@ -2657,8 +2655,7 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .x2,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: true
             )
         )
         XCTAssertEqual(OpticalFlowTargetFPS.fps96.effectiveTargetFPS(sourceFPS: 25.0), 100.0, accuracy: 0.01)
@@ -2671,8 +2668,7 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: true,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: true
             )
         )
         XCTAssertFalse(
@@ -2682,8 +2678,7 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: false,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: false
             )
         )
         XCTAssertFalse(
@@ -2693,24 +2688,35 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true,
-                allowExperimentalFlowWarp: true
+                is8BitSDRPixelFormat: true
             )
         )
 
         let flowCaps120 = RemoteOpticalFlowBudgetPlanner.flowResolutionCaps(forMaxInterpolatedFrames: 5)
-        XCTAssertEqual(flowCaps120.first?.0, 640)
-        XCTAssertEqual(flowCaps120.first?.1, 360)
+        XCTAssertEqual(flowCaps120.first?.0, 960)
+        XCTAssertEqual(flowCaps120.first?.1, 540)
         let flowPlan120 = RemoteOpticalFlowBudgetPlanner.buildHybridFlowCandidates(
             sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 5
         )
         XCTAssertEqual(flowPlan120.count, 2)
-        XCTAssertEqual(flowPlan120[0].width, 640)
-        XCTAssertEqual(flowPlan120[0].height, 360)
-        XCTAssertEqual(flowPlan120[1].width, 512)
-        XCTAssertEqual(flowPlan120[1].height, 288)
+        XCTAssertEqual(flowPlan120[0].width, 960)
+        XCTAssertEqual(flowPlan120[0].height, 540)
+        XCTAssertEqual(flowPlan120[1].width, 640)
+        XCTAssertEqual(flowPlan120[1].height, 360)
+
+        XCTAssertEqual(
+            FlowVectorCalibrator.selectOptimalFlowSourceFormat(from: [kCVPixelFormatType_64RGBAHalf, kCVPixelFormatType_32BGRA]),
+            kCVPixelFormatType_32BGRA
+        )
+        XCTAssertEqual(
+            FlowVectorCalibrator.selectOptimalFlowSourceFormat(from: [kCVPixelFormatType_64RGBAHalf, kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]),
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        )
+        XCTAssertEqual(FlowVectorCalibrator.decodeFloat16(FlowVectorCalibrator.encodeFloat16(3.5)), 3.5, accuracy: 0.01)
+        XCTAssertEqual(FlowVectorCalibrator.decodeFloat16(FlowVectorCalibrator.encodeFloat16(-2.25)), -2.25, accuracy: 0.01)
+        XCTAssertEqual(FlowVectorCalibrator.decodeFloat16(FlowVectorCalibrator.encodeFloat16(0.0)), 0.0, accuracy: 0.0001)
 
         XCTAssertEqual(
             MetalVideoEnhancer.flowMetalPixelFormat(for: kCVPixelFormatType_TwoComponent16Half),
@@ -2790,12 +2796,73 @@ final class GlassMPVTests: XCTestCase {
         let fwdBuf = try XCTUnwrap(fwdOpt)
         let bwdBuf = try XCTUnwrap(bwdOpt)
 
+        func fillPattern(_ buf: CVPixelBuffer, shiftX: Float, shiftY: Float) {
+            CVPixelBufferLockBaseAddress(buf, [])
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            let w = CVPixelBufferGetWidth(buf)
+            let h = CVPixelBufferGetHeight(buf)
+            let bpr = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+            guard let ptr = CVPixelBufferGetBaseAddressOfPlane(buf, 0)?.assumingMemoryBound(to: UInt8.self) else { return }
+            for y in 0..<h {
+                for x in 0..<w {
+                    let sx = Float(x) - shiftX
+                    let sy = Float(y) - shiftY
+                    let v = 128.0 + 70.0 * sin(sx * 0.25) * cos(sy * 0.30)
+                    ptr[y * bpr + x] = UInt8(max(16, min(235, Int(v.rounded()))))
+                }
+            }
+        }
+        func fillFlow(_ buf: CVPixelBuffer, dx: Float, dy: Float) {
+            CVPixelBufferLockBaseAddress(buf, [])
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            let w = CVPixelBufferGetWidth(buf)
+            let h = CVPixelBufferGetHeight(buf)
+            let bpr = CVPixelBufferGetBytesPerRow(buf)
+            guard let ptr = CVPixelBufferGetBaseAddress(buf) else { return }
+            let hx = FlowVectorCalibrator.encodeFloat16(dx)
+            let hy = FlowVectorCalibrator.encodeFloat16(dy)
+            for y in 0..<h {
+                let row = ptr.advanced(by: y * bpr).assumingMemoryBound(to: UInt16.self)
+                for x in 0..<w {
+                    row[x * 2] = hx
+                    row[x * 2 + 1] = hy
+                }
+            }
+        }
+
+        fillPattern(prevBuf, shiftX: 0, shiftY: 0)
+        fillPattern(currBuf, shiftX: 4, shiftY: 2)
+
+        fillFlow(fwdBuf, dx: 2.0, dy: 1.0)
+        let calNormal = try XCTUnwrap(FlowVectorCalibrator.calibrate(prevBuffer: prevBuf, currBuffer: currBuf, forwardFlow: fwdBuf))
+        XCTAssertTrue(calNormal.isLocked)
+        XCTAssertEqual(calNormal.signX, 1.0)
+        XCTAssertEqual(calNormal.signY, 1.0)
+        XCTAssertFalse(calNormal.isNormalizedUV)
+        XCTAssertLessThan(calNormal.calibratedSAD, calNormal.baselineSAD * 0.5)
+
+        fillFlow(fwdBuf, dx: 2.0, dy: -1.0)
+        let calYFlip = try XCTUnwrap(FlowVectorCalibrator.calibrate(prevBuffer: prevBuf, currBuffer: currBuf, forwardFlow: fwdBuf))
+        XCTAssertEqual(calYFlip.signX, 1.0)
+        XCTAssertEqual(calYFlip.signY, -1.0)
+
+        fillFlow(fwdBuf, dx: -2.0, dy: -1.0)
+        let calInv = try XCTUnwrap(FlowVectorCalibrator.calibrate(prevBuffer: prevBuf, currBuffer: currBuf, forwardFlow: fwdBuf))
+        XCTAssertEqual(calInv.signX, -1.0)
+        XCTAssertEqual(calInv.signY, -1.0)
+
+        fillFlow(fwdBuf, dx: 2.0, dy: 1.0)
+        fillFlow(bwdBuf, dx: -2.0, dy: -1.0)
+
         let status = enhancer.renderFlowWarpedToLayerStatus(
             prevBuffer: prevBuf,
             currBuffer: currBuf,
             forwardFlow: fwdBuf,
             backwardFlow: bwdBuf,
             phase: 0.4,
+            flowSignX: calNormal.signX,
+            flowSignY: calNormal.signY,
+            isNormalizedUV: calNormal.isNormalizedUV,
             on: metalLayer,
             preset: .off,
             strength: .standard,
