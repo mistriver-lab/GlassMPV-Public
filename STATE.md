@@ -2,18 +2,18 @@
 > 🚨 **反重力智能体铁律**：每次开启新会话首轮静默读取本文件，并在回复开头输出 <50 字【现场复原快照】。
 
 ## 📌 项目基本元数据
-- **工程名称**：`ipa开发`（私有主线 `mistriver-lab/GlassMPV` @ `29d0917` / 公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `29d0917` | 最新交付 IPA `dist/GlassMPV-0.1.0-beta.13-b44-unsigned.ipa`）
-- **当前阶段**：`已完成 v0.1.0-beta.13 (Build 44)：原生 4K 120fps Flow-Warp v2 —— 60/96/120fps 全程保留真 3840×2160 原分辨率输出，接入 FlowVectorCalibrator 运行时 SAD 向量符号/单位自校准、高速 32BGRA/420v 输入与 960×540 单次光流、Metal 5-tap 联合光度边缘吸附着色器及 14 帧紧凑 4K 硬解队列；CI Run 46116118353 全绿 49/49（8m30s）`
-- **最后活跃时间**：`2026-11-28 14:29:22` | **最近安全快照**：`29d0917`（CI Run `46116118353` 绿灯出包）
+- **工程名称**：`ipa开发`（私有主线 `mistriver-lab/GlassMPV` @ `b2bdc74` / 公开 CI 镜像 `mistriver-lab/GlassMPV-Public` @ `b2bdc74` | 最新交付 IPA `dist/GlassMPV-0.1.0-beta.14-b49-unsigned.ipa`）
+- **当前阶段**：`已完成 v0.1.0-beta.14 (Build 49)：纯 Metal 4 级 GPU 金字塔光流引擎 + 强制 sourceNormPool 标准化与 -19740 熔断防泄漏 + 单调送显守卫 RemoteDisplayCadenceGuard + 动态高刷队列扩容（24/30/36 帧）；CI Run 46161609576 全绿 52/52（9m51s）`
+- **最后活跃时间**：`2026-11-28 23:58:00` | **最近安全快照**：`b2bdc74`（CI Run `46161609576` 绿灯出包）
 - **运行环境**：`Swift 6.0 / iOS 26+ / XcodeGen + GitHub Actions macOS CI (无本地 Xcode)`
 
 ---
 
 ## 🎯 当前核心推进焦点 (Active Focus)
-`已完成 v0.1.0-beta.13 (Build 44)：原生 4K 120fps Flow-Warp v2 上线（不降分辨率保持真 4K + 120fps 不跌档 + 运行时 SAD 自校准 + 5-tap 边缘吸附 + 14 帧防卡顿）；CI Run 46116118353 全绿 49/49`
+`已完成 v0.1.0-beta.14 (Build 49)：60/96/120fps 改由 4 级 Metal GPU 金字塔光流在原分辨率 YUV 上直算直绘（零降采样糊化、静止区域零模糊），并彻底修复切画质 1440×810 触发 -19740 会话泄漏与闪烁跳帧；CI Run 46161609576 全绿 52/52`
 - 最近交付闭环（更早的历史里程碑已归档至 [CHANGELOG.md](CHANGELOG.md)）：
-    - **原生 4K 120fps Flow-Warp v2 (`v0.1.0-beta.13`)**：`FlowVectorCalibrator` 在首个动态画面联立 `prev/curr` 亮度自校准精确 `(signX, signY)` 与坐标单位并优选 `420v/32BGRA` 避开 `64RGBAHalf` (`RGhA`)，将 ANE 光流场提升至 `960×540`；`MetalVideoEnhancer` 新增 5-tap 联合光度边缘吸附与真实 GPU 耗时遥测，`VTOpticalFlowEngine` 收紧 Flow-Warp 队列至 14 帧释放 4K 硬解 Surface 池。
-    - **HLS / 误标 fMP4 切流与底栏换源、UI 防重叠闭环 (`v0.1.0-beta.12`)**：`QuarkDriveClient` 改用 `m3u8,fmp4` 优先并区分 `isHLS`；`LocalHTTPStreamProxy` 取消对无后缀 HLS 路由强拼 `.m3u8` 改用 `.stream` 并通过 `UpstreamStreamRelay` 嗅探 `Content-Type` / `#EXT` 前缀避免 `AVPlayer -1002`，切流立即 `cancelActiveChunkCaches()`；`LiquidGlassPlayerView` 底部内置画质流切换菜单 + `PlayerOverlayLayoutPolicy` 严格隔离加载/播控/续播提示。
+    - **零降采样 Metal GPU 金字塔光流 + 切画质闪烁/泄漏根治 (`v0.1.0-beta.14`)**：下线高耗超预算的 `VTOpticalFlowConfiguration`（RGhA 32.5–45.9ms）与静态背景符号错锁，改由 4 级纯 Metal GPU 金字塔光流 (`MetalPyramidOpticalFlowEngine`) 计算归一化双向 UV 位移并在 `displayFlowWarpYUVFragment` 零降采样直绘；强制 `sourceNormPool` 标准化并加入 `1280×720` 候选、2 次异常熔断与 `RemoteDisplayCadenceGuard` 单调 PTS 守卫，高刷队列上限由 14 恢复至 24/30/36 帧。
+    - **原生 4K 120fps Flow-Warp v2 (`v0.1.0-beta.13`)**：新增 5-tap 联合光度边缘吸附着色器、FP16 编解码自校准工具及真实 GPU 耗时遥测。
 
 ---
 
@@ -26,13 +26,13 @@
 
 ## 🧪 最近一次自动化门禁状态 (Latest Verification Gate)
 <!-- AGY:REGRESSION:START -->
-> 🟢 **[PASS]** `GlassMPV v0.1.0-beta.13`（`mistriver-lab/GlassMPV-Public` @ `29d0917`，CI Run `46116118353`，总耗时 `8m30s`）iOS 模拟器 `GlassMPVTests` 49/49 通过（`Executed 49 tests, with 0 failures (0 unexpected) in 30.194 (31.272) seconds`，含 `FlowVectorCalibrator` 真值合成符号/单位校准测试与 5-tap Metal Warp 渲染校验）且 Release `iphoneos` 打包全绿，交付 `dist/GlassMPV-0.1.0-beta.13-b44-unsigned.ipa`（`3,954,371` bytes，`CFBundleIdentifier=com.glassmpv.player`，`CFBundleShortVersionString=0.1.0`，`CFBundleVersion=44`，含 `Assets.car`，0 个 `.glsl` 着色器）；主仓本地 `pytest tests/test_project_integrity.py -v`（`6 passed in 0.56s`）PASS
+> 🟢 **[PASS]** `GlassMPV v0.1.0-beta.14`（`mistriver-lab/GlassMPV-Public` @ `b2bdc74`，CI Run `46161609576`，总耗时 `9m51s`）iOS 模拟器 `GlassMPVTests` 52/52 通过（`Executed 52 tests, with 0 failures (0 unexpected) in 34.735 (34.857) seconds`，含 Metal 金字塔真 GPU 运动追踪与像素 MAE 清晰度校验、单调时钟无闪烁队列守卫、切流标准化测试）且 Release `iphoneos` 打包全绿，交付 `dist/GlassMPV-0.1.0-beta.14-b49-unsigned.ipa`（`3,959,184` bytes，`CFBundleIdentifier=com.glassmpv.player`，`CFBundleShortVersionString=0.1.0`，`CFBundleVersion=49`，含 `Assets.car`，0 个 `.glsl` 着色器）；主仓本地 `pytest tests/test_project_integrity.py -v`（`6 passed in 0.41s`）PASS
 <!-- AGY:REGRESSION:END -->
-- **门禁评级**：🟢 [PASS]（本地 `pytest 6/6`、远程 macOS `GlassMPVTests 49/49` 与 Release Beta IPA 交付均已绿灯）
+- **门禁评级**：🟢 [PASS]（本地 `pytest 6/6`、远程 macOS `GlassMPVTests 52/52` 与 Release Beta IPA 交付均已绿灯）
 - **交付与工作区归档**：
-  - 最新交付 IPA：`dist/GlassMPV-0.1.0-beta.13-b44-unsigned.ipa`（`3,954,371` bytes）。
-  - 最新实机定因日志：`GlassMPV-Log-20261128-140944.txt`。
+  - 最新交付 IPA：`dist/GlassMPV-0.1.0-beta.14-b49-unsigned.ipa`（`3,959,184` bytes）。
+  - 最新实机定因日志：`GlassMPV-Log-20261128-230804.txt`。
 - **待办清单**：
-  - [x] 完成 `v0.1.0-beta.13 (Build 44)` 原生 4K 120fps Flow-Warp v2（`FlowVectorCalibrator` 运行时自校准 + `32BGRA`/`420v` + `960×540` + Metal 5-tap 边缘吸附 + 14 帧队列），CI Run `46116118353`（49/49 PASS，`8m30s`）。
-  - [x] 下载校验 `dist/GlassMPV-0.1.0-beta.13-b44-unsigned.ipa`（`3,954,371` bytes）并发送至微信「文件传输助手」。
-  - [ ] 用户安装 `v0.1.0-beta.13-b44` 真机实测：播放 `3840×2160` 夸克原画直链验证「4K原生光流变形 3840×2160」清晰度、120fps 满血稳帧与 `4K光流向量自校准锁定` 日志指标。
+  - [x] 完成 `v0.1.0-beta.14 (Build 49)` Metal GPU 金字塔光流引擎 + `1440×810` `-19740` 池标准化与熔断 + `RemoteDisplayCadenceGuard` 单调送显守卫 + `24/30/36` 动态高刷队列扩容，CI Run `46161609576`（52/52 PASS，`9m51s`）。
+  - [x] 下载校验 `dist/GlassMPV-0.1.0-beta.14-b49-unsigned.ipa`（`3,959,184` bytes）并发送至微信「文件传输助手」。
+  - [ ] 用户安装 `v0.1.0-beta.14-b49` 真机实测：播放夸克原画直链体验 `60/96/120fps` Metal GPU 原生光流效果，并切换 `夸克 1080P+` 等画质验证闪烁卡顿消除与内存稳态。
