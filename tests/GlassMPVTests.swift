@@ -3191,4 +3191,345 @@ final class GlassMPVTests: XCTestCase {
         XCTAssertEqual(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: "原画直链"), "原画")
         XCTAssertEqual(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: "夸克 · 夸克 1080P+"), "1080P+")
     }
+
+    @MainActor
+    func testMetalPyramidOpticalFlowRealMotionAccuracyAndSharpness() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            return
+        }
+        let width = 640
+        let height = 360
+        let ioAttrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        func makeFullRangeBuffer() throws -> CVPixelBuffer {
+            var pb: CVPixelBuffer?
+            let st = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                ioAttrs as CFDictionary,
+                &pb
+            )
+            XCTAssertEqual(st, kCVReturnSuccess)
+            return try XCTUnwrap(pb)
+        }
+
+        func fillSyntheticScene(_ buf: CVPixelBuffer, blockCenterX: Float, blockCenterY: Float, invertScene: Bool = false) {
+            CVPixelBufferLockBaseAddress(buf, [])
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            let yBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+            let uvBPR = CVPixelBufferGetBytesPerRowOfPlane(buf, 1)
+            let uvW = CVPixelBufferGetWidthOfPlane(buf, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(buf, 1)
+            if let yPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 0)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<height {
+                    for x in 0..<width {
+                        if invertScene {
+                            let val = 128.0 + 95.0 * cos(Float(x) * 0.11 - Float(y) * 0.09) * sin(Float(x + y) * 0.05)
+                            yPtr[y * yBPR + x] = UInt8(max(0, min(255, Int(val.rounded()))))
+                        } else {
+                            let dx = Float(x) - blockCenterX
+                            let dy = Float(y) - blockCenterY
+                            let val: Float
+                            if abs(dx) <= 72.0 && abs(dy) <= 52.0 {
+                                val = 165.0 + 70.0 * sin(dx * 0.28) * cos(dy * 0.28)
+                            } else {
+                                val = 58.0 + 18.0 * sin(Float(x) * 0.14) * cos(Float(y) * 0.14)
+                            }
+                            yPtr[y * yBPR + x] = UInt8(max(0, min(255, Int(val.rounded()))))
+                        }
+                    }
+                }
+            }
+            if let uvPtr = CVPixelBufferGetBaseAddressOfPlane(buf, 1)?.assumingMemoryBound(to: UInt8.self) {
+                for y in 0..<uvH {
+                    for x in 0..<uvW {
+                        uvPtr[y * uvBPR + x * 2] = 128
+                        uvPtr[y * uvBPR + x * 2 + 1] = 128
+                    }
+                }
+            }
+        }
+
+        let prevBuf = try makeFullRangeBuffer()
+        let currBuf = try makeFullRangeBuffer()
+        let gtMidBuf = try makeFullRangeBuffer()
+        let cutBuf = try makeFullRangeBuffer()
+
+        fillSyntheticScene(prevBuf, blockCenterX: 280, blockCenterY: 180)
+        fillSyntheticScene(currBuf, blockCenterX: 304, blockCenterY: 168)
+        fillSyntheticScene(gtMidBuf, blockCenterX: 292, blockCenterY: 174)
+        fillSyntheticScene(cutBuf, blockCenterX: 280, blockCenterY: 180, invertScene: true)
+
+        let flowEngine = MetalPyramidOpticalFlowEngine()
+        XCTAssertNil(flowEngine.shaderInitError)
+
+        let flowResult = try XCTUnwrap(await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: currBuf))
+        XCTAssertFalse(flowResult.isSceneCut, "连续运动帧不应误触发切镜保护")
+
+        func readFlowVector(texture: MTLTexture, normU: Double, normV: Double) -> (dxPx: Float, dyPx: Float) {
+            let w = texture.width
+            let h = texture.height
+            let bpr = w * 4
+            var raw = [UInt16](repeating: 0, count: w * h * 2)
+            raw.withUnsafeMutableBytes { buf in
+                if let base = buf.baseAddress {
+                    texture.getBytes(base, bytesPerRow: bpr, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+                }
+            }
+            let tx = max(0, min(w - 1, Int((normU * Double(w)).rounded())))
+            let ty = max(0, min(h - 1, Int((normV * Double(h)).rounded())))
+            let idx = (ty * w + tx) * 2
+            let fu = FlowVectorCalibrator.decodeFloat16(raw[idx])
+            let fv = FlowVectorCalibrator.decodeFloat16(raw[idx + 1])
+            return (fu * Float(width), fv * Float(height))
+        }
+
+        let fwdCenter = readFlowVector(texture: flowResult.forwardFlow.texture, normU: 280.0 / Double(width), normV: 180.0 / Double(height))
+        XCTAssertEqual(fwdCenter.dxPx, 24.0, accuracy: 3.0, "前向光流 X 位移应精确追踪 +24px 物体运动")
+        XCTAssertEqual(fwdCenter.dyPx, -12.0, accuracy: 3.0, "前向光流 Y 位移应精确追踪 -12px 物体运动")
+
+        let bwdCenter = readFlowVector(texture: flowResult.backwardFlow.texture, normU: 304.0 / Double(width), normV: 168.0 / Double(height))
+        XCTAssertEqual(bwdCenter.dxPx, -24.0, accuracy: 3.0, "后向光流 X 位移应精确追踪 -24px")
+        XCTAssertEqual(bwdCenter.dyPx, 12.0, accuracy: 3.0, "后向光流 Y 位移应精确追踪 +12px")
+
+        let bgVec = readFlowVector(texture: flowResult.forwardFlow.texture, normU: 60.0 / Double(width), normV: 60.0 / Double(height))
+        XCTAssertLessThan(hypot(bgVec.dxPx, bgVec.dyPx), 1.5, "静止纹理背景光流应锁定接近 0，避免拖影模糊")
+
+        let cutResult = try XCTUnwrap(await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: cutBuf))
+        XCTAssertTrue(cutResult.isSceneCut, "大幅切镜帧对必须触发 scene-cut 保护")
+
+        let enhancer = MetalVideoEnhancer()
+        XCTAssertNil(enhancer.shaderInitError)
+        let warpedBGRA = try XCTUnwrap(
+            enhancer.renderFlowWarpedOffscreenForTesting(
+                prevBuffer: prevBuf,
+                currBuffer: currBuf,
+                forwardFlowTexture: flowResult.forwardFlow.texture,
+                backwardFlowTexture: flowResult.backwardFlow.texture,
+                phase: 0.5,
+                isSceneCut: false
+            )
+        )
+
+        CVPixelBufferLockBaseAddress(prevBuf, .readOnly)
+        CVPixelBufferLockBaseAddress(currBuf, .readOnly)
+        CVPixelBufferLockBaseAddress(gtMidBuf, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(gtMidBuf, .readOnly)
+            CVPixelBufferUnlockBaseAddress(currBuf, .readOnly)
+            CVPixelBufferUnlockBaseAddress(prevBuf, .readOnly)
+        }
+        let pPtr = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(prevBuf, 0)?.assumingMemoryBound(to: UInt8.self))
+        let cPtr = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(currBuf, 0)?.assumingMemoryBound(to: UInt8.self))
+        let gPtr = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(gtMidBuf, 0)?.assumingMemoryBound(to: UInt8.self))
+        let pBPR = CVPixelBufferGetBytesPerRowOfPlane(prevBuf, 0)
+        let cBPR = CVPixelBufferGetBytesPerRowOfPlane(currBuf, 0)
+        let gBPR = CVPixelBufferGetBytesPerRowOfPlane(gtMidBuf, 0)
+
+        var warpedBlockErr: Double = 0
+        var prevBlockErr: Double = 0
+        var blendBlockErr: Double = 0
+        var blockSamples = 0
+        for y in 140..<210 {
+            for x in 242..<342 {
+                let offset = (y * width + x) * 4
+                let wY = Double(warpedBGRA[offset + 1])
+                let gY = Double(gPtr[y * gBPR + x])
+                let pY = Double(pPtr[y * pBPR + x])
+                let cY = Double(cPtr[y * cBPR + x])
+                warpedBlockErr += abs(wY - gY)
+                prevBlockErr += abs(pY - gY)
+                blendBlockErr += abs(0.5 * (pY + cY) - gY)
+                blockSamples += 1
+            }
+        }
+        let warpedMAE = warpedBlockErr / Double(blockSamples)
+        let uninterpolatedMAE = prevBlockErr / Double(blockSamples)
+        let naiveBlendMAE = blendBlockErr / Double(blockSamples)
+
+        XCTAssertLessThan(warpedMAE, uninterpolatedMAE * 0.25, "t=0.5 运动区域必须真正跟随光流位移而非停留在原帧")
+        XCTAssertLessThan(warpedMAE, naiveBlendMAE * 0.35, "t=0.5 运动区域必须清晰保真而非前后帧半透明重影")
+
+        var bgErr: Double = 0
+        var bgSamples = 0
+        for y in 20..<100 {
+            for x in 20..<120 {
+                let offset = (y * width + x) * 4
+                let wY = Double(warpedBGRA[offset + 1])
+                let gY = Double(gPtr[y * gBPR + x])
+                bgErr += abs(wY - gY)
+                bgSamples += 1
+            }
+        }
+        let bgMAE = bgErr / Double(bgSamples)
+        XCTAssertLessThan(bgMAE, 4.0, "静止背景必须零降质直出")
+    }
+
+    func testRemoteDisplayCadenceGuardAndHighFPSQueueCapNoDrops() {
+        var guardState = RemoteDisplayCadenceGuard()
+        var presentedPTS: [Double] = []
+
+        // 复现 b44 1440x810 故障：实时解码领先帧(725.00+)与延迟回退队列帧(724.92+)交错竞争
+        XCTAssertTrue(guardState.shouldAcceptDirectFallback(samplePTS: 725.00, hostTime: 10.00, queueIsEmpty: true, interpolatedCount: 0, lastPresentedHostTime: 0))
+        presentedPTS.append(725.00)
+
+        XCTAssertFalse(guardState.shouldAcceptQueueFrame(mediaPTS: 724.92), "绝不允许回退呈递比当前更早的队列帧")
+        XCTAssertFalse(guardState.shouldAcceptQueueFrame(mediaPTS: 724.96), "绝不允许回退呈递比当前更早的队列帧")
+        XCTAssertFalse(guardState.shouldAcceptQueueFrame(mediaPTS: 725.00), "绝不允许重复呈递相同时间戳")
+
+        XCTAssertTrue(guardState.shouldAcceptDirectFallback(samplePTS: 725.04, hostTime: 10.04, queueIsEmpty: true, interpolatedCount: 0, lastPresentedHostTime: 10.00))
+        presentedPTS.append(725.04)
+
+        XCTAssertTrue(guardState.shouldAcceptQueueFrame(mediaPTS: 725.08))
+        presentedPTS.append(725.08)
+
+        // 一旦队列帧生效，即使短暂队列抽空，也不允许在 0.35s 窗口内抢插直通帧造成时间跳变闪烁
+        XCTAssertFalse(guardState.shouldAcceptDirectFallback(samplePTS: 725.20, hostTime: 10.12, queueIsEmpty: true, interpolatedCount: 0, lastPresentedHostTime: 10.08))
+        XCTAssertTrue(guardState.shouldAcceptDirectFallback(samplePTS: 725.44, hostTime: 10.45, queueIsEmpty: true, interpolatedCount: 0, lastPresentedHostTime: 10.08), "超过 0.35s 真断流才允许救援")
+        presentedPTS.append(725.44)
+
+        for idx in 1..<presentedPTS.count {
+            XCTAssertGreaterThan(presentedPTS[idx], presentedPTS[idx - 1], "呈递 PTS 必须严格单调递增，消除闪烁跳帧")
+        }
+
+        XCTAssertEqual(RemoteOpticalFlowBudgetPlanner.recommendedFlowQueueCap(targetFPS: 60.0, maxQueued: 30), 24)
+        XCTAssertEqual(RemoteOpticalFlowBudgetPlanner.recommendedFlowQueueCap(targetFPS: 100.0, maxQueued: 50), 30)
+        XCTAssertEqual(RemoteOpticalFlowBudgetPlanner.recommendedFlowQueueCap(targetFPS: 120.0, maxQueued: 60), 36)
+
+        // 模拟 25fps -> 120fps 连续 2 秒推流，验证新上限 36 帧零队列头驱逐丢帧
+        let cap = RemoteOpticalFlowBudgetPlanner.recommendedFlowQueueCap(targetFPS: 120.0, maxQueued: 60)
+        var simQueue: [(pts: Double, buffer: Int)] = []
+        var headEvictions = 0
+        var clockPTS: Double = 0.0
+        var pacerLag = RemoteOpticalFlowBudgetPlanner.recommendedMetalFlowPacerLagSeconds(sourceFPS: 25.0, averageFlowMs: 3.5)
+        XCTAssertGreaterThanOrEqual(pacerLag, 0.075)
+        XCTAssertLessThanOrEqual(pacerLag, 0.115)
+        pacerLag = 0.085
+
+        var nextPairIdx = 1
+        for tick in 0..<240 {
+            clockPTS = Double(tick) / 120.0
+            let sourceInterval = 0.040
+            if Double(nextPairIdx) * sourceInterval <= clockPTS + 0.0001 {
+                let prevPTS = Double(nextPairIdx - 1) * sourceInterval
+                for k in 1...4 {
+                    if simQueue.count >= cap {
+                        simQueue.removeFirst()
+                        headEvictions += 1
+                    }
+                    simQueue.append((pts: prevPTS + Double(k) * 0.008, buffer: k))
+                }
+                if simQueue.count >= cap {
+                    simQueue.removeFirst()
+                    headEvictions += 1
+                }
+                simQueue.append((pts: Double(nextPairIdx) * sourceInterval, buffer: 5))
+                nextPairIdx += 1
+            }
+            let pacerNow = max(0.0, clockPTS - pacerLag)
+            _ = OpticalFlowFramePacer.dequeueNextFrame(from: &simQueue, now: pacerNow, isInterpolationEnabled: true, maxLateGraceSeconds: 0.120)
+        }
+        XCTAssertEqual(headEvictions, 0, "120fps 动态队列上限必须彻底消除未呈递帧静默驱逐丢帧")
+    }
+
+    func testRemoteSourceNormalizationAndVariantSwitchMetalFlow() async throws {
+        XCTAssertTrue(RemoteOpticalFlowBudgetPlanner.shouldForceNormalizeSourceBuffer(hasNormPool: true))
+        XCTAssertFalse(RemoteOpticalFlowBudgetPlanner.shouldForceNormalizeSourceBuffer(hasNormPool: false))
+
+        let plan1440 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
+            sourceWidth: 1440,
+            sourceHeight: 810,
+            maxInterpolatedFrames: 1
+        )
+        XCTAssertGreaterThanOrEqual(plan1440.count, 2, "1440x810 必须保留 1280x720 16-aligned 安全降级档")
+        XCTAssertEqual(plan1440[0].width, 1440)
+        XCTAssertEqual(plan1440[1].width, 1280)
+        XCTAssertEqual(plan1440[1].height, 720)
+
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            return
+        }
+
+        let boxLock = NSLock()
+        var emittedMetalBatches = 0
+        var totalInterpolated = 0
+        var lastPTS: Double = -1
+        var monotonicOK = true
+
+        let worker = RemoteStreamOpticalFlowWorker(
+            targetFPS: .fps60,
+            sourceFPS: 25.0
+        ) { frames, delta, _, _ in
+            boxLock.lock()
+            let hasMetalWarp = frames.contains {
+                if case .metalFlowWarped = $0.payload { return true }
+                return false
+            }
+            if hasMetalWarp {
+                emittedMetalBatches += 1
+            }
+            totalInterpolated += delta
+            for frame in frames {
+                if frame.pts <= lastPTS {
+                    monotonicOK = false
+                }
+                lastPTS = frame.pts
+            }
+            boxLock.unlock()
+        }
+
+        func makeBuffer(width: Int, height: Int, shift: Float) throws -> CVPixelBuffer {
+            var pb: CVPixelBuffer?
+            let ioAttrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+            XCTAssertEqual(
+                CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, ioAttrs as CFDictionary, &pb),
+                kCVReturnSuccess
+            )
+            let buf = try XCTUnwrap(pb)
+            CVPixelBufferLockBaseAddress(buf, [])
+            if let base = CVPixelBufferGetBaseAddressOfPlane(buf, 0)?.assumingMemoryBound(to: UInt8.self) {
+                let bpr = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+                for y in stride(from: 0, to: height, by: 2) {
+                    for x in stride(from: 0, to: width, by: 2) {
+                        let v = UInt8(max(16, min(235, Int(128 + 60 * sin((Float(x) - shift) * 0.08) * cos(Float(y) * 0.08)))))
+                        base[y * bpr + x] = v
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buf, [])
+            return buf
+        }
+
+        for i in 0..<4 {
+            let buf = try makeBuffer(width: 1440, height: 810, shift: Float(i * 4))
+            worker.submitFrame(pts: Double(i) * 0.04, box: RemoteSendablePixelBuffer(buffer: buf))
+        }
+        try await Task.sleep(for: .milliseconds(350))
+
+        worker.reconfigure(targetFPS: .fps120, sourceFPS: 25.0)
+        for i in 0..<4 {
+            let pts = 1.0 + Double(i) * 0.04
+            let buf = try makeBuffer(width: 1920, height: 1080, shift: Float(i * 6))
+            worker.submitFrame(pts: pts, box: RemoteSendablePixelBuffer(buffer: buf))
+        }
+        try await Task.sleep(for: .milliseconds(450))
+
+        boxLock.lock()
+        let batchesSnapshot = emittedMetalBatches
+        let interpSnapshot = totalInterpolated
+        let monotonicSnapshot = monotonicOK
+        boxLock.unlock()
+
+        XCTAssertGreaterThanOrEqual(batchesSnapshot, 4, "60/120fps 跨分辨率切换后必须稳定输出 Metal GPU 原生光流变形帧")
+        XCTAssertGreaterThan(interpSnapshot, 10)
+        XCTAssertTrue(monotonicSnapshot, "跨分辨率重配后的输出帧时间戳必须严格递增")
+    }
 }

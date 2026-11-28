@@ -40,6 +40,7 @@ private struct MetalFlowWarpUniforms {
     var isBT601: UInt32
     var compareMode: UInt32
     var splitX: Float
+    var isSceneCut: UInt32
 }
 
 enum MetalDirectRenderResult: Equatable, Sendable {
@@ -181,6 +182,7 @@ final class MetalVideoEnhancer {
         uint isBT601;
         uint compareMode;
         float splitX;
+        uint isSceneCut;
     };
 
     struct QuadVaryings {
@@ -502,7 +504,7 @@ final class MetalVideoEnhancer {
             ? inPrevUV.sample(linearSampler, uv).rg
             : inCurrUV.sample(linearSampler, uv).rg;
 
-        if (u.compareMode == 2u) {
+        if (u.compareMode == 2u || u.isSceneCut != 0u) {
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
         float invWidth = 1.0f / max(1.0f, float(inCurrY.get_width()));
@@ -580,6 +582,9 @@ final class MetalVideoEnhancer {
         }
 
         float flowMag = length(bestFlow);
+        if (flowMag < 0.00025f) {
+            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+        }
         // 转场/极端运动保护：避免整帧撕裂重影，直接输出最近原生高分辨率参考帧
         if (flowMag > 0.18f || (fbErr > 0.045f && bestDiff > 0.12f)) {
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
@@ -986,6 +991,94 @@ final class MetalVideoEnhancer {
         outputFPS: Double = 120.0,
         thermalState: ProcessInfo.ThermalState = .nominal
     ) -> MetalDirectRenderResult {
+        guard let textureCache else {
+            return .unavailable
+        }
+        guard let fwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(forwardFlow)),
+              let bwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(backwardFlow)),
+              let fwdTex = makeTexture(from: forwardFlow, pixelFormat: fwdMetalFmt, plane: 0, cache: textureCache),
+              let bwdTex = makeTexture(from: backwardFlow, pixelFormat: bwdMetalFmt, plane: 0, cache: textureCache) else {
+            return .unavailable
+        }
+        return renderFlowWarpedTexturesToLayerStatus(
+            prevBuffer: prevBuffer,
+            currBuffer: currBuffer,
+            forwardFlowTexture: fwdTex,
+            backwardFlowTexture: bwdTex,
+            phase: phase,
+            flowSignX: flowSignX,
+            flowSignY: flowSignY,
+            isNormalizedUV: isNormalizedUV,
+            isSceneCut: false,
+            pipelinePrefix: nil,
+            on: metalLayer,
+            preset: preset,
+            strength: strength,
+            aspectFill: aspectFill,
+            compareMode: compareMode,
+            outputFPS: outputFPS,
+            thermalState: thermalState
+        )
+    }
+
+    /// 原生全分辨率双向遮挡感知 GPU 光流变形直绘（直接消费 MetalPyramidOpticalFlowEngine 归一化 UV 位移纹理）
+    func renderFlowWarpedToLayerStatus(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlowTexture: MTLTexture,
+        backwardFlowTexture: MTLTexture,
+        phase: Float,
+        isSceneCut: Bool,
+        on metalLayer: CAMetalLayer,
+        preset: VideoEnhancementPreset,
+        strength: VideoEnhancementStrength,
+        aspectFill: Bool,
+        compareMode: VideoEnhancementCompareMode = .off,
+        outputFPS: Double = 120.0,
+        thermalState: ProcessInfo.ThermalState = .nominal
+    ) -> MetalDirectRenderResult {
+        renderFlowWarpedTexturesToLayerStatus(
+            prevBuffer: prevBuffer,
+            currBuffer: currBuffer,
+            forwardFlowTexture: forwardFlowTexture,
+            backwardFlowTexture: backwardFlowTexture,
+            phase: phase,
+            flowSignX: 1.0,
+            flowSignY: 1.0,
+            isNormalizedUV: true,
+            isSceneCut: isSceneCut,
+            pipelinePrefix: max(CVPixelBufferGetWidth(currBuffer), CVPixelBufferGetHeight(currBuffer)) >= 3000 ? "4K原生GPU光流变形" : "原生GPU光流变形",
+            on: metalLayer,
+            preset: preset,
+            strength: strength,
+            aspectFill: aspectFill,
+            compareMode: compareMode,
+            outputFPS: outputFPS,
+            thermalState: thermalState
+        )
+    }
+
+    private func renderFlowWarpedTexturesToLayerStatus(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlowTexture fwdTex: MTLTexture,
+        backwardFlowTexture bwdTex: MTLTexture,
+        phase: Float,
+        flowSignX: Float,
+        flowSignY: Float,
+        isNormalizedUV: Bool,
+        isSceneCut: Bool,
+        pipelinePrefix: String?,
+        on metalLayer: CAMetalLayer,
+        preset: VideoEnhancementPreset,
+        strength: VideoEnhancementStrength,
+        aspectFill: Bool,
+        compareMode: VideoEnhancementCompareMode,
+        outputFPS: Double,
+        thermalState: ProcessInfo.ThermalState
+    ) -> MetalDirectRenderResult {
+        _ = outputFPS
+        _ = thermalState
         guard let commandQueue,
               let textureCache,
               let displayFlowWarpYUVRenderPipeline else {
@@ -1002,15 +1095,10 @@ final class MetalVideoEnhancer {
             return .unavailable
         }
 
-        guard let fwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(forwardFlow)),
-              let bwdMetalFmt = Self.flowMetalPixelFormat(for: CVPixelBufferGetPixelFormatType(backwardFlow)) else {
-            return .unavailable
-        }
-
         let srcW = CVPixelBufferGetWidth(currBuffer)
         let srcH = CVPixelBufferGetHeight(currBuffer)
-        let flowW = CVPixelBufferGetWidth(forwardFlow)
-        let flowH = CVPixelBufferGetHeight(forwardFlow)
+        let flowW = fwdTex.width
+        let flowH = fwdTex.height
         guard srcW >= 2, srcH >= 2, flowW >= 2, flowH >= 2 else {
             return .unavailable
         }
@@ -1035,9 +1123,7 @@ final class MetalVideoEnhancer {
         guard let prevY = makeTexture(from: prevBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
               let prevUV = makeTexture(from: prevBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
               let currY = makeTexture(from: currBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
-              let currUV = makeTexture(from: currBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
-              let fwdTex = makeTexture(from: forwardFlow, pixelFormat: fwdMetalFmt, plane: 0, cache: textureCache),
-              let bwdTex = makeTexture(from: backwardFlow, pixelFormat: bwdMetalFmt, plane: 0, cache: textureCache) else {
+              let currUV = makeTexture(from: currBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache) else {
             return .unavailable
         }
 
@@ -1064,7 +1150,8 @@ final class MetalVideoEnhancer {
             isVideoRange: isVideoRange,
             isBT601: isBT601,
             compareMode: compareMode.uniformValue,
-            splitX: 0.5
+            splitX: 0.5,
+            isSceneCut: isSceneCut ? 1 : 0
         )
 
         let scaleVec = Self.aspectVertexScale(
@@ -1109,10 +1196,11 @@ final class MetalVideoEnhancer {
         didCommit = true
         commandBuffer.commit()
 
-        let prefix = max(srcW, srcH) >= 3000 ? "4K原生光流变形" : "原生光流变形"
+        let defaultPrefix = max(srcW, srcH) >= 3000 ? "4K原生光流变形" : "原生光流变形"
+        let resolvedPrefix = pipelinePrefix ?? defaultPrefix
         activePipelineLabel = preset != .off && compareMode != .original
-            ? "\(prefix)·\(preset.rawValue) \(srcW)×\(srcH)"
-            : "\(prefix) \(srcW)×\(srcH)"
+            ? "\(resolvedPrefix)·\(preset.rawValue) \(srcW)×\(srcH)"
+            : "\(resolvedPrefix) \(srcW)×\(srcH)"
         enhancedFrameCount += 1
         let snapMs = gpuTimingTracker.snapshotAverageMs()
         if snapMs > 0 {
@@ -1122,6 +1210,101 @@ final class MetalVideoEnhancer {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
         return .rendered
+    }
+
+    /// 离屏渲染 Flow-Warp 着色器并返回 BGRA8 像素字节（专用于 XCTest 像素级真实运动插值精度回归）
+    func renderFlowWarpedOffscreenForTesting(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlowTexture: MTLTexture,
+        backwardFlowTexture: MTLTexture,
+        phase: Float,
+        isSceneCut: Bool = false
+    ) -> [UInt8]? {
+        guard let device,
+              let commandQueue,
+              let textureCache,
+              let displayFlowWarpYUVRenderPipeline else {
+            return nil
+        }
+        let srcW = CVPixelBufferGetWidth(currBuffer)
+        let srcH = CVPixelBufferGetHeight(currBuffer)
+        let flowW = forwardFlowTexture.width
+        let flowH = forwardFlowTexture.height
+        guard srcW >= 2, srcH >= 2, flowW >= 2, flowH >= 2 else { return nil }
+
+        let currFmt = CVPixelBufferGetPixelFormatType(currBuffer)
+        let isVideoRange: UInt32 = (currFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 0 : 1
+        let isBT601: UInt32 = Self.isBT601Matrix(on: currBuffer) ? 1 : 0
+
+        let outDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: srcW,
+            height: srcH,
+            mipmapped: false
+        )
+        outDesc.usage = [.renderTarget, .shaderRead]
+        outDesc.storageMode = .shared
+        guard let outTex = device.makeTexture(descriptor: outDesc),
+              let prevY = makeTexture(from: prevBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+              let prevUV = makeTexture(from: prevBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+              let currY = makeTexture(from: currBuffer, pixelFormat: .r8Unorm, plane: 0, cache: textureCache),
+              let currUV = makeTexture(from: currBuffer, pixelFormat: .rg8Unorm, plane: 1, cache: textureCache),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return nil
+        }
+
+        var warpUniforms = MetalFlowWarpUniforms(
+            phase: max(0.0, min(1.0, phase)),
+            flowScaleX: 1.0,
+            flowScaleY: 1.0,
+            flowTexelX: 1.0 / Float(max(1, flowW)),
+            flowTexelY: 1.0 / Float(max(1, flowH)),
+            deblurStrength: 0,
+            casStrength: 0,
+            lineDarken: 0,
+            clarityStrength: 0,
+            noiseDeadzone: 0,
+            isVideoRange: isVideoRange,
+            isBT601: isBT601,
+            compareMode: 0,
+            splitX: 0.5,
+            isSceneCut: isSceneCut ? 1 : 0
+        )
+        var vertexUniforms = MetalDisplayVertexUniforms(scaleX: 1.0, scaleY: 1.0)
+
+        let rpd = MTLRenderPassDescriptor()
+        rpd.colorAttachments[0].texture = outTex
+        rpd.colorAttachments[0].loadAction = .clear
+        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        rpd.colorAttachments[0].storeAction = .store
+
+        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else {
+            return nil
+        }
+        renderEncoder.setRenderPipelineState(displayFlowWarpYUVRenderPipeline)
+        renderEncoder.setVertexBytes(&vertexUniforms, length: MemoryLayout<MetalDisplayVertexUniforms>.size, index: 0)
+        renderEncoder.setFragmentTexture(prevY, index: 0)
+        renderEncoder.setFragmentTexture(prevUV, index: 1)
+        renderEncoder.setFragmentTexture(currY, index: 2)
+        renderEncoder.setFragmentTexture(currUV, index: 3)
+        renderEncoder.setFragmentTexture(forwardFlowTexture, index: 4)
+        renderEncoder.setFragmentTexture(backwardFlowTexture, index: 5)
+        renderEncoder.setFragmentBytes(&warpUniforms, length: MemoryLayout<MetalFlowWarpUniforms>.size, index: 0)
+        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        renderEncoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let bytesPerRow = srcW * 4
+        var result = [UInt8](repeating: 0, count: bytesPerRow * srcH)
+        result.withUnsafeMutableBytes { rawBuf in
+            if let base = rawBuf.baseAddress {
+                outTex.getBytes(base, bytesPerRow: bytesPerRow, from: MTLRegionMake2D(0, 0, srcW, srcH), mipmapLevel: 0)
+            }
+        }
+        return result
     }
 
     /// 零拷贝全异步 FP16 直绘路径：直接由 Fragment Shader 采样解码帧输出至 CAMetalLayer，消除 waitUntilCompleted 与中间像素池拷贝

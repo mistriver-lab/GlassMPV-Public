@@ -366,6 +366,47 @@ enum OpticalFlowFramePacer {
     }
 }
 
+/// 跨平台云端流送显单调时钟守卫：杜绝并发直通与队列插帧相互穿插回跳（防止「切换分辨率闪烁式卡顿」）
+struct RemoteDisplayCadenceGuard: Sendable {
+    private(set) var lastPresentedMediaPTS: Double = -1
+    private(set) var hasPresentedQueueFrame: Bool = false
+
+    mutating func reset() {
+        lastPresentedMediaPTS = -1
+        hasPresentedQueueFrame = false
+    }
+
+    mutating func shouldAcceptQueueFrame(mediaPTS: Double) -> Bool {
+        guard mediaPTS.isFinite, mediaPTS > lastPresentedMediaPTS + 0.0005 else {
+            return false
+        }
+        lastPresentedMediaPTS = mediaPTS
+        hasPresentedQueueFrame = true
+        return true
+    }
+
+    mutating func shouldAcceptDirectFallback(
+        samplePTS: Double,
+        hostTime: Double,
+        queueIsEmpty: Bool,
+        interpolatedCount: Int,
+        lastPresentedHostTime: Double
+    ) -> Bool {
+        guard samplePTS.isFinite,
+              queueIsEmpty,
+              samplePTS > lastPresentedMediaPTS + 0.0005 else {
+            return false
+        }
+        let allowInitialWarmup = (interpolatedCount == 0 && !hasPresentedQueueFrame)
+        let allowStallRescue = (lastPresentedHostTime > 0 && (hostTime - lastPresentedHostTime) > 0.35)
+        guard allowInitialWarmup || allowStallRescue else {
+            return false
+        }
+        lastPresentedMediaPTS = samplePTS
+        return true
+    }
+}
+
 struct OpticalFlowSendableFrame: @unchecked Sendable {
     let pts: CMTime
     let buffer: CVPixelBuffer
@@ -1784,6 +1825,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor private var lastRemoteClockPTS: Double = -1
     @MainActor private var remotePacerLagSeconds: Double = 0.110
     @MainActor private var lastRemotePresentedHostTime: CFTimeInterval = 0
+    @MainActor private var remoteCadenceGuard = RemoteDisplayCadenceGuard()
     private var remoteStatusObserver: NSKeyValueObservation?
     var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
     var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
@@ -2315,11 +2357,24 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     ) {
         guard isTokenValid(token) else { return }
         let hasFlowWarped = frames.contains {
-            if case .flowWarped = $0.payload { return true }
+            switch $0.payload {
+            case .flowWarped, .metalFlowWarped:
+                return true
+            case .pixelBuffer:
+                return false
+            }
+        }
+        let hasMetalFlowWarped = frames.contains {
+            if case .metalFlowWarped = $0.payload { return true }
             return false
         }
         bufferLock.lock()
-        let queueCap = hasFlowWarped ? min(maxQueuedFrames, 14) : maxQueuedFrames
+        let queueCap = hasFlowWarped
+            ? RemoteOpticalFlowBudgetPlanner.recommendedFlowQueueCap(
+                targetFPS: Double(maxQueuedFrames) * 2.0,
+                maxQueued: maxQueuedFrames
+            )
+            : maxQueuedFrames
         for item in frames {
             if remoteFrameQueue.count >= queueCap {
                 remoteFrameQueue.removeFirst()
@@ -2338,12 +2393,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 self.rawAverageInterpolationMs = avgMs
                 if avgMs > 0 {
                     let safeSrc = self.sourceFPS > 1.0 ? self.sourceFPS : 24.0
-                    let targetLag = RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
-                        sourceFPS: safeSrc,
-                        averageInterpolationMs: avgMs,
-                        targetFPS: self.effectiveTargetFPS
-                    )
-                    let clampedLag = hasFlowWarped ? min(targetLag, 0.110) : targetLag
+                    let targetLag = hasMetalFlowWarped
+                        ? RemoteOpticalFlowBudgetPlanner.recommendedMetalFlowPacerLagSeconds(
+                            sourceFPS: safeSrc,
+                            averageFlowMs: avgMs
+                        )
+                        : RemoteOpticalFlowBudgetPlanner.recommendedPacerLagSeconds(
+                            sourceFPS: safeSrc,
+                            averageInterpolationMs: avgMs,
+                            targetFPS: self.effectiveTargetFPS
+                        )
+                    let clampedLag = (hasFlowWarped && !hasMetalFlowWarped) ? min(targetLag, 0.110) : targetLag
                     self.remotePacerLagSeconds = self.remotePacerLagSeconds * 0.8 + clampedLag * 0.2
                 }
                 self.flushPublishedTelemetryIfNeeded()
@@ -2776,6 +2836,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         if isRemoteStream {
             lastRemoteSamplePTS = -1
             lastRemoteClockPTS = -1
+            lastRemotePresentedHostTime = 0
+            remoteCadenceGuard.reset()
             didLogFirstRemoteFrame = false
             remoteFlowWorker?.reset()
             isLoadingPipeline = false
@@ -2942,6 +3004,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         lastRemoteClockPTS = -1
         remotePacerLagSeconds = 0.110
         lastRemotePresentedHostTime = 0
+        remoteCadenceGuard.reset()
         didLogFirstRemoteFrame = false
         onRemoteVideoTrackUnplayable = nil
         onRemoteStreamFailed = nil
@@ -4277,6 +4340,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             isInterpolationEnabled: true,
             maxLateGraceSeconds: 0.120
         )
+        let isQueueEmptyAfterPop = remoteFrameQueue.isEmpty
         bufferLock.unlock()
 
         if skippedStaleBurst || paceResult.droppedCount > 0 {
@@ -4284,7 +4348,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 rawDroppedFrames += Int64(paceResult.droppedCount)
             }
         }
-        if let payload = paceResult.frame {
+        if let payload = paceResult.frame,
+           let mediaPTS = paceResult.presentedPTS,
+           remoteCadenceGuard.shouldAcceptQueueFrame(mediaPTS: mediaPTS) {
             lastRemotePresentedHostTime = hostTime
             switch payload {
             case .pixelBuffer(let buffer):
@@ -4302,9 +4368,26 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                     ptsSeconds: hostTime,
                     on: layer
                 )
+            case .metalFlowWarped(let prevBuffer, let currBuffer, let forwardFlow, let backwardFlow, let phase, let isSceneCut):
+                presentMetalFlowWarpedFrame(
+                    prevBuffer: prevBuffer,
+                    currBuffer: currBuffer,
+                    forwardFlow: forwardFlow,
+                    backwardFlow: backwardFlow,
+                    phase: phase,
+                    isSceneCut: isSceneCut,
+                    ptsSeconds: hostTime,
+                    on: layer
+                )
             }
         } else if let pb = pulledBuffer,
-                  (rawInterpolatedFrameCount == 0 || (hostTime - lastRemotePresentedHostTime) > 0.25) {
+                  remoteCadenceGuard.shouldAcceptDirectFallback(
+                      samplePTS: samplePTS,
+                      hostTime: hostTime,
+                      queueIsEmpty: isQueueEmptyAfterPop,
+                      interpolatedCount: rawInterpolatedFrameCount,
+                      lastPresentedHostTime: lastRemotePresentedHostTime
+                  ) {
             lastRemotePresentedHostTime = hostTime
             presentFrame(pb, ptsSeconds: hostTime, on: layer)
         } else if paceResult.droppedCount > 0 {
@@ -4378,6 +4461,70 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 flowSignX: flowSignX,
                 flowSignY: flowSignY,
                 isNormalizedUV: isNormalizedUV,
+                on: container.metalLayer,
+                preset: videoEnhancementPreset,
+                strength: videoEnhancementStrength,
+                aspectFill: isAspectFill,
+                compareMode: activeCompareMode,
+                outputFPS: liveOutputFPS,
+                thermalState: ProcessInfo.processInfo.thermalState
+            )
+            switch status {
+            case .rendered:
+                container.setMetalOverlayActive(true)
+                if activeQualityPipelineLabel != metalEnhancer.activePipelineLabel {
+                    activeQualityPipelineLabel = metalEnhancer.activePipelineLabel
+                }
+                updatePresentedFrameMetrics(isRefresh: false, enhanceMs: metalEnhancer.averageProcessMs)
+                return
+            case .skippedBusy:
+                container.setMetalOverlayActive(true)
+                return
+            case .unavailable:
+                break
+            }
+        }
+
+        presentFrame(currBuffer, ptsSeconds: ptsSeconds, on: layer)
+    }
+
+    @MainActor
+    private func presentMetalFlowWarpedFrame(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: SendableMetalTexture,
+        backwardFlow: SendableMetalTexture,
+        phase: Float,
+        isSceneCut: Bool,
+        ptsSeconds: Double,
+        on layer: AVSampleBufferDisplayLayer
+    ) {
+        lastRawPresentedBuffer = currBuffer
+        lastRawPresentedPTS = ptsSeconds
+
+        let activeCompareMode: VideoEnhancementCompareMode
+        if isComparingOriginalQuality || qualityCompareMode == .original {
+            activeCompareMode = .original
+        } else {
+            activeCompareMode = qualityCompareMode
+        }
+
+        if !isDolbyVisionContent,
+           !isHDRContent,
+           let container = displayContainer {
+            let liveOutputFPS = max(rawActualOutputFPS, interpolatedFPS > 0 ? interpolatedFPS : 60.0)
+            let metalCap = SampleBufferDisplayContainerView.recommendedMetalMaxLongSide(
+                outputFPS: liveOutputFPS,
+                allowSpatialUpscale: true
+            )
+            container.updateMetalMaxLongSide(metalCap)
+            let status = metalEnhancer.renderFlowWarpedToLayerStatus(
+                prevBuffer: prevBuffer,
+                currBuffer: currBuffer,
+                forwardFlowTexture: forwardFlow.texture,
+                backwardFlowTexture: backwardFlow.texture,
+                phase: phase,
+                isSceneCut: isSceneCut,
                 on: container.metalLayer,
                 preset: videoEnhancementPreset,
                 strength: videoEnhancementStrength,
@@ -4811,6 +4958,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         clearBufferedFrames()
         lastRemoteSamplePTS = -1
         lastRemoteClockPTS = -1
+        lastRemotePresentedHostTime = 0
+        remoteCadenceGuard.reset()
         remoteFlowWorker = makeRemoteFlowWorker(
             targetFPS: targetFPS,
             sourceFPS: safeSrc,
@@ -4846,6 +4995,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 )
             }
             clearBufferedFrames()
+            remoteCadenceGuard.reset()
             remoteFlowWorker?.reconfigure(targetFPS: targetFPS, sourceFPS: safeSrc)
             appendLog("[remote][switch] 云端流在线切换目标档位: \(targetFPS.shortBadge)")
             return

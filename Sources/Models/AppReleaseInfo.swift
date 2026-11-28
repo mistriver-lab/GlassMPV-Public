@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.13"
+    static let releaseTag = "0.1.0-beta.14"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.14",
+            date: "2026-11-28",
+            highlights: [
+                "全新零降采样 Metal GPU 金字塔光流引擎 (MetalPyramidOpticalFlow)：60 / 96 / 120fps 彻底摆脱 Apple VTOpticalFlow (RGhA 32–46ms 超预算) 与静态背景符号错锁，在原分辨率 4K/1080p YUV 上实现亚像素真运动追踪、边缘保真与切镜无重影，静止文字背景 100% 锐利直出",
+                "根治切画质「1440×810 闪烁式卡顿 + 600MB 内存飙升」：强制经 sourceNormPool 标准化送入 ANE 并为 1440×810 增加 1280×720 降级档与连续异常熔断器，彻底终结 -19740 会话泄漏循环",
+                "单调送显时钟守卫 (RemoteDisplayCadenceGuard) + 动态高刷队列扩容（24/30/36 帧替代误丢帧的 14 帧硬上限）：杜绝超前直通帧与延迟队列帧交错倒跳，CI 新增真实 GPU 运动精度像素级回归测试"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.13",
             date: "2026-11-28",

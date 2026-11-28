@@ -261,6 +261,7 @@ def test_swift_sources_non_empty_and_balanced():
         ROOT / "Sources" / "Models" / "WatchHistoryStore.swift",
         ROOT / "Sources" / "Models" / "UserPreferencesStore.swift",
         ROOT / "Sources" / "Engine" / "MediaSourceClients.swift",
+        ROOT / "Sources" / "Engine" / "MetalPyramidOpticalFlow.swift",
         ROOT / "Sources" / "Engine" / "RemoteStreamOpticalFlowWorker.swift",
         ROOT / "Sources" / "Engine" / "SubtitleManager.swift",
         ROOT / "Sources" / "UI" / "CloudMediaLibraryView.swift",
@@ -286,14 +287,22 @@ def test_swift_sources_non_empty_and_balanced():
     assert "shouldEmitPreparedOriginalFrame" in remote_worker_src
     assert "warmupPairsRemaining" in remote_worker_src
     assert "isCatchUpOverload" in remote_worker_src
-    assert "VTOpticalFlowConfiguration" in remote_worker_src
-    assert "VTOpticalFlowParameters" in remote_worker_src
-    assert "VTFrameProcessorOpticalFlow" in remote_worker_src
     assert "shouldUseHybridFlowWarp" in remote_worker_src
     assert "flowResolutionCaps" in remote_worker_src
+    assert "recommendedMetalFlowPacerLagSeconds" in remote_worker_src
+    assert "consecutiveLowLatencyErrors" in remote_worker_src
+    assert "lowLatencyFailedForSession" in remote_worker_src
     assert "FlowVectorCalibrator" in remote_worker_src
     assert "selectOptimalFlowSourceFormat" in remote_worker_src
     assert "decodeFloat16" in remote_worker_src
+    assert "shouldForceNormalizeSourceBuffer" in remote_worker_src
+    assert "recommendedFlowQueueCap" in remote_worker_src
+    assert "MetalPyramidOpticalFlowEngine" in remote_worker_src
+
+    metal_flow_src = (ROOT / "Sources" / "Engine" / "MetalPyramidOpticalFlow.swift").read_text(encoding="utf-8")
+    assert "final class MetalPyramidOpticalFlowEngine" in metal_flow_src
+    assert "computeSceneCutStats" in metal_flow_src
+    assert "bilateralSmoothFlow" in metal_flow_src
 
     sub_models_src = (ROOT / "Sources" / "Models" / "SubtitleModels.swift").read_text(encoding="utf-8")
     assert "SubtitleParser" in sub_models_src
@@ -465,12 +474,17 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testLocalHTTPStreamProxyHLSAndMislabeledFMP4VariantSwitch" in swift_test_src
     assert "testEndToEndSimulatorRemoteVariantSwitchPlayback" in swift_test_src
     assert "testPlayerOverlayNonOverlapAndTimelineRetention" in swift_test_src
+    assert "testMetalPyramidOpticalFlowRealMotionAccuracyAndSharpness" in swift_test_src
+    assert "testRemoteDisplayCadenceGuardAndHighFPSQueueCapNoDrops" in swift_test_src
+    assert "testRemoteSourceNormalizationAndVariantSwitchMetalFlow" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src
     assert "setRemoteInterpolationEnabled" in engine_src
     assert "preferredForwardBufferDuration" in engine_src
     assert "presentFlowWarpedFrame" in engine_src
+    assert "presentMetalFlowWarpedFrame" in engine_src
+    assert "RemoteDisplayCadenceGuard" in engine_src
     player_view_src = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "reResolveCurrentCloudStream" in player_view_src
     assert "PlayerOverlayLayoutPolicy" in player_view_src

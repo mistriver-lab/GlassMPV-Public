@@ -2,6 +2,16 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.14] - 2026-11-28
+
+### 修复与架构重构 (Fixed & Re-architected)
+- **彻底解决「切画质闪烁式卡顿 + 600MB 内存泄漏」(`RemoteStreamOpticalFlowWorker` + `VTOpticalFlowEngine`)**：
+  - 根因定位自真机日志 `GlassMPV-Log-20261128-230804.txt`：切流至 `夸克 1080P+ (1440×810)` 时，因分辨率与候选完全一致，`prepareSourceBuffer` 绕过 `sourceNormPool` 直接将解码器私有缓冲送入 `VTFrameProcessor`，触发每秒数十次 `VTFrameProcessorErrorDomain -19740`，`catch` 又原地重建会话不进位，18 秒泄露 324 个会话（AppMem 飙升至 821MB）；同时 `handleRemoteDisplayTick` 将实时解码超前帧与延迟队列回退帧混播导致画面倒跳闪烁。
+  - 修复：强制所有待送入 ANE 的远端缓冲经 `sourceNormPool` + `VTPixelTransferSession` 标准化、`1440×810` 补充 `1280×720` 安全降级候选并加入连续 2 次异常自动降级/熔断器；新增 `RemoteDisplayCadenceGuard` 强制单调 PTS 呈递，彻底根除闪烁倒跳。
+- **彻底解决「60 / 96 / 120fps 原画不降分辨率且不卡顿、真光流生效」(`MetalPyramidOpticalFlowEngine` + `MetalVideoEnhancer` + `VTOpticalFlowEngine`)**：
+  - 下线 iOS 26/27 真机强制 `64RGBAHalf (RGhA)` 且耗时高达 `32.5–45.9ms` 还会在静态背景随机锁错正负号的 `VTOpticalFlowConfiguration` + 14 帧误丢弃队列。
+  - 全新上线 4 级纯 Metal GPU 金字塔光流引擎 (`L0→L3`, 梯度+亮度 SAD、零运动静态铆定、抛物线亚像素细化、双边保边平滑与切镜 `sceneCut` 检测)，直接对原始分辨率 YUV 纹理（`3840×2160` / `1440×810`）生成清晰中间帧、零降采样糊化、静止区域 0 模糊，并将高刷动态队列上限恢复至 24/30/36 帧消除静默抽帧。
+
 ## [v0.1.0-beta.13] - 2026-11-28
 
 ### 重大架构演进 (Major Architecture Upgrade)

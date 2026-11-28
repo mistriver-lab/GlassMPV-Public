@@ -20,6 +20,14 @@ enum RemoteOpticalFlowPayload: @unchecked Sendable {
         flowSignY: Float = 1.0,
         isNormalizedUV: Bool = false
     )
+    case metalFlowWarped(
+        prevBuffer: CVPixelBuffer,
+        currBuffer: CVPixelBuffer,
+        forwardFlow: SendableMetalTexture,
+        backwardFlow: SendableMetalTexture,
+        phase: Float,
+        isSceneCut: Bool = false
+    )
 }
 
 struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
@@ -41,6 +49,8 @@ struct RemoteOpticalFlowOutputFrame: @unchecked Sendable {
         case .pixelBuffer(let buffer):
             return buffer
         case .flowWarped(_, let currBuffer, _, _, _, _, _, _):
+            return currBuffer
+        case .metalFlowWarped(_, let currBuffer, _, _, _, _):
             return currBuffer
         }
     }
@@ -347,12 +357,33 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
 
     static func resolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
         if maxInterp <= 1 {
-            return [(1920, 1080), (1440, 810)]
+            return [(1920, 1080), (1440, 810), (1280, 720)]
         }
         if maxInterp <= 3 {
             return [(1440, 810), (1280, 720)]
         }
         return [(1280, 720)]
+    }
+
+    static func shouldForceNormalizeSourceBuffer(hasNormPool: Bool) -> Bool {
+        hasNormPool
+    }
+
+    static func recommendedFlowQueueCap(targetFPS: Double, maxQueued: Int) -> Int {
+        let clampedFPS = max(48.0, min(120.0, targetFPS.isFinite ? targetFPS : 60.0))
+        let minSafeFrames = max(24, Int(ceil(clampedFPS * 0.30)))
+        return min(max(24, maxQueued), minSafeFrames)
+    }
+
+    static func recommendedMetalFlowPacerLagSeconds(
+        sourceFPS: Double,
+        averageFlowMs: Double
+    ) -> Double {
+        let clampedFPS = max(12.0, min(120.0, sourceFPS.isFinite ? sourceFPS : 24.0))
+        let frameInterval = 1.0 / clampedFPS
+        let rawFlowMs = (averageFlowMs.isFinite && averageFlowMs > 0) ? averageFlowMs : 4.0
+        let flowSec = max(0.002, min(0.030, rawFlowMs / 1000.0))
+        return min(0.115, max(0.075, frameInterval + flowSec + 0.030))
     }
 
     static func shouldEmitPreparedOriginalFrame(
@@ -462,6 +493,10 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
     private var warmupPairsRemaining: Int = 8
     private var totalInterpolationMs: Double = 0
     private var batchCount: Int = 0
+    private var metalFlowEngine: MetalPyramidOpticalFlowEngine?
+    private var metalFlowFailedForSession: Bool = false
+    private var consecutiveLowLatencyErrors: Int = 0
+    private var lowLatencyFailedForSession: Bool = false
 
 #if !targetEnvironment(simulator)
     private var processor: VTFrameProcessor?
@@ -595,6 +630,10 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 warmupPairsRemaining = 8
                 totalInterpolationMs = 0
                 batchCount = 0
+                metalFlowFailedForSession = false
+                metalFlowEngine?.reset()
+                consecutiveLowLatencyErrors = 0
+                lowLatencyFailedForSession = false
 #if !targetEnvironment(simulator)
                 candidateIndex = 0
                 candidates.removeAll(keepingCapacity: true)
@@ -631,12 +670,6 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         sourceFPS: Double,
         skippedInputs: Int
     ) async -> OpticalFlowTargetFPS? {
-#if targetEnvironment(simulator)
-        previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
-        let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
-        onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
-        return nil
-#else
         let srcW = CVPixelBufferGetWidth(currBuffer)
         let srcH = CVPixelBufferGetHeight(currBuffer)
         guard srcW >= 64, srcH >= 64 else {
@@ -649,34 +682,34 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
             if dt <= 0.008 || dt >= 0.35 {
                 previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
                 phaseScheduler.reset()
-                flowWarpNeedsRandomSubmission = true
-                let passthroughLabel: String
-                if isHybridFlowWarpActive, activeFlowWidth > 0 {
-                    let prefix = max(srcW, srcH) >= 3000 ? "远程·4K光流变形" : "远程·原生光流变形"
-                    passthroughLabel = "\(prefix) \(activeFlowWidth)×\(activeFlowHeight)→\(srcW)×\(srcH)"
-                } else {
-                    passthroughLabel = activeCandidate?.displayLabel ?? "远程流直通"
-                }
-                onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, passthroughLabel)
+                onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, 0, "远程硬解直通")
                 return nil
             }
 
             let srcFmt = CVPixelBufferGetPixelFormatType(currBuffer)
-            if ensureHybridFlowWarpSession(
-                srcWidth: srcW,
-                srcHeight: srcH,
-                targetFPS: targetFPS,
-                sourceFPS: sourceFPS,
-                srcPixelFormat: srcFmt
-            ),
-               let processor,
-               let flowDestPool,
-               activeFlowWidth > 0,
-               activeFlowHeight > 0 {
+            if !metalFlowFailedForSession,
+               RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                   sourceWidth: srcW,
+                   sourceHeight: srcH,
+                   targetFPS: targetFPS,
+                   isHDR: false,
+                   isDolbyVision: false,
+                   is8BitSDRPixelFormat: RemoteOpticalFlowBudgetPlanner.is8BitSDRBiPlanarFormat(srcFmt)
+               ) {
+                let flowEngine: MetalPyramidOpticalFlowEngine
+                if let existing = metalFlowEngine {
+                    flowEngine = existing
+                } else {
+                    let created = MetalPyramidOpticalFlowEngine()
+                    metalFlowEngine = created
+                    flowEngine = created
+                }
+
                 let maxSlots = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
                 let step = phaseScheduler.planStep(previousPTS: prev.pts, currentPTS: currPTS, maxAllowedSlots: maxSlots)
-                let flowLabelPrefix = max(srcW, srcH) >= 3000 ? "远程·4K光流变形" : "远程·原生光流变形"
-                let emittedLabel = "\(flowLabelPrefix) \(activeFlowWidth)×\(activeFlowHeight)→\(srcW)×\(srcH)"
+                let dims = MetalPyramidOpticalFlowEngine.recommendedFlowDimensions(sourceWidth: srcW, sourceHeight: srcH)
+                let flowLabelPrefix = max(srcW, srcH) >= 3000 ? "远程·4K原生GPU光流" : "远程·原生GPU光流"
+                let emittedLabel = "\(flowLabelPrefix) \(dims.width)×\(dims.height)→\(srcW)×\(srcH)"
 
                 if step.interpolatedSlots.isEmpty {
                     previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
@@ -685,173 +718,81 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                     return nil
                 }
 
-                let pairStartHost = CACurrentMediaTime()
-                let reusedPrev: CVPixelBuffer? = (prev.preparedWidth == activeFlowWidth
-                    && prev.preparedHeight == activeFlowHeight
-                    && prev.preparedFormat == activePixelFormat)
-                    ? prev.preparedBuffer
-                    : nil
+                if let flowResult = await flowEngine.estimateFlow(prevBuffer: prev.rawBuffer, currBuffer: currBuffer) {
+                    guard readGeneration() == jobGeneration else { return nil }
+                    totalInterpolationMs += flowResult.elapsedMs
+                    batchCount += 1
+                    let avgMs = totalInterpolationMs / Double(max(1, batchCount))
+                    if batchCount == 1 {
+                        onLog?("[remote][gpu] 已激活零降采样 Metal 金字塔光流 (\(flowResult.flowWidth)×\(flowResult.flowHeight)→\(srcW)×\(srcH), 耗时=\(String(format: "%.1f", flowResult.elapsedMs))ms)")
+                    }
 
-                var fwdOpt: CVPixelBuffer?
-                var bwdOpt: CVPixelBuffer?
-                let fwdStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, flowDestPool, &fwdOpt)
-                let bwdStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, flowDestPool, &bwdOpt)
-
-                if fwdStatus == kCVReturnSuccess,
-                   bwdStatus == kCVReturnSuccess,
-                   let fwdBuf = fwdOpt,
-                   let bwdBuf = bwdOpt,
-                   let preparedPrev = reusedPrev ?? prepareSourceBuffer(
-                       prev.rawBuffer,
-                       targetWidth: activeFlowWidth,
-                       targetHeight: activeFlowHeight,
-                       targetFormat: activePixelFormat
-                   ),
-                   let preparedCurr = prepareSourceBuffer(
-                       currBuffer,
-                       targetWidth: activeFlowWidth,
-                       targetHeight: activeFlowHeight,
-                       targetFormat: activePixelFormat
-                   ),
-                   let prevFrame = VTFrameProcessorFrame(buffer: preparedPrev, presentationTimeStamp: CMTime(seconds: prev.pts, preferredTimescale: 600)),
-                   let currFrame = VTFrameProcessorFrame(buffer: preparedCurr, presentationTimeStamp: CMTime(seconds: currPTS, preferredTimescale: 600)),
-                   let opticalFlow = VTFrameProcessorOpticalFlow(forwardFlow: fwdBuf, backwardFlow: bwdBuf),
-                   let flowParams = VTOpticalFlowParameters(
-                       sourceFrame: prevFrame,
-                       nextFrame: currFrame,
-                       submissionMode: flowWarpNeedsRandomSubmission ? .random : .sequential,
-                       destinationOpticalFlow: opticalFlow
-                   ) {
-                    do {
-                        _ = try await processor.process(parameters: flowParams)
-                        flowWarpNeedsRandomSubmission = false
-                        guard readGeneration() == jobGeneration else { return nil }
-                        let elapsedMs = (CACurrentMediaTime() - pairStartHost) * 1000.0
-                        totalInterpolationMs += elapsedMs
-                        batchCount += 1
-                        let avgMs = totalInterpolationMs / Double(max(1, batchCount))
-
-                        if !flowCalibration.isLocked,
-                           let calibrated = FlowVectorCalibrator.calibrate(
-                               prevBuffer: prev.rawBuffer,
-                               currBuffer: currBuffer,
-                               forwardFlow: fwdBuf
-                           ) {
-                            flowCalibration = calibrated
-                            onLog?("[remote][ane] 4K光流向量自校准锁定: sign=(\(Int(calibrated.signX)),\(Int(calibrated.signY))), unit=\(calibrated.isNormalizedUV ? "uv" : "px"), rawP90=\(String(format: "%.2f", calibrated.rawP90)), SAD \(String(format: "%.1f", calibrated.baselineSAD))->\(String(format: "%.1f", calibrated.calibratedSAD))")
-                        }
-
-                        var outFrames: [RemoteOpticalFlowOutputFrame] = []
-                        outFrames.reserveCapacity(step.interpolatedSlots.count + 1)
-                        for slot in step.interpolatedSlots {
-                            outFrames.append(
-                                RemoteOpticalFlowOutputFrame(
-                                    pts: slot.pts,
-                                    payload: .flowWarped(
-                                        prevBuffer: prev.rawBuffer,
-                                        currBuffer: currBuffer,
-                                        forwardFlow: fwdBuf,
-                                        backwardFlow: bwdBuf,
-                                        phase: slot.phase,
-                                        flowSignX: flowCalibration.signX,
-                                        flowSignY: flowCalibration.signY,
-                                        isNormalizedUV: flowCalibration.isNormalizedUV
-                                    )
+                    var outFrames: [RemoteOpticalFlowOutputFrame] = []
+                    outFrames.reserveCapacity(step.interpolatedSlots.count + 1)
+                    for slot in step.interpolatedSlots {
+                        outFrames.append(
+                            RemoteOpticalFlowOutputFrame(
+                                pts: slot.pts,
+                                payload: .metalFlowWarped(
+                                    prevBuffer: prev.rawBuffer,
+                                    currBuffer: currBuffer,
+                                    forwardFlow: flowResult.forwardFlow,
+                                    backwardFlow: flowResult.backwardFlow,
+                                    phase: slot.phase,
+                                    isSceneCut: flowResult.isSceneCut
                                 )
                             )
-                        }
-                        if step.shouldEmitOriginalFrame || outFrames.isEmpty {
-                            outFrames.append(RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer))
-                        }
-
-                        previousFrame = (
-                            pts: currPTS,
-                            rawBuffer: currBuffer,
-                            preparedBuffer: preparedCurr,
-                            preparedWidth: activeFlowWidth,
-                            preparedHeight: activeFlowHeight,
-                            preparedFormat: activePixelFormat
                         )
-                        onBatch(outFrames, step.interpolatedSlots.count, avgMs, emittedLabel)
-
-                        if warmupPairsRemaining > 0 {
-                            warmupPairsRemaining -= 1
-                            return nil
-                        }
-
-                        let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
-                        let canDowngradeRes = (flowCandidateIndex + 1) < flowCandidates.count
-                        let canDowngradeFPS = targetFPS.nextLowerTier != nil
-                        let catchUpOverload = RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
-                            skippedInputs: skippedInputs,
-                            processMs: elapsedMs,
-                            sourceIntervalMs: sourceIntervalMs
-                        )
-                        let action = budgetGuard.recordPair(
-                            processMs: elapsedMs,
-                            sourceIntervalMs: sourceIntervalMs,
-                            skippedForCatchUp: catchUpOverload,
-                            canDowngradeResolution: canDowngradeRes,
-                            canDowngradeTargetFPS: canDowngradeFPS
-                        )
-                        switch action {
-                        case .keep:
-                            return nil
-                        case .downgradeResolution:
-                            if flowCandidateIndex + 1 < flowCandidates.count {
-                                let prevFlowLabel = "\(activeFlowWidth)×\(activeFlowHeight)"
-                                flowCandidateIndex += 1
-                                let nextDims = flowCandidates[flowCandidateIndex]
-                                teardownSession()
-                                totalInterpolationMs = 0
-                                batchCount = 0
-                                onLog?("[remote][perf] 4K光流场超预算 (单对=\(String(format: "%.1f", elapsedMs))ms, 均值=\(String(format: "%.1f", avgMs))ms, 预算=\(String(format: "%.1f", sourceIntervalMs))ms)，光流场 \(prevFlowLabel) 自动降级 -> \(nextDims.width)×\(nextDims.height)（画面保持\(srcW)×\(srcH)原画无损）")
-                                return nil
-                            } else if let lower = targetFPS.nextLowerTier {
-                                updateWorkerTargetTier(lower)
-                                phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
-                                flowCandidateIndex = 0
-                                flowCandidates.removeAll(keepingCapacity: true)
-                                flowPlanSignature = ""
-                                candidateIndex = 0
-                                candidates.removeAll(keepingCapacity: true)
-                                candidatePlanSignature = ""
-                                teardownSession()
-                                totalInterpolationMs = 0
-                                batchCount = 0
-                                onTargetDowngrade?(lower, "4K原生光流场已触底，自动稳帧降档至 \(lower.shortBadge)")
-                                return lower
-                            }
-                        case .downgradeTargetFPS:
-                            if let lower = targetFPS.nextLowerTier {
-                                updateWorkerTargetTier(lower)
-                                phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
-                                flowCandidateIndex = 0
-                                flowCandidates.removeAll(keepingCapacity: true)
-                                flowPlanSignature = ""
-                                candidateIndex = 0
-                                candidates.removeAll(keepingCapacity: true)
-                                candidatePlanSignature = ""
-                                teardownSession()
-                                totalInterpolationMs = 0
-                                batchCount = 0
-                                onTargetDowngrade?(lower, "4K原生光流变形持续超预算或追帧跳过，自动稳帧至 \(lower.shortBadge)")
-                                return lower
-                            }
-                        }
-                        return nil
-                    } catch {
-                        let now = CACurrentMediaTime()
-                        if now - lastErrorLogTime > 2.0 {
-                            lastErrorLogTime = now
-                            onLog?("[remote][warn] 4K原生光流变形异常 (\(activeFlowWidth)×\(activeFlowHeight))，自动回退 LowLatency: \(error.localizedDescription)")
-                        }
-                        hybridFlowWarpFailedForSession = true
-                        teardownSession()
                     }
+                    if step.shouldEmitOriginalFrame || outFrames.isEmpty {
+                        outFrames.append(RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer))
+                    }
+
+                    previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
+                    onBatch(outFrames, step.interpolatedSlots.count, avgMs, emittedLabel)
+
+                    if warmupPairsRemaining > 0 {
+                        warmupPairsRemaining -= 1
+                        return nil
+                    }
+
+                    let sourceIntervalMs = 1000.0 / max(12.0, sourceFPS)
+                    let canDowngradeFPS = targetFPS.nextLowerTier != nil
+                    let catchUpOverload = RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
+                        skippedInputs: skippedInputs,
+                        processMs: flowResult.elapsedMs,
+                        sourceIntervalMs: sourceIntervalMs
+                    )
+                    let action = budgetGuard.recordPair(
+                        processMs: flowResult.elapsedMs,
+                        sourceIntervalMs: sourceIntervalMs,
+                        skippedForCatchUp: catchUpOverload,
+                        canDowngradeResolution: false,
+                        canDowngradeTargetFPS: canDowngradeFPS
+                    )
+                    if action == .downgradeTargetFPS, let lower = targetFPS.nextLowerTier {
+                        updateWorkerTargetTier(lower)
+                        phaseScheduler = OpticalFlowPhaseScheduler(targetTier: lower, sourceFPS: sourceFPS)
+                        totalInterpolationMs = 0
+                        batchCount = 0
+                        onTargetDowngrade?(lower, "GPU原生光流持续超预算，自动稳帧至 \(lower.shortBadge)")
+                        return lower
+                    }
+                    return nil
+                } else {
+                    metalFlowFailedForSession = true
+                    onLog?("[remote][warn] Metal金字塔光流初始化或执行不可用，回退硬件光流通道: \(flowEngine.shaderInitError ?? "device unavailable")")
                 }
             }
+        }
 
+#if targetEnvironment(simulator)
+        previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
+        let avg = batchCount > 0 ? totalInterpolationMs / Double(batchCount) : 0
+        onBatch([RemoteOpticalFlowOutputFrame(pts: currPTS, buffer: currBuffer)], 0, avg, "远程硬解直通")
+        return nil
+#else
+        if let prev = previousFrame {
             if ensureSession(srcWidth: srcW, srcHeight: srcH, targetFPS: targetFPS, sourceFPS: sourceFPS),
                let processor,
                let activeCandidate,
@@ -911,6 +852,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                        ) {
                         do {
                             _ = try await processor.process(parameters: params)
+                            consecutiveLowLatencyErrors = 0
                             guard readGeneration() == jobGeneration else { return nil }
                             let elapsedMs = (CACurrentMediaTime() - pairStartHost) * 1000.0
                             totalInterpolationMs += elapsedMs
@@ -1004,8 +946,20 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                             }
                             return nil
                         } catch {
+                            consecutiveLowLatencyErrors += 1
                             let now = CACurrentMediaTime()
-                            if now - lastErrorLogTime > 2.0 {
+                            if consecutiveLowLatencyErrors >= 2 {
+                                let prevLabel = activeCandidate.displayLabel
+                                if candidateIndex + 1 < candidates.count {
+                                    candidateIndex += 1
+                                    let nextLabel = candidates[candidateIndex].displayLabel
+                                    consecutiveLowLatencyErrors = 0
+                                    onLog?("[remote][warn] 远程光流推理异常 (\(prevLabel))，自动降档切换 -> \(nextLabel): \(error.localizedDescription)")
+                                } else {
+                                    lowLatencyFailedForSession = true
+                                    onLog?("[remote][warn] 远程光流候选耗尽 (\(prevLabel))，已熔断切回原画直通: \(error.localizedDescription)")
+                                }
+                            } else if now - lastErrorLogTime > 2.0 {
                                 lastErrorLogTime = now
                                 onLog?("[remote][warn] 远程光流推理异常 (\(activeCandidate.displayLabel)): \(error.localizedDescription)")
                             }
@@ -1188,6 +1142,9 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         targetFPS: OpticalFlowTargetFPS,
         sourceFPS: Double
     ) -> Bool {
+        guard !lowLatencyFailedForSession else {
+            return false
+        }
         let maxInterp = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
         let exponent = OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: maxInterp)
         let planSig = "\(srcWidth)x\(srcHeight):\(maxInterp)"
@@ -1297,14 +1254,14 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
         targetHeight: Int,
         targetFormat: OSType
     ) -> CVPixelBuffer? {
-        let hasIOSurface = CVPixelBufferGetIOSurface(buffer) != nil
-        if hasIOSurface,
-           CVPixelBufferGetWidth(buffer) == targetWidth,
-           CVPixelBufferGetHeight(buffer) == targetHeight,
-           CVPixelBufferGetPixelFormatType(buffer) == targetFormat {
-            return buffer
-        }
-        guard let normPool = sourceNormPool, let xfer = sourceTransferSession else {
+        _ = targetWidth
+        _ = targetHeight
+        _ = targetFormat
+        // 强制经 VTPixelTransferSession 写入由 VTFrameProcessor 属性池分配的标准 IOSurface 缓冲，
+        // 避免同分辨率 1440×810 / 1080p AVPlayerItemVideoOutput 解码缓冲直传触发 -19740 与内存泄漏
+        guard RemoteOpticalFlowBudgetPlanner.shouldForceNormalizeSourceBuffer(hasNormPool: sourceNormPool != nil),
+              let normPool = sourceNormPool,
+              let xfer = sourceTransferSession else {
             return nil
         }
         var outOpt: CVPixelBuffer?
