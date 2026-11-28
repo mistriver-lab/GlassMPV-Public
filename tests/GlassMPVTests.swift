@@ -3268,7 +3268,8 @@ final class GlassMPVTests: XCTestCase {
         let flowEngine = MetalPyramidOpticalFlowEngine()
         XCTAssertNil(flowEngine.shaderInitError)
 
-        let flowResult = try XCTUnwrap(await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: currBuf))
+        let flowRaw = await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: currBuf)
+        let flowResult = try XCTUnwrap(flowRaw)
         XCTAssertFalse(flowResult.isSceneCut, "连续运动帧不应误触发切镜保护")
 
         func readFlowVector(texture: MTLTexture, normU: Double, normV: Double) -> (dxPx: Float, dyPx: Float) {
@@ -3300,7 +3301,8 @@ final class GlassMPVTests: XCTestCase {
         let bgVec = readFlowVector(texture: flowResult.forwardFlow.texture, normU: 60.0 / Double(width), normV: 60.0 / Double(height))
         XCTAssertLessThan(hypot(bgVec.dxPx, bgVec.dyPx), 1.5, "静止纹理背景光流应锁定接近 0，避免拖影模糊")
 
-        let cutResult = try XCTUnwrap(await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: cutBuf))
+        let cutRaw = await flowEngine.estimateFlow(prevBuffer: prevBuf, currBuffer: cutBuf)
+        let cutResult = try XCTUnwrap(cutRaw)
         XCTAssertTrue(cutResult.isSceneCut, "大幅切镜帧对必须触发 scene-cut 保护")
 
         let enhancer = MetalVideoEnhancer()
@@ -3455,32 +3457,46 @@ final class GlassMPVTests: XCTestCase {
             return
         }
 
-        let boxLock = NSLock()
-        var emittedMetalBatches = 0
-        var totalInterpolated = 0
-        var lastPTS: Double = -1
-        var monotonicOK = true
+        final class BatchRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var emittedMetalBatches = 0
+            private var totalInterpolated = 0
+            private var lastPTS: Double = -1
+            private var monotonicOK = true
 
+            func record(_ frames: [RemoteOpticalFlowOutputFrame], delta: Int) {
+                lock.lock()
+                let hasMetalWarp = frames.contains {
+                    if case .metalFlowWarped = $0.payload { return true }
+                    return false
+                }
+                if hasMetalWarp {
+                    emittedMetalBatches += 1
+                }
+                totalInterpolated += delta
+                for frame in frames {
+                    if frame.pts <= lastPTS {
+                        monotonicOK = false
+                    }
+                    lastPTS = frame.pts
+                }
+                lock.unlock()
+            }
+
+            func snapshot() -> (batches: Int, interpolated: Int, monotonic: Bool) {
+                lock.lock()
+                let out = (emittedMetalBatches, totalInterpolated, monotonicOK)
+                lock.unlock()
+                return out
+            }
+        }
+
+        let recorder = BatchRecorder()
         let worker = RemoteStreamOpticalFlowWorker(
             targetFPS: .fps60,
             sourceFPS: 25.0
         ) { frames, delta, _, _ in
-            boxLock.lock()
-            let hasMetalWarp = frames.contains {
-                if case .metalFlowWarped = $0.payload { return true }
-                return false
-            }
-            if hasMetalWarp {
-                emittedMetalBatches += 1
-            }
-            totalInterpolated += delta
-            for frame in frames {
-                if frame.pts <= lastPTS {
-                    monotonicOK = false
-                }
-                lastPTS = frame.pts
-            }
-            boxLock.unlock()
+            recorder.record(frames, delta: delta)
         }
 
         func makeBuffer(width: Int, height: Int, shift: Float) throws -> CVPixelBuffer {
@@ -3522,14 +3538,9 @@ final class GlassMPVTests: XCTestCase {
         }
         try await Task.sleep(for: .milliseconds(450))
 
-        boxLock.lock()
-        let batchesSnapshot = emittedMetalBatches
-        let interpSnapshot = totalInterpolated
-        let monotonicSnapshot = monotonicOK
-        boxLock.unlock()
-
-        XCTAssertGreaterThanOrEqual(batchesSnapshot, 4, "60/120fps 跨分辨率切换后必须稳定输出 Metal GPU 原生光流变形帧")
-        XCTAssertGreaterThan(interpSnapshot, 10)
-        XCTAssertTrue(monotonicSnapshot, "跨分辨率重配后的输出帧时间戳必须严格递增")
+        let snap = recorder.snapshot()
+        XCTAssertGreaterThanOrEqual(snap.batches, 4, "60/120fps 跨分辨率切换后必须稳定输出 Metal GPU 原生光流变形帧")
+        XCTAssertGreaterThan(snap.interpolated, 10)
+        XCTAssertTrue(snap.monotonic, "跨分辨率重配后的输出帧时间戳必须严格递增")
     }
 }
