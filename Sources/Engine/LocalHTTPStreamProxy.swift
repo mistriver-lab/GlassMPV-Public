@@ -117,8 +117,17 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         do {
             let port = try ensureStarted()
             let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-            let safeExt = url.pathExtension.isEmpty ? (isHLS ? "m3u8" : "mp4") : url.pathExtension
-            let resolvedIsHLS = isHLS || safeExt.lowercased() == "m3u8"
+            let urlLower = url.absoluteString.lowercased()
+            let rawExt = url.pathExtension
+            let resolvedIsHLS = isHLS || rawExt.lowercased() == "m3u8" || urlLower.contains(".m3u8")
+            let safeExt: String
+            if resolvedIsHLS {
+                safeExt = "m3u8"
+            } else if rawExt.isEmpty || rawExt.lowercased() == "m3u8" {
+                safeExt = "mp4"
+            } else {
+                safeExt = rawExt
+            }
             var evictedCaches: [ProxyRouteChunkCache] = []
             lock.lock()
             if routes.count > 512 {
@@ -191,6 +200,17 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         )
         lock.unlock()
         return URL(string: "http://127.0.0.1:\(port)/sub/\(token)/seg.\(ext)") ?? url
+    }
+
+    func cancelActiveChunkCaches() {
+        lock.lock()
+        let caches = Array(chunkCaches.values)
+        chunkCaches.removeAll()
+        chunkCacheOrder.removeAll()
+        lock.unlock()
+        for cache in caches {
+            cache.invalidate()
+        }
     }
 
     func resetRoutes() {
@@ -306,87 +326,9 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
         }
 
         let upstreamHost = matchedRoute.upstreamURL.host ?? "upstream"
-        let reqStartTime = CFAbsoluteTimeGetCurrent()
         let isManifest = matchedRoute.isHLS
             || matchedRoute.upstreamURL.pathExtension.lowercased() == "m3u8"
             || matchedRoute.upstreamURL.absoluteString.lowercased().contains(".m3u8")
-        if isManifest {
-            let redirectDelegate = RedirectHeaderPreservingDelegate(
-                headers: matchedRoute.headers,
-                rangeHeader: parsed.rangeHeader
-            )
-            let session = URLSession(configuration: .ephemeral, delegate: redirectDelegate, delegateQueue: nil)
-            let task = session.dataTask(with: upstreamReq) { [weak self] data, response, error in
-                defer { session.finishTasksAndInvalidate() }
-                guard let self else {
-                    connection.cancel()
-                    return
-                }
-                let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - reqStartTime) * 1000).rounded())
-                if let error {
-                    let nsErr = error as NSError
-                    let status = Self.httpErrorStatus(for: error)
-                    self.emitRouteLog(
-                        token: token,
-                        route: matchedRoute,
-                        important: true,
-                        message: "[proxy][error] HLS \(upstreamHost) 失败: \(nsErr.domain)(\(nsErr.code)) \(error.localizedDescription) (\(elapsedMs)ms)"
-                    )
-                    self.sendSimpleResponse(
-                        connection: connection,
-                        status: status,
-                        body: Data(error.localizedDescription.utf8)
-                    )
-                    return
-                }
-                guard let http = response as? HTTPURLResponse, let data else {
-                    self.emitRouteLog(
-                        token: token,
-                        route: matchedRoute,
-                        important: true,
-                        message: "[proxy][error] HLS \(upstreamHost) 无 HTTP 响应 (\(elapsedMs)ms)"
-                    )
-                    self.sendSimpleResponse(connection: connection, status: "502 Bad Gateway", body: Data())
-                    return
-                }
-                self.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
-                guard (200...299).contains(http.statusCode) else {
-                    self.emitRouteLog(
-                        token: token,
-                        route: matchedRoute,
-                        important: true,
-                        message: "[proxy][error] HLS \(upstreamHost) HTTP \(http.statusCode) (\(elapsedMs)ms)"
-                    )
-                    self.sendSimpleResponse(
-                        connection: connection,
-                        status: "\(http.statusCode) Error",
-                        body: data
-                    )
-                    return
-                }
-
-                self.emitRouteLog(
-                    token: token,
-                    route: matchedRoute,
-                    important: false,
-                    message: "[proxy] HLS \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms)"
-                )
-                let rawManifest = String(data: data, encoding: .utf8) ?? ""
-                let baseURL = http.url ?? matchedRoute.upstreamURL
-                let rewritten = Self.rewriteHLSManifest(rawManifest, baseURL: baseURL) { childURL in
-                    self.registerSubResource(url: childURL, inheritingFrom: matchedRoute, port: activePort)
-                }
-                let outData = Data(rewritten.utf8)
-                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl; charset=utf-8\r\nContent-Length: \(outData.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-                var packet = Data(head.utf8)
-                packet.append(outData)
-                connection.send(content: packet, completion: .contentProcessed { _ in
-                    connection.cancel()
-                })
-            }
-            task.resume()
-            return
-        }
 
         if parsed.method == "GET",
            !isManifest,
@@ -413,7 +355,15 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             return
         }
 
-        let matchedCache = chunkCache(for: matchedRoute)
+        let manifestRewriter: (@Sendable (String, URL) -> String)? = (isManifest && parsed.method != "HEAD")
+            ? { [weak self] rawManifest, resolvedBaseURL in
+                guard let self else { return rawManifest }
+                return Self.rewriteHLSManifest(rawManifest, baseURL: resolvedBaseURL) { childURL in
+                    self.registerSubResource(url: childURL, inheritingFrom: matchedRoute, port: activePort)
+                }
+            }
+            : nil
+        let matchedCache = isManifest ? nil : chunkCache(for: matchedRoute)
         let streamRelay = UpstreamStreamRelay(
             connection: connection,
             headers: matchedRoute.headers,
@@ -422,6 +372,7 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             upstreamHost: upstreamHost,
             enableMP4HEV1Patch: parsed.method != "HEAD",
             chunkCache: matchedCache,
+            hlsManifestRewriter: manifestRewriter,
             onResponse: { [weak self] http in
                 self?.captureRefreshedCookies(from: http, route: matchedRoute, token: token)
             },
@@ -953,33 +904,6 @@ struct MP4HEV1StreamPatcher: Sendable {
     }
 }
 
-private final class RedirectHeaderPreservingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    private let headers: [String: String]
-    private let rangeHeader: String?
-
-    init(headers: [String: String], rangeHeader: String?) {
-        self.headers = headers
-        self.rangeHeader = rangeHeader
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        var next = request
-        for (k, v) in headers {
-            next.setValue(v, forHTTPHeaderField: k)
-        }
-        if let rangeHeader {
-            next.setValue(rangeHeader, forHTTPHeaderField: "Range")
-        }
-        completionHandler(next)
-    }
-}
-
 private protocol ProxySessionTaskHandler: AnyObject, Sendable {
     func handleRedirect(newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void)
     func handleResponse(_ response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void)
@@ -1068,6 +992,8 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
 }
 
 private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sendable {
+    private static let maxManifestBytes: Int = 4 * 1024 * 1024
+
     private let connection: NWConnection
     private let headers: [String: String]
     private let rangeHeader: String?
@@ -1075,6 +1001,7 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
     private let upstreamHost: String
     private let enableMP4HEV1Patch: Bool
     private weak var chunkCache: ProxyRouteChunkCache?
+    private let hlsManifestRewriter: (@Sendable (String, URL) -> String)?
     private let onResponse: @Sendable (HTTPURLResponse) -> Void
     private let onLog: @Sendable (Bool, String) -> Void
     private let lock = NSLock()
@@ -1084,6 +1011,11 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
     private var didSendHeaders = false
     private var shouldPatchMP4Stream = false
     private var mp4Patcher = MP4HEV1StreamPatcher()
+    private var isBufferingManifest = false
+    private var manifestData = Data()
+    private var manifestBaseURL: URL?
+    private var manifestStatusCode: Int = 200
+    private var manifestHeaderPacket: Data?
     private var inFlightBytes: Int = 0
     private var isUpstreamSuspended = false
     private let highWaterBytes: Int = 4 * 1024 * 1024
@@ -1097,6 +1029,7 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         upstreamHost: String = "upstream",
         enableMP4HEV1Patch: Bool = true,
         chunkCache: ProxyRouteChunkCache? = nil,
+        hlsManifestRewriter: (@Sendable (String, URL) -> String)? = nil,
         onResponse: @escaping @Sendable (HTTPURLResponse) -> Void,
         onLog: @escaping @Sendable (Bool, String) -> Void
     ) {
@@ -1107,6 +1040,7 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         self.upstreamHost = upstreamHost
         self.enableMP4HEV1Patch = enableMP4HEV1Patch
         self.chunkCache = chunkCache
+        self.hlsManifestRewriter = hlsManifestRewriter
         self.onResponse = onResponse
         self.onLog = onLog
     }
@@ -1173,13 +1107,16 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         }
         onResponse(http)
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
-        let isMP4OrBinary = !contentType.lowercased().contains("mpegurl") && !contentType.lowercased().contains("text/")
+        let ctLower = contentType.lowercased()
+        let isMP4OrBinary = !ctLower.contains("mpegurl") && !ctLower.contains("text/")
         let contentRange = http.value(forHTTPHeaderField: "Content-Range") ?? ""
         let startsAtZero = (http.statusCode == 200) || contentRange.lowercased().hasPrefix("bytes 0-")
+        let contentLengthVal = http.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) }
+        let expectedLen = contentLengthVal ?? http.expectedContentLength
+        let parsedTotal = LocalHTTPStreamProxy.parseContentRangeTotalLength(contentRange)
+            ?? (http.statusCode == 200 ? contentLengthVal : nil)
         if isMP4OrBinary, (200...299).contains(http.statusCode), let cache = chunkCache {
             cache.setKnownContentType(contentType)
-            let parsedTotal = LocalHTTPStreamProxy.parseContentRangeTotalLength(contentRange)
-                ?? (http.statusCode == 200 ? http.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) } : nil)
             if let parsedTotal, parsedTotal >= 4 * 1024 * 1024 {
                 cache.setKnownTotalLength(parsedTotal)
                 if requestMethod == "GET", rangeHeader == "bytes=0-1" {
@@ -1187,19 +1124,6 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
                 }
             }
         }
-        lock.lock()
-        shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
-        if shouldPatchMP4Stream {
-            mp4Patcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: startsAtZero)
-        }
-        didSendHeaders = true
-        lock.unlock()
-
-        let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
-        let isImportant = http.statusCode >= 400
-        let rangeDesc = rangeHeader ?? "full"
-        let pathSuffix = isImportant ? " path=...\(String((http.url?.path ?? "").suffix(48)))" : ""
-        onLog(isImportant, "[proxy] \(requestMethod) \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms, range=\(rangeDesc))\(pathSuffix)")
 
         var headerLines = ["HTTP/1.1 \(http.statusCode) \(HTTPURLResponse.localizedString(forStatusCode: http.statusCode))"]
         headerLines.append("Content-Type: \(contentType)")
@@ -1212,23 +1136,97 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         headerLines.append("Accept-Ranges: bytes")
         headerLines.append("Connection: close")
         let headPacket = Data((headerLines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+
+        let totalOrExpected = parsedTotal ?? expectedLen
+        let shouldBufferManifest = hlsManifestRewriter != nil
+            && requestMethod != "HEAD"
+            && (200...299).contains(http.statusCode)
+            && !ctLower.contains("video/")
+            && !ctLower.contains("audio/")
+            && totalOrExpected <= Int64(Self.maxManifestBytes)
+
+        lock.lock()
+        shouldPatchMP4Stream = enableMP4HEV1Patch && (200...299).contains(http.statusCode) && isMP4OrBinary
+        if shouldPatchMP4Stream {
+            mp4Patcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: startsAtZero)
+        }
+        if shouldBufferManifest {
+            isBufferingManifest = true
+            manifestData.removeAll(keepingCapacity: true)
+            manifestBaseURL = http.url
+            manifestStatusCode = http.statusCode
+            manifestHeaderPacket = headPacket
+            didSendHeaders = false
+            lock.unlock()
+            completionHandler(.allow)
+            return
+        }
+        didSendHeaders = true
+        lock.unlock()
+
+        let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+        let isImportant = http.statusCode >= 400
+        let rangeDesc = rangeHeader ?? "full"
+        let pathSuffix = isImportant ? " path=...\(String((http.url?.path ?? "").suffix(48)))" : ""
+        onLog(isImportant, "[proxy] \(requestMethod) \(upstreamHost) -> HTTP \(http.statusCode) (\(elapsedMs)ms, range=\(rangeDesc))\(pathSuffix)")
+
         connection.send(content: headPacket, completion: .contentProcessed { _ in })
         completionHandler(.allow)
     }
 
+    private static func isLikelyTextManifestPrefix(_ data: Data) -> Bool? {
+        var idx = data.startIndex
+        if data.count >= 3,
+           data[idx] == 0xEF,
+           data[idx + 1] == 0xBB,
+           data[idx + 2] == 0xBF {
+            idx += 3
+        }
+        while idx < data.endIndex {
+            let byte = data[idx]
+            if byte == 0x20 || byte == 0x09 || byte == 0x0D || byte == 0x0A {
+                idx += 1
+                continue
+            }
+            return byte == 0x23
+        }
+        return nil
+    }
+
     func handleData(_ data: Data) {
         guard !data.isEmpty else { return }
-        let outgoing: Data
+        var fallbackHeader: Data?
+        var payloadToStream = data
         var taskToSuspend: URLSessionDataTask?
+
         lock.lock()
         guard !didFinish else {
             lock.unlock()
             return
         }
+        if isBufferingManifest {
+            manifestData.append(data)
+            let looksLikeManifest = Self.isLikelyTextManifestPrefix(manifestData)
+            if manifestData.count <= Self.maxManifestBytes && looksLikeManifest != false {
+                lock.unlock()
+                return
+            }
+            // 上游返回非 #EXTM3U 二进制流（如误标 HLS 的 fmp4/mp4），立即无缝退化为二进制透传
+            isBufferingManifest = false
+            didSendHeaders = true
+            shouldPatchMP4Stream = enableMP4HEV1Patch
+            mp4Patcher = MP4HEV1StreamPatcher(startsAtFileOffsetZero: rangeHeader == nil || rangeHeader?.lowercased().hasPrefix("bytes=0-") == true)
+            fallbackHeader = manifestHeaderPacket
+            manifestHeaderPacket = nil
+            payloadToStream = manifestData
+            manifestData.removeAll(keepingCapacity: false)
+        }
+
+        let outgoing: Data
         if shouldPatchMP4Stream {
-            outgoing = mp4Patcher.processChunk(data)
+            outgoing = mp4Patcher.processChunk(payloadToStream)
         } else {
-            outgoing = data
+            outgoing = payloadToStream
         }
         let sentCount = outgoing.count
         if sentCount > 0 {
@@ -1240,6 +1238,12 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         }
         lock.unlock()
         taskToSuspend?.suspend()
+
+        if let fallbackHeader {
+            let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+            onLog(false, "[proxy] 流式混流探测为二进制流 \(upstreamHost) -> 切换直传 (\(elapsedMs)ms)")
+            connection.send(content: fallbackHeader, completion: .contentProcessed { _ in })
+        }
         guard sentCount > 0 else { return }
         connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
             guard let self else { return }
@@ -1263,11 +1267,59 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, @unchecked Sen
         lock.lock()
         let alreadyFinished = didFinish
         let sentHeaders = didSendHeaders
+        let wasBufferingManifest = isBufferingManifest
+        let rawManifestData = manifestData
+        let baseURL = manifestBaseURL
+        let statusCode = manifestStatusCode
+        let savedHeaderPacket = manifestHeaderPacket
+        isBufferingManifest = false
+        manifestData.removeAll(keepingCapacity: false)
+        manifestHeaderPacket = nil
         didFinish = true
         self.dataTask = nil
-        let trailing = shouldPatchMP4Stream ? mp4Patcher.flush() : Data()
+        let trailing = (!wasBufferingManifest && shouldPatchMP4Stream) ? mp4Patcher.flush() : Data()
         lock.unlock()
         guard !alreadyFinished else { return }
+
+        if wasBufferingManifest {
+            let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())
+            if let error {
+                let nsErr = error as NSError
+                if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
+                    onLog(true, "[proxy][error] HLS \(upstreamHost) 失败: \(nsErr.domain)(\(nsErr.code)) \(error.localizedDescription) (\(elapsedMs)ms)")
+                }
+                let status = LocalHTTPStreamProxy.httpErrorStatus(for: error)
+                let body = Data(error.localizedDescription.utf8)
+                let head = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+                var packet = Data(head.utf8)
+                packet.append(body)
+                connection.send(content: packet, completion: .contentProcessed { [weak self] _ in
+                    self?.connection.cancel()
+                })
+                return
+            }
+            if let rewriter = hlsManifestRewriter,
+               let rawText = String(data: rawManifestData, encoding: .utf8),
+               let resolvedBase = baseURL,
+               Self.isLikelyTextManifestPrefix(rawManifestData) == true {
+                onLog(false, "[proxy] HLS \(upstreamHost) -> HTTP \(statusCode) (\(elapsedMs)ms)")
+                let rewritten = rewriter(rawText, resolvedBase)
+                let outData = Data(rewritten.utf8)
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl; charset=utf-8\r\nContent-Length: \(outData.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                var packet = Data(head.utf8)
+                packet.append(outData)
+                connection.send(content: packet, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+                    self?.connection.cancel()
+                })
+                return
+            }
+            var rawPacket = savedHeaderPacket ?? Data("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".utf8)
+            rawPacket.append(rawManifestData)
+            connection.send(content: rawPacket, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self] _ in
+                self?.connection.cancel()
+            })
+            return
+        }
 
         if let error, !sentHeaders {
             let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000).rounded())

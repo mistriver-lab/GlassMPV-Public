@@ -1958,23 +1958,23 @@ final class GlassMPVTests: XCTestCase {
             sourceHeight: 2160,
             maxInterpolatedFrames: 1
         )
-        XCTAssertEqual(plan2x.map(\.height), [1080, 720])
+        XCTAssertEqual(plan2x.map(\.height), [1080, 810])
 
         let plan96 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
             sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 3
         )
-        XCTAssertEqual(plan96.map(\.height), [810, 720, 540])
-        XCTAssertFalse(plan96.contains(where: { $0.height <= 480 }))
+        XCTAssertEqual(plan96.map(\.height), [810, 720])
+        XCTAssertFalse(plan96.contains(where: { $0.height < 720 }))
 
         let plan120 = RemoteOpticalFlowBudgetPlanner.buildRemoteCandidatePlan(
             sourceWidth: 3840,
             sourceHeight: 2160,
             maxInterpolatedFrames: 4
         )
-        XCTAssertEqual(plan120.map(\.height), [720, 540])
-        XCTAssertFalse(plan120.contains(where: { $0.height <= 480 }))
+        XCTAssertEqual(plan120.map(\.height), [720])
+        XCTAssertFalse(plan120.contains(where: { $0.height < 720 }))
 
         XCTAssertFalse(
             RemoteOpticalFlowBudgetPlanner.isCatchUpOverload(
@@ -2606,7 +2606,7 @@ final class GlassMPVTests: XCTestCase {
 
     @MainActor
     func testHybrid4KFlowWarpPlannerAndMetalRender() throws {
-        XCTAssertTrue(
+        XCTAssertFalse(
             RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
                 sourceWidth: 3840,
                 sourceHeight: 2160,
@@ -2614,6 +2614,18 @@ final class GlassMPVTests: XCTestCase {
                 isHDR: false,
                 isDolbyVision: false,
                 is8BitSDRPixelFormat: true
+            ),
+            "默认应走稳定清晰的低延迟 ANE + MetalFX 通道，防止试验性 FlowWarp 引起边沿重影模糊"
+        )
+        XCTAssertTrue(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 3840,
+                sourceHeight: 2160,
+                targetFPS: .fps120,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
         XCTAssertTrue(
@@ -2623,7 +2635,8 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps96,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
         XCTAssertTrue(
@@ -2633,7 +2646,8 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps60,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
         XCTAssertFalse(
@@ -2643,9 +2657,13 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .x2,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
+        XCTAssertEqual(OpticalFlowTargetFPS.fps96.effectiveTargetFPS(sourceFPS: 25.0), 100.0, accuracy: 0.01)
+        XCTAssertEqual(OpticalFlowTargetFPS.fps96.maxInterpolatedFramesPerPair(sourceFPS: 25.0), 3)
+        XCTAssertEqual(OpticalFlowResolutionPlanner.lowLatencyExponent(forInterpolatedFrames: 3), 2)
         XCTAssertFalse(
             RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
                 sourceWidth: 3840,
@@ -2653,7 +2671,8 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: true,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
         XCTAssertFalse(
@@ -2663,7 +2682,8 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: false
+                is8BitSDRPixelFormat: false,
+                allowExperimentalFlowWarp: true
             )
         )
         XCTAssertFalse(
@@ -2673,7 +2693,8 @@ final class GlassMPVTests: XCTestCase {
                 targetFPS: .fps120,
                 isHDR: false,
                 isDolbyVision: false,
-                is8BitSDRPixelFormat: true
+                is8BitSDRPixelFormat: true,
+                allowExperimentalFlowWarp: true
             )
         )
 
@@ -2789,5 +2810,318 @@ final class GlassMPVTests: XCTestCase {
         } else {
             XCTAssertEqual(status, .unavailable)
         }
+    }
+
+    func testLocalHTTPStreamProxyHLSAndMislabeledFMP4VariantSwitch() async throws {
+        let playJSON = Data((
+            "{\"code\":0,\"data\":{\"video_list\":["
+            + "{\"resolution\":\"super\",\"format\":\"fmp4\",\"video_info\":{\"url\":\"https://cdn.example.com/1080p_fmp4\",\"format\":\"mp4\"}},"
+            + "{\"resolution\":\"high\",\"video_info\":{\"url\":\"https://cdn.example.com/1080p.m3u8\"}}"
+            + "]}}"
+        ).utf8)
+        let headers = QuarkDriveClient.requestHeaders(cookie: "__pus=abc")
+        let variants = QuarkDriveClient.parsePlayVariantsJSON(playJSON, headers: headers)
+        XCTAssertEqual(variants.count, 2)
+        XCTAssertFalse(variants[0].isHLS)
+        XCTAssertTrue(variants[1].isHLS)
+
+        let fakeFMP4Payload = Data([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D]) + Data(repeating: 0x3C, count: 65536)
+        let tsPayload = Data(repeating: 0x47, count: 4096)
+
+        final class MockVariantServer: @unchecked Sendable {
+            private let lock = NSLock()
+            private let readySem = DispatchSemaphore(value: 0)
+            private var port: UInt16 = 0
+
+            func markReady(port: UInt16) {
+                lock.lock()
+                self.port = port
+                lock.unlock()
+                readySem.signal()
+            }
+
+            func waitForPort() -> UInt16 {
+                _ = readySem.wait(timeout: .now() + 2.0)
+                lock.lock()
+                let p = port
+                lock.unlock()
+                return p
+            }
+        }
+        let server = MockVariantServer()
+        let stubQueue = DispatchQueue(label: "com.glassmpv.test.hls_fmp4")
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                server.markReady(port: listener.port?.rawValue ?? 0)
+            }
+        }
+        listener.newConnectionHandler = { conn in
+            conn.start(queue: stubQueue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, _ in
+                let reqStr = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let parsed = LocalHTTPStreamProxy.parseHTTPRequestHead(reqStr)
+                let path = parsed?.path ?? ""
+                if path.hasPrefix("/playlist.m3u8") {
+                    let body = Data("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n#EXT-X-ENDLIST\n".utf8)
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+                    var pkt = Data(head.utf8)
+                    pkt.append(body)
+                    conn.send(content: pkt, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+                } else if path.hasPrefix("/seg0.ts") {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: \(tsPayload.count)\r\nConnection: close\r\n\r\n"
+                    var pkt = Data(head.utf8)
+                    pkt.append(tsPayload)
+                    conn.send(content: pkt, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+                } else {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: \(fakeFMP4Payload.count)\r\nConnection: close\r\n\r\n"
+                    var pkt = Data(head.utf8)
+                    pkt.append(fakeFMP4Payload)
+                    conn.send(content: pkt, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+                }
+            }
+        }
+        listener.start(queue: stubQueue)
+        defer {
+            listener.cancel()
+            LocalHTTPStreamProxy.shared.resetRoutes()
+        }
+
+        let port = server.waitForPort()
+        XCTAssertGreaterThan(port, 0)
+
+        // 1) 验证真实 HLS manifest 改写 + 子分片透传
+        let hlsUpstream = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/playlist.m3u8"))
+        let hlsProxy = LocalHTTPStreamProxy.shared.registerStream(
+            url: hlsUpstream,
+            headers: ["Referer": "https://pan.quark.cn/"],
+            isHLS: true
+        )
+        let (hlsData, hlsResp) = try await URLSession.shared.data(from: hlsProxy)
+        XCTAssertEqual((hlsResp as? HTTPURLResponse)?.statusCode, 200)
+        let rewrittenText = try XCTUnwrap(String(data: hlsData, encoding: .utf8))
+        XCTAssertTrue(rewrittenText.contains("/sub/"))
+        let segLine = try XCTUnwrap(
+            rewrittenText.components(separatedBy: .newlines).first(where: { $0.hasPrefix("http://127.0.0.1:") })
+        )
+        let segURL = try XCTUnwrap(URL(string: segLine))
+        let (segData, segResp) = try await URLSession.shared.data(from: segURL)
+        XCTAssertEqual((segResp as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(segData, tsPayload)
+
+        // 2) 验证即使误传 isHLS=true 的二进制 fmp4 流也能毫秒级直传而不卡死
+        let fmp4Upstream = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/1080p_fmp4?auth=1"))
+        let fmp4Proxy = LocalHTTPStreamProxy.shared.registerStream(
+            url: fmp4Upstream,
+            headers: ["Referer": "https://pan.quark.cn/"],
+            isHLS: true
+        )
+        let (binData, binResp) = try await URLSession.shared.data(from: fmp4Proxy)
+        XCTAssertEqual((binResp as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(binData, fakeFMP4Payload)
+    }
+
+    @MainActor
+    func testEndToEndSimulatorRemoteVariantSwitchPlayback() async throws {
+        let sampleURL = try await TestVideoGenerator.generateSampleMP4(
+            durationSeconds: 1.5,
+            width: 320,
+            height: 180,
+            fps: 24
+        )
+        let mp4Data = try Data(contentsOf: sampleURL)
+
+        final class MockMP4RangeServer: @unchecked Sendable {
+            private let lock = NSLock()
+            private let readySem = DispatchSemaphore(value: 0)
+            private var port: UInt16 = 0
+            let bodyData: Data
+
+            init(bodyData: Data) {
+                self.bodyData = bodyData
+            }
+
+            func markReady(port: UInt16) {
+                lock.lock()
+                self.port = port
+                lock.unlock()
+                readySem.signal()
+            }
+
+            func waitForPort() -> UInt16 {
+                _ = readySem.wait(timeout: .now() + 2.0)
+                lock.lock()
+                let p = port
+                lock.unlock()
+                return p
+            }
+        }
+
+        let mockServer = MockMP4RangeServer(bodyData: mp4Data)
+        let stubQueue = DispatchQueue(label: "com.glassmpv.test.e2e_variant_switch")
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                mockServer.markReady(port: listener.port?.rawValue ?? 0)
+            }
+        }
+        listener.newConnectionHandler = { conn in
+            conn.start(queue: stubQueue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, _ in
+                let reqStr = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let parsed = LocalHTTPStreamProxy.parseHTTPRequestHead(reqStr)
+                let totalLen = Int64(mockServer.bodyData.count)
+                let range = parsed?.rangeHeader.flatMap {
+                    LocalHTTPStreamProxy.parseByteRangeHeader($0, totalLength: totalLen)
+                } ?? (start: Int64(0), end: totalLen - 1)
+                let slice = mockServer.bodyData.subdata(in: Int(range.start)..<Int(range.end + 1))
+                let head = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Length: \(slice.count)\r\nContent-Range: bytes \(range.start)-\(range.end)/\(totalLen)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                var pkt = Data(head.utf8)
+                pkt.append(slice)
+                conn.send(content: pkt, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+            }
+        }
+        listener.start(queue: stubQueue)
+        defer {
+            listener.cancel()
+            LocalHTTPStreamProxy.shared.resetRoutes()
+        }
+
+        let port = mockServer.waitForPort()
+        XCTAssertGreaterThan(port, 0)
+
+        let controller = OpticalFlowPlayerController()
+        let displayContainer = SampleBufferDisplayContainerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        controller.attach(to: displayContainer)
+        defer {
+            controller.stop()
+            _ = displayContainer
+        }
+
+        func waitFrames(timeout: TimeInterval) async throws {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if controller.errorMessage != nil || controller.presentedFrameCount > 0 {
+                    break
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+
+        let variantAURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/original_4k.mp4"))
+        controller.load(
+            url: variantAURL,
+            spatial2x: false,
+            targetFPS: .fps60,
+            startAt: 0,
+            autoPlay: true,
+            enableInterpolation: false,
+            httpHeaders: ["Referer": "https://pan.quark.cn/"],
+            displayTitle: "SwitchTest",
+            streamLabel: "原画直链",
+            isHLS: false
+        )
+        try await waitFrames(timeout: 15.0)
+        if controller.presentedFrameCount == 0 {
+            controller.clearError()
+            controller.load(
+                url: variantAURL,
+                spatial2x: false,
+                targetFPS: .fps60,
+                startAt: 0,
+                autoPlay: true,
+                enableInterpolation: false,
+                httpHeaders: ["Referer": "https://pan.quark.cn/"],
+                displayTitle: "SwitchTest",
+                streamLabel: "原画直链",
+                isHLS: false
+            )
+            try await waitFrames(timeout: 15.0)
+        }
+        XCTAssertNil(controller.errorMessage)
+        XCTAssertGreaterThan(controller.presentedFrameCount, 0)
+
+        let variantBURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/transcode_1080p"))
+        controller.load(
+            url: variantBURL,
+            spatial2x: false,
+            targetFPS: .fps60,
+            startAt: 0.2,
+            autoPlay: true,
+            enableInterpolation: false,
+            httpHeaders: ["Referer": "https://pan.quark.cn/"],
+            displayTitle: "SwitchTest",
+            streamLabel: "夸克 1080P+",
+            isHLS: true
+        )
+        try await waitFrames(timeout: 15.0)
+        XCTAssertNil(controller.errorMessage)
+        XCTAssertGreaterThan(controller.presentedFrameCount, 0)
+    }
+
+    @MainActor
+    func testPlayerOverlayNonOverlapAndTimelineRetention() throws {
+        XCTAssertFalse(
+            PlayerOverlayLayoutPolicy.shouldShowCenterTransportControls(
+                showFPSPicker: false,
+                showQualityPicker: false,
+                isLoadingPipeline: true,
+                presentedFrameCount: 0,
+                hasError: false
+            )
+        )
+        XCTAssertFalse(
+            PlayerOverlayLayoutPolicy.shouldShowCenterTransportControls(
+                showFPSPicker: false,
+                showQualityPicker: false,
+                isLoadingPipeline: false,
+                presentedFrameCount: 10,
+                hasError: true
+            )
+        )
+        XCTAssertTrue(
+            PlayerOverlayLayoutPolicy.shouldShowCenterTransportControls(
+                showFPSPicker: false,
+                showQualityPicker: false,
+                isLoadingPipeline: false,
+                presentedFrameCount: 10,
+                hasError: false
+            )
+        )
+
+        XCTAssertEqual(
+            PlayerOverlayLayoutPolicy.activeCenterLoadingMessage(
+                isImportingFile: true,
+                isResolvingHistoryResume: true,
+                hasActiveURL: true,
+                hasError: false,
+                isLoadingPipeline: true,
+                presentedFrameCount: 0,
+                pipelineStatusText: "加载中"
+            ),
+            "正在解析续播直链..."
+        )
+        XCTAssertNil(
+            PlayerOverlayLayoutPolicy.activeCenterLoadingMessage(
+                isImportingFile: false,
+                isResolvingHistoryResume: false,
+                hasActiveURL: true,
+                hasError: false,
+                isLoadingPipeline: false,
+                presentedFrameCount: 12,
+                pipelineStatusText: ""
+            )
+        )
+
+        XCTAssertGreaterThan(
+            PlayerOverlayLayoutPolicy.topBannerPaddingTop(showHUD: true, showStatsHUD: true),
+            PlayerOverlayLayoutPolicy.topBannerPaddingTop(showHUD: true, showStatsHUD: false)
+        )
+        XCTAssertEqual(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: "原画直链"), "原画")
+        XCTAssertEqual(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: "夸克 · 夸克 1080P+"), "1080P+")
     }
 }

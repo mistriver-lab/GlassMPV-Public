@@ -21,6 +21,62 @@ private final class TelemetryLoopToken: @unchecked Sendable {
     }
 }
 
+enum PlayerOverlayLayoutPolicy: Sendable {
+    static func shouldShowCenterTransportControls(
+        showFPSPicker: Bool,
+        showQualityPicker: Bool,
+        isLoadingPipeline: Bool,
+        presentedFrameCount: Int,
+        hasError: Bool
+    ) -> Bool {
+        !showFPSPicker && !showQualityPicker && !isLoadingPipeline && presentedFrameCount > 0 && !hasError
+    }
+
+    static func activeCenterLoadingMessage(
+        isImportingFile: Bool,
+        isResolvingHistoryResume: Bool,
+        hasActiveURL: Bool,
+        hasError: Bool,
+        isLoadingPipeline: Bool,
+        presentedFrameCount: Int,
+        pipelineStatusText: String
+    ) -> String? {
+        if isResolvingHistoryResume {
+            return "正在解析续播直链..."
+        }
+        if isImportingFile {
+            return "正在导入视频..."
+        }
+        guard hasActiveURL, !hasError else {
+            return nil
+        }
+        if isLoadingPipeline || presentedFrameCount == 0 {
+            return pipelineStatusText.isEmpty ? "正在预热视频管线..." : pipelineStatusText
+        }
+        return nil
+    }
+
+    static func topBannerPaddingTop(showHUD: Bool, showStatsHUD: Bool) -> CGFloat {
+        if showHUD {
+            return showStatsHUD ? 108 : 66
+        }
+        return showStatsHUD ? 58 : 18
+    }
+
+    static func compactStreamVariantLabel(from fullLabel: String) -> String {
+        let stripped = fullLabel
+            .replacingOccurrences(of: "夸克 · ", with: "")
+            .replacingOccurrences(of: "Emby · ", with: "")
+            .replacingOccurrences(of: "WebDAV · ", with: "")
+            .replacingOccurrences(of: "夸克 ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped == "原画直链" || stripped.isEmpty {
+            return "原画"
+        }
+        return stripped
+    }
+}
+
 @MainActor
 final class PlayerCoordinator: ObservableObject {
     @Published var interpolationMode: InterpolationMode = .vtOpticalFlow
@@ -523,13 +579,58 @@ final class PlayerCoordinator: ObservableObject {
     func switchStreamVariant(_ variant: StreamVariantOption) {
         guard let currentReq = activeMediaRequest, variant.url != currentURL else { return }
         let resumeTime = activeCurrentTime > 0 ? activeCurrentTime : pendingSeekSeconds
+        if let accountID = currentReq.accountID,
+           let account = mediaSourceStore.accounts.first(where: { $0.id == accountID }),
+           account.kind == .quark,
+           let item = currentReq.cloudItem {
+            let secret = mediaSourceStore.secret(for: account.id)
+            let storeRef = mediaSourceStore
+            opticalFlowController.clearError()
+            isResolvingHistoryResume = true
+            recordUISwitch("switchStreamVariant(refresh quark) -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.isResolvingHistoryResume = false }
+                var targetVariant = variant
+                if let resolved = try? await QuarkDriveClient.resolvePlaybackStream(
+                    item: item,
+                    cookie: secret,
+                    preferTranscode: variant.id != "quark-original",
+                    onCookieRefresh: { refreshed in
+                        Task { @MainActor in
+                            storeRef.addOrUpdate(account: account, secret: refreshed)
+                        }
+                    }
+                ) {
+                    self.currentStreamVariants = resolved.alternatives
+                    if let refreshedMatch = resolved.alternatives.first(where: { $0.id == variant.id }) {
+                        targetVariant = refreshedMatch
+                    }
+                }
+                guard self.currentURL != nil, self.activeMediaRequest?.cloudItem?.id == item.id else {
+                    return
+                }
+                self.applyStreamVariantSwitch(targetVariant, currentReq: currentReq, resumeTime: resumeTime)
+            }
+            return
+        }
+        recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
+        applyStreamVariantSwitch(variant, currentReq: currentReq, resumeTime: resumeTime)
+    }
+
+    private func applyStreamVariantSwitch(
+        _ variant: StreamVariantOption,
+        currentReq: PlaybackMediaRequest,
+        resumeTime: Double
+    ) {
+        let updatedVariants = currentStreamVariants.isEmpty ? currentReq.alternatives : currentStreamVariants
         let updated = PlaybackMediaRequest(
             url: variant.url,
             headers: variant.headers,
             displayTitle: currentReq.displayTitle,
             sourceLabel: variant.label,
             isHLS: variant.isHLS,
-            alternatives: currentReq.alternatives,
+            alternatives: updatedVariants,
             accountID: currentReq.accountID,
             cloudItem: currentReq.cloudItem,
             subtitleCandidates: currentReq.subtitleCandidates,
@@ -538,7 +639,6 @@ final class PlayerCoordinator: ObservableObject {
             directorySubtitles: currentReq.directorySubtitles,
             folderKey: currentReq.folderKey
         )
-        recordUISwitch("switchStreamVariant -> \(variant.label) (t=\(String(format: "%.1f", resumeTime))s)")
         activeMediaRequest = updated
         beginPlayback(url: updated.url, seekTo: resumeTime)
         if !updated.subtitleCandidates.isEmpty {
@@ -667,7 +767,9 @@ final class PlayerCoordinator: ObservableObject {
         let enteringFromHome = (currentURL == nil)
         currentURL = url
         pendingSeekSeconds = max(0, seekTo)
-        runtimeTimeline.removeAll()
+        if enteringFromHome {
+            runtimeTimeline.removeAll()
+        }
         subtitleManager.resetForNewMedia()
         activeHistoryEntryID = resolveActiveHistoryEntryID(for: url)
         saveWatchProgressNow(overridePosition: seekTo)
@@ -1738,13 +1840,6 @@ struct LiquidGlassPlayerView: View {
                         Spacer()
                     }
                 }
-                if optical.errorMessage == nil,
-                   (optical.isLoadingPipeline || optical.presentedFrameCount == 0) {
-                    loadingStatusPill(
-                        optical.pipelineStatusText.isEmpty ? "正在预热视频管线..." : optical.pipelineStatusText
-                    )
-                }
-
                 if subtitleManager.isEnabled, subtitleManager.selectedTrackID != nil {
                     SubtitleOverlayView(
                         subtitleManager: subtitleManager,
@@ -1759,6 +1854,10 @@ struct LiquidGlassPlayerView: View {
                     isHoldFastForwarding: coordinator.isHoldFastForwarding
                 )
 
+                let topBannerOffset = PlayerOverlayLayoutPolicy.topBannerPaddingTop(
+                    showHUD: showHUD,
+                    showStatsHUD: showStatsHUD
+                )
                 if let notice = coordinator.streamNoticeText, coordinator.resumeToastText == nil {
                     VStack {
                         HStack(spacing: 8) {
@@ -1773,13 +1872,13 @@ struct LiquidGlassPlayerView: View {
                         .padding(.vertical, 8)
                         .background(Capsule().fill(Color.black.opacity(0.78)))
                         .overlay(Capsule().strokeBorder(Color.cyan.opacity(0.35), lineWidth: 0.8))
-                        .padding(.top, showHUD ? 60 : 18)
+                        .padding(.top, topBannerOffset)
                         Spacer()
                     }
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                if let toast = coordinator.resumeToastText {
+                if let toast = coordinator.resumeToastText, optical.presentedFrameCount > 0 {
                     VStack {
                         HStack(spacing: 10) {
                             Image(systemName: "clock.arrow.circlepath")
@@ -1799,7 +1898,7 @@ struct LiquidGlassPlayerView: View {
                         .padding(.vertical, 8)
                         .background(Capsule().fill(Color.black.opacity(0.75)))
                         .overlay(Capsule().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8))
-                        .padding(.top, showHUD ? 60 : 18)
+                        .padding(.top, topBannerOffset)
                         Spacer()
                     }
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -1861,8 +1960,16 @@ struct LiquidGlassPlayerView: View {
                 }
             }
 
-            if coordinator.isImportingFile || coordinator.isResolvingHistoryResume {
-                loadingStatusPill(coordinator.isResolvingHistoryResume ? "正在解析续播直链..." : "正在导入视频...")
+            if let loadingMessage = PlayerOverlayLayoutPolicy.activeCenterLoadingMessage(
+                isImportingFile: coordinator.isImportingFile,
+                isResolvingHistoryResume: coordinator.isResolvingHistoryResume,
+                hasActiveURL: coordinator.currentURL != nil,
+                hasError: optical.errorMessage != nil,
+                isLoadingPipeline: optical.isLoadingPipeline,
+                presentedFrameCount: optical.presentedFrameCount,
+                pipelineStatusText: optical.pipelineStatusText
+            ) {
+                loadingStatusPill(loadingMessage)
             }
 
             if let error = optical.errorMessage {
@@ -2380,6 +2487,37 @@ struct LiquidGlassPlayerView: View {
                                 }
                                 .buttonStyle(.plain)
 
+                                if coordinator.currentStreamVariants.count > 1 {
+                                    Menu {
+                                        ForEach(coordinator.currentStreamVariants) { variant in
+                                            let isCurrent = (variant.url == coordinator.currentURL)
+                                            Button {
+                                                coordinator.switchStreamVariant(variant)
+                                                scheduleHUDAutoHide()
+                                            } label: {
+                                                if isCurrent {
+                                                    Label(variant.label, systemImage: "checkmark")
+                                                } else {
+                                                    Text(variant.label)
+                                                }
+                                            }
+                                        }
+                                    } label: {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "4k.tv")
+                                                .font(.caption2.weight(.bold))
+                                            Text(PlayerOverlayLayoutPolicy.compactStreamVariantLabel(from: optical.activeStreamLabel))
+                                                .font(.caption2.weight(.bold))
+                                            Image(systemName: "chevron.up.chevron.down")
+                                                .font(.system(size: 8, weight: .bold))
+                                        }
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 7)
+                                        .background(Capsule().fill(Color.white.opacity(0.14)))
+                                    }
+                                }
+
                                 Spacer(minLength: 4)
 
                                 if coordinator.activePlaylist.count > 1 {
@@ -2466,8 +2604,14 @@ struct LiquidGlassPlayerView: View {
                 Spacer()
             }
 
-            // 正中 Infuse 风格盲按播控中心（弹层打开时避让）
-            if !showFPSPicker && !showQualityPicker {
+            // 正中 Infuse 风格盲按播控中心（弹层打开、加载预热中或报错时自动避让防重叠）
+            if PlayerOverlayLayoutPolicy.shouldShowCenterTransportControls(
+                showFPSPicker: showFPSPicker,
+                showQualityPicker: showQualityPicker,
+                isLoadingPipeline: optical.isLoadingPipeline,
+                presentedFrameCount: optical.presentedFrameCount,
+                hasError: optical.errorMessage != nil
+            ) {
                 let skipStep = preferencesStore.skipIntervalSeconds
                 HStack(spacing: 24) {
                     if coordinator.activePlaylist.count > 1 {

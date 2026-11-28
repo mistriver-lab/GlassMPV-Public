@@ -251,6 +251,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "ProxyRouteChunkCache" in local_proxy_src
     assert "ParallelChunkedStreamRelay" in local_proxy_src
     assert "parseContentRangeTotalLength" in local_proxy_src
+    assert "cancelActiveChunkCaches" in local_proxy_src
+    assert "hlsManifestRewriter" in local_proxy_src
 
     for required_cloud_file in (
         ROOT / "Sources" / "Models" / "MediaSourceModels.swift",
@@ -456,6 +458,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testAutoMetalFXUpscaleOpticalFlowDecision" in swift_test_src
     assert "testLocalHTTPStreamProxyParallelChunkedRangeAndCacheReuse" in swift_test_src
     assert "testHybrid4KFlowWarpPlannerAndMetalRender" in swift_test_src
+    assert "testLocalHTTPStreamProxyHLSAndMislabeledFMP4VariantSwitch" in swift_test_src
+    assert "testEndToEndSimulatorRemoteVariantSwitchPlayback" in swift_test_src
+    assert "testPlayerOverlayNonOverlapAndTimelineRetention" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src
@@ -464,6 +469,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "presentFlowWarpedFrame" in engine_src
     player_view_src = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "reResolveCurrentCloudStream" in player_view_src
+    assert "PlayerOverlayLayoutPolicy" in player_view_src
 
     orientation_ctrl = ROOT / "Sources" / "UI" / "OrientationController.swift"
     assert orientation_ctrl.is_file(), f"Missing {orientation_ctrl}"

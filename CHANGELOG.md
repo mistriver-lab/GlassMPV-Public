@@ -2,6 +2,19 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.12] - 2026-11-28
+
+### 修复与架构稳态升级 (Fixed & Stabilized)
+- **画质与流畅度全面止损 (`RemoteStreamOpticalFlowWorker` + `OpticalFlowOptions` + `MetalVideoEnhancer`)**：
+  - `RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp` 新增 `allowExperimentalFlowWarp` 开关并默认关闭试验性 `FlowWarp`，彻底消除 b38 因 `RGhA` 转码 + `640×360` 原始向量直接 Warp 导致的重影发糊与 4K 解码 Surface 池卡顿。
+  - 全档位淘汰 `540p`/`480p` 糊档（`2×`: `1080p→810p`、`60/96/100fps`: `810p→720p`、`120fps`: 锁定 `720p` 超限稳帧降至 `96/100fps`）；25fps 片源在 `fps96` 自动映射至 `100.0fps (4×, exp=2)`，并在 `<= 105fps` 下将 `MetalFX` 重建上限放开至 **`2560×1440`**。
+- **彻底修复「切画质卡死不播」与底栏直接换源 (`LocalHTTPStreamProxy` + `MediaSourceClients` + `LiquidGlassPlayerView`)**：
+  - `QuarkDriveClient` 改用 `m3u8,fmp4` 优先序并根据真实 `format` 与扩展名区分 `isHLS`；`LocalHTTPStreamProxy` 在 `UpstreamStreamRelay` 内依据响应头与首包 `#EXT` 前缀探测，即使转码流被误标为 `isHLS` 也能毫秒级无缝切换为二进制直传，并在切流时立即调用 `cancelActiveChunkCaches()` 停止旧片源 2MB 预读。
+  - `LiquidGlassPlayerView` 底部播放栏直接内置「画质流切换」菜单，切换夸克画质时先后台刷新未过期直链并保留 `runtimeTimeline` 黑匣子遥测。
+- **消除初播界面控件重叠 & 扩充 macOS 模拟器 E2E 自测 (`LiquidGlassPlayerView` + `GlassMPVTests`)**：
+  - 引入 `PlayerOverlayLayoutPolicy`：居中加载提示与中央播控按钮严格互斥，顶部续播提示自动避让左上统计 HUD，且仅在首帧呈递后显示。
+  - 在 GitHub Actions macOS iOS 26 模拟器 CI 新增 `testLocalHTTPStreamProxyHLSAndMislabeledFMP4VariantSwitch`、`testEndToEndSimulatorRemoteVariantSwitchPlayback` 与 `testPlayerOverlayNonOverlapAndTimelineRetention` 端到端测试。
+
 ## [v0.1.0-beta.11] - 2026-11-28
 
 ### 重大架构升级 (Major Upgrade)

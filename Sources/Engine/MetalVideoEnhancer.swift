@@ -1268,8 +1268,8 @@ final class MetalVideoEnhancer {
         } else if wantsAutoMetalFX,
                   let yuvToBGRAPipeline {
 #if canImport(MetalFX) && !targetEnvironment(simulator)
-            let autoMaxLong = (outputFPS > 65.0) ? 1920 : 2560
-            let autoMaxShort = (outputFPS > 65.0) ? 1080 : 1440
+            let autoMaxLong = (outputFPS > 105.0) ? 1920 : 2560
+            let autoMaxShort = (outputFPS > 105.0) ? 1080 : 1440
             if let outDims = VideoEnhancementPlanner.recommendedUpscaleDimensions(
                 inputWidth: srcW,
                 inputHeight: srcH,

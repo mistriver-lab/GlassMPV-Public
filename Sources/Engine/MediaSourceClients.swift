@@ -595,6 +595,15 @@ enum QuarkDriveClient: Sendable {
             let videoInfo = entry["video_info"] as? [String: Any]
             let urlStr = (videoInfo?["url"] as? String) ?? (entry["url"] as? String)
             guard let urlStr, let url = URL(string: urlStr) else { continue }
+            let formatHint = ((videoInfo?["format"] as? String) ?? (entry["format"] as? String) ?? "").lowercased()
+            let urlLower = url.absoluteString.lowercased()
+            let extLower = url.pathExtension.lowercased()
+            let variantIsHLS: Bool
+            if formatHint.contains("m3u8") || formatHint.contains("hls") || extLower == "m3u8" || urlLower.contains(".m3u8") {
+                variantIsHLS = true
+            } else {
+                variantIsHLS = false
+            }
             let label = displayNames[resolution] ?? "夸克 \(resolution.uppercased())"
             let rank = orderRank[resolution] ?? 0
             options.append((
@@ -604,7 +613,7 @@ enum QuarkDriveClient: Sendable {
                     label: label,
                     url: url,
                     headers: headers,
-                    isHLS: true
+                    isHLS: variantIsHLS
                 )
             ))
         }
@@ -647,7 +656,7 @@ enum QuarkDriveClient: Sendable {
                 headers: headers,
                 title: item.name,
                 qualityLabel: bestTranscode.label,
-                isHLS: true,
+                isHLS: bestTranscode.isHLS,
                 alternatives: allOptions
             )
         }
@@ -723,7 +732,7 @@ enum QuarkDriveClient: Sendable {
         req.httpBody = try JSONSerialization.data(withJSONObject: [
             "fid": fid,
             "resolutions": "normal,low,high,super,2k,4k",
-            "supports": "fmp4,m3u8"
+            "supports": "m3u8,fmp4"
         ])
 
         let (data, resp) = try await session.data(for: req)

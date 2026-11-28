@@ -63,6 +63,9 @@ enum OpticalFlowTargetFPS: String, CaseIterable, Identifiable, Hashable, Sendabl
         guard let fixed = targetFPSValue else {
             return safeSrc * 2.0
         }
+        if self == .fps96, (24.5...25.5).contains(safeSrc) {
+            return safeSrc * 4.0
+        }
         return max(safeSrc, fixed)
     }
 

@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.11"
+    static let releaseTag = "0.1.0-beta.12"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.12",
+            date: "2026-11-28",
+            highlights: [
+                "画质与流畅度全面止损回稳：默认下线引发边沿重影模糊与 4K 解码池抢占卡顿的试验性 FlowWarp，恢复并强化稳定清晰的 ANE 硬件光流 + MetalFX 通道（2× 1080p、60/96/100fps 810p/720p、120fps 锁定 720p 并全面剔除 540p/480p 糊档）；25fps 片源选择 96fps 档自动对齐 100fps (4×) 整数甜点并解锁最高 2560×1440 MetalFX 重建",
+                "彻底修复「无法切换画质流」与「切画质后卡死无画面」：播放器底栏新增一键「画质流切换」胶囊菜单并会在切换夸克片源时自动刷新直链防过期；QuarkDriveClient 按真实 format/扩展名判定 HLS 与 fMP4；LocalHTTPStreamProxy 根据 Content-Type/长度/#EXT 头嗅探自动将误标为 HLS 的二进制流退化为直传并在切流时立即清理旧缓存预读",
+                "彻底消除初播界面按钮重叠 + 扩充 macOS 模拟器 E2E 自测门禁：PlayerOverlayLayoutPolicy 统一居中加载态并在预热/报错期避让中央播控按键、顶部续播提示自动避让左上 HUD，且切流不再清空遥测时间线；CI 新增 HLS/误标 fMP4 切换与双流端到端实播自测"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.11",
             date: "2026-11-28",

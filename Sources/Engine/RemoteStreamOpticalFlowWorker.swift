@@ -56,8 +56,12 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
         targetFPS: OpticalFlowTargetFPS,
         isHDR: Bool,
         isDolbyVision: Bool,
-        is8BitSDRPixelFormat: Bool = true
+        is8BitSDRPixelFormat: Bool = true,
+        allowExperimentalFlowWarp: Bool = false
     ) -> Bool {
+        guard allowExperimentalFlowWarp else {
+            return false
+        }
         guard !isHDR, !isDolbyVision, is8BitSDRPixelFormat else {
             return false
         }
@@ -99,12 +103,12 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
 
     static func resolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
         if maxInterp <= 1 {
-            return [(1920, 1080), (1280, 720)]
+            return [(1920, 1080), (1440, 810)]
         }
         if maxInterp <= 3 {
-            return [(1440, 810), (1280, 720), (960, 540)]
+            return [(1440, 810), (1280, 720)]
         }
-        return [(1280, 720), (960, 540)]
+        return [(1280, 720)]
     }
 
     static func shouldEmitPreparedOriginalFrame(

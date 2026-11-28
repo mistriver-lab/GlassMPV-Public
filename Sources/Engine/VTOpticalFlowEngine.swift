@@ -2066,7 +2066,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
                 }
             )
             options = nil
-            appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(detectedHLS))")
+            appendLog("[remote] 已启用 127.0.0.1 本地 HTTP 反向代理透传请求头 (isHLS=\(detectedHLS), host=\(url.host ?? "unknown"), ext=\(playbackURL.pathExtension))")
         } else {
             playbackURL = url
             options = nil
@@ -2940,6 +2940,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         onRemoteVideoTrackUnplayable = nil
         onRemoteStreamFailed = nil
         currentHTTPHeaders = [:]
+        if isRemoteStream {
+            LocalHTTPStreamProxy.shared.cancelActiveChunkCaches()
+        }
         isRemoteStream = false
         displayTitle = ""
         activeStreamLabel = ""
