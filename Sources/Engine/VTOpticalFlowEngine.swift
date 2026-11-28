@@ -440,12 +440,14 @@ struct RemoteClockContinuityGuard: Sendable {
     private(set) var seekTargetPTS: Double = -1
     private(set) var lastSamplePTS: Double = -1
     private(set) var lastClockPTS: Double = -1
+    private(set) var postSeekKeyframeGraceUntilPTS: Double = -1
 
     mutating func reset() {
         isSeekPending = false
         seekTargetPTS = -1
         lastSamplePTS = -1
         lastClockPTS = -1
+        postSeekKeyframeGraceUntilPTS = -1
     }
 
     mutating func beginSeek(targetPTS: Double) {
@@ -453,12 +455,14 @@ struct RemoteClockContinuityGuard: Sendable {
         seekTargetPTS = targetPTS.isFinite ? max(0, targetPTS) : 0
         lastSamplePTS = -1
         lastClockPTS = -1
+        postSeekKeyframeGraceUntilPTS = -1
     }
 
     mutating func completeSeek() {
         isSeekPending = false
         lastSamplePTS = -1
         lastClockPTS = -1
+        postSeekKeyframeGraceUntilPTS = -1
     }
 
     mutating func evaluateTick(
@@ -480,8 +484,10 @@ struct RemoteClockContinuityGuard: Sendable {
                 if let s = validSample {
                     lastSamplePTS = s
                 }
+                let resolvedClock = max(0, validClock ?? seekTargetPTS)
+                postSeekKeyframeGraceUntilPTS = resolvedClock + 1.5
                 return .resetPipelineAndContinue(
-                    activeClockPTS: max(0, validClock ?? seekTargetPTS),
+                    activeClockPTS: resolvedClock,
                     shouldSubmitSample: validSample != nil
                 )
             }
@@ -490,13 +496,16 @@ struct RemoteClockContinuityGuard: Sendable {
 
         let backwardClockJump = (lastClockPTS >= 0 && validClock.map { $0 < lastClockPTS - 0.50 } == true)
         let forwardClockJump = (lastClockPTS >= 0 && validClock.map { $0 > lastClockPTS + 4.0 } == true)
-        let backwardSampleJump = (lastSamplePTS >= 0 && validSample.map { $0 < lastSamplePTS - 0.50 } == true)
+        let inPostSeekGrace = (postSeekKeyframeGraceUntilPTS >= 0) && !backwardClockJump && !forwardClockJump
+        let sampleBackTolerance = inPostSeekGrace ? 2.0 : 0.50
+        let backwardSampleJump = (lastSamplePTS >= 0 && validSample.map { $0 < lastSamplePTS - sampleBackTolerance } == true)
         let forwardSampleJump = (lastSamplePTS >= 0 && validSample.map { $0 > lastSamplePTS + 4.0 } == true)
 
         if backwardClockJump || forwardClockJump || backwardSampleJump || forwardSampleJump {
             lastClockPTS = validClock ?? -1
             lastSamplePTS = validSample ?? -1
             let resolvedClock = max(0, validClock ?? validSample ?? 0)
+            postSeekKeyframeGraceUntilPTS = resolvedClock + 1.5
             return .resetPipelineAndContinue(
                 activeClockPTS: resolvedClock,
                 shouldSubmitSample: validSample != nil
@@ -513,10 +522,21 @@ struct RemoteClockContinuityGuard: Sendable {
             activeClockPTS = max(0, lastClockPTS)
         }
 
+        if postSeekKeyframeGraceUntilPTS >= 0, activeClockPTS > postSeekKeyframeGraceUntilPTS {
+            postSeekKeyframeGraceUntilPTS = -1
+        }
+
         let shouldSubmit: Bool
-        if let validSample, validSample > lastSamplePTS + 0.002 {
-            lastSamplePTS = validSample
-            shouldSubmit = true
+        if let validSample {
+            if validSample > lastSamplePTS + 0.002 {
+                lastSamplePTS = validSample
+                shouldSubmit = true
+            } else if inPostSeekGrace, validSample < lastSamplePTS - 0.002 {
+                lastSamplePTS = validSample
+                shouldSubmit = true
+            } else {
+                shouldSubmit = false
+            }
         } else {
             shouldSubmit = false
         }
@@ -2291,7 +2311,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         }
         let asset = AVURLAsset(url: playbackURL, options: options)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 10.0
+        item.preferredForwardBufferDuration = 15.0
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -4845,7 +4865,12 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         )
         let wantsHighFPSMetalPassthrough = allowMetalBuffer
             && isInterpolationEnabled
-            && (isDownsampledOpticalFlow || effectiveTargetFPS == .fps60 || effectiveTargetFPS == .fps96 || effectiveTargetFPS == .fps120)
+            && (isDownsampledOpticalFlow
+                || effectiveTargetFPS == .fps60
+                || effectiveTargetFPS == .fps96
+                || effectiveTargetFPS == .fps120
+                || activeBackendLabel.contains("GPU光流")
+                || (effectiveTargetFPS == .x2 && origLong > 1920))
 
         if videoEnhancementPreset != .off || wantsHighFPSMetalPassthrough {
             let enhancer = metalEnhancer

@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.17"
+    static let releaseTag = "0.1.0-beta.18"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.18",
+            date: "2026-11-29",
+            highlights: [
+                "根治「2× 降画质 + 149 帧异常掉帧」：4K/2K 2× 档位全线切换至零降采样原生 GPU 光流 (4.7ms/帧、0 掉帧)，彻底淘汰 `1920×1080` ANE 降采样与 `MetalFX 2560×1440` 二次缩放，同时放宽 1080p 以下 2× ANE Pacer 缓冲裕量至 +55ms",
+                "彻底重构本地代理真流式分块直传 (`LocalHTTPStreamProxy`)：升级边下边传订阅模型 (1MB/块、首包 65KB 后再触发 2 路前瞻预取、Seek 立即剪除窗外僵尸任务、10s 空闲超时快速重试)，消除 `bytes=0-1` 探测阶段拥塞与 -1001 缓冲卡顿",
+                "消除 Seek 后双重时钟重置导致的卡顿：为 `RemoteClockContinuityGuard` 新增 Seek 落地 1.5s 关键帧回退容忍窗口，阻止同位置对齐重复清空光流管线"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.17",
             date: "2026-11-29",

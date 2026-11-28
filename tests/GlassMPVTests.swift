@@ -2648,7 +2648,7 @@ final class GlassMPVTests: XCTestCase {
                 is8BitSDRPixelFormat: true
             )
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
                 sourceWidth: 3840,
                 sourceHeight: 2160,
@@ -2656,7 +2656,19 @@ final class GlassMPVTests: XCTestCase {
                 isHDR: false,
                 isDolbyVision: false,
                 is8BitSDRPixelFormat: true
-            )
+            ),
+            "4K 2× 也应走零降采样原生 GPU 光流，彻底消除 1920×1080 降采样画质损失与 ANE 异常掉帧"
+        )
+        XCTAssertFalse(
+            RemoteOpticalFlowBudgetPlanner.shouldUseHybridFlowWarp(
+                sourceWidth: 1920,
+                sourceHeight: 1080,
+                targetFPS: .x2,
+                isHDR: false,
+                isDolbyVision: false,
+                is8BitSDRPixelFormat: true
+            ),
+            "1080p 及以下 2× 保持原生分辨率 ANE 硬件光流，不降画质"
         )
         XCTAssertEqual(OpticalFlowTargetFPS.fps96.effectiveTargetFPS(sourceFPS: 25.0), 100.0, accuracy: 0.01)
         XCTAssertEqual(OpticalFlowTargetFPS.fps96.maxInterpolatedFramesPerPair(sourceFPS: 25.0), 3)
@@ -4201,5 +4213,152 @@ final class GlassMPVTests: XCTestCase {
         controller.stop()
         XCTAssertNil(controller.onRemoteStreamFailed, "stop() 销毁播放会话时才应释放回调")
         XCTAssertNil(controller.onRemoteVideoTrackUnplayable, "stop() 销毁播放会话时才应释放回调")
+    }
+
+    func testProgressiveChunkStreamingTTFBAndPostSeekKeyframeGrace() async throws {
+        // 1. 验证真流式分块在慢速 1MB 上游响应完成前先吐出首包（且 bytes=0-1 不触发盲目预取）
+        let chunkSize = 1 * 1024 * 1024
+        let totalSize = 3 * chunkSize
+        final class SlowTrickleMockServer: @unchecked Sendable {
+            private let lock = NSLock()
+            private let readySem = DispatchSemaphore(value: 0)
+            private var port: UInt16 = 0
+            private(set) var recordedRanges: [String] = []
+            let queue = DispatchQueue(label: "test.slow.trickle.server")
+
+            func markReady(port: UInt16) {
+                lock.lock()
+                self.port = port
+                lock.unlock()
+                readySem.signal()
+            }
+
+            func waitForPort() -> UInt16 {
+                _ = readySem.wait(timeout: .now() + 2.0)
+                lock.lock()
+                let p = port
+                lock.unlock()
+                return p
+            }
+
+            func recordRange(_ r: String) {
+                lock.lock()
+                recordedRanges.append(r)
+                lock.unlock()
+            }
+
+            func snapshotRanges() -> [String] {
+                lock.lock()
+                let out = recordedRanges
+                lock.unlock()
+                return out
+            }
+        }
+
+        let mock = SlowTrickleMockServer()
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: params)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state, let p = listener.port?.rawValue {
+                mock.markReady(port: p)
+            }
+        }
+        listener.newConnectionHandler = { conn in
+            conn.start(queue: mock.queue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, err in
+                guard err == nil, let data, let reqText = String(data: data, encoding: .utf8),
+                      let parsed = LocalHTTPStreamProxy.parseHTTPRequestHead(reqText) else {
+                    conn.cancel()
+                    return
+                }
+                let rangeStr = parsed.rangeHeader ?? "full"
+                mock.recordRange(rangeStr)
+                guard let br = LocalHTTPStreamProxy.parseByteRangeHeader(rangeStr, totalLength: Int64(totalSize)) else {
+                    conn.cancel()
+                    return
+                }
+                let len = Int(br.end - br.start + 1)
+                let head = Data(
+                    ("HTTP/1.1 206 Partial Content\r\n"
+                        + "Content-Type: video/mp4\r\n"
+                        + "Content-Length: \(len)\r\n"
+                        + "Content-Range: bytes \(br.start)-\(br.end)/\(totalSize)\r\n"
+                        + "Accept-Ranges: bytes\r\n"
+                        + "Connection: close\r\n\r\n").utf8
+                )
+                if br.start == 0 && len > 65_536 {
+                    let firstPart = Data(repeating: 0x33, count: 32_768)
+                    var firstPacket = head
+                    firstPacket.append(firstPart)
+                    conn.send(content: firstPacket, completion: .contentProcessed { _ in
+                        mock.queue.asyncAfter(deadline: .now() + 1.2) {
+                            let rest = Data(repeating: 0x33, count: max(0, len - 32_768))
+                            conn.send(content: rest, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+                                conn.cancel()
+                            })
+                        }
+                    })
+                } else {
+                    var fullPacket = head
+                    fullPacket.append(Data(repeating: 0x44, count: len))
+                    conn.send(content: fullPacket, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+                        conn.cancel()
+                    })
+                }
+            }
+        }
+        listener.start(queue: mock.queue)
+        defer {
+            listener.cancel()
+            LocalHTTPStreamProxy.shared.resetRoutes()
+        }
+
+        let port = mock.waitForPort()
+        XCTAssertGreaterThan(port, 0)
+        let proxyURL = LocalHTTPStreamProxy.shared.registerStream(
+            url: URL(string: "http://127.0.0.1:\(port)/slow_4k.mp4")!,
+            headers: ["Referer": "https://pan.quark.cn/"],
+            isHLS: false
+        )
+
+        var probeReq = URLRequest(url: proxyURL)
+        probeReq.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        let (probeData, probeResp) = try await URLSession.shared.data(for: probeReq)
+        XCTAssertEqual((probeResp as? HTTPURLResponse)?.statusCode, 206)
+        XCTAssertEqual(probeData.count, 2)
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(mock.snapshotRanges(), ["bytes=0-1"], "bytes=0-1 元数据探测阶段严禁盲目预取多路大块")
+
+        let streamStart = CFAbsoluteTimeGetCurrent()
+        var rangeReq = URLRequest(url: proxyURL)
+        rangeReq.setValue("bytes=0-\(2 * chunkSize - 1)", forHTTPHeaderField: "Range")
+        let (byteStream, streamResp) = try await URLSession.shared.bytes(for: rangeReq)
+        XCTAssertEqual((streamResp as? HTTPURLResponse)?.statusCode, 206)
+        var collectedFirstBytes = Data()
+        for try await b in byteStream {
+            collectedFirstBytes.append(b)
+            if collectedFirstBytes.count >= 16_384 {
+                break
+            }
+        }
+        let elapsedTTFB = CFAbsoluteTimeGetCurrent() - streamStart
+        XCTAssertEqual(collectedFirstBytes.count, 16_384)
+        XCTAssertLessThan(elapsedTTFB, 0.80, "1MB 首块仍在缓慢传输(1.2s)时，代理必须先流式吐出首批 16KB 避免卡死")
+
+        // 2. 验证 Seek 落地 1.5s 关键帧宽限窗不重复清空，且真回拖仍正常重置
+        var clockGuard = RemoteClockContinuityGuard()
+        _ = clockGuard.evaluateTick(mediaClock: 5000.0, pulledSamplePTS: 5000.0, isActivelyPlaying: true)
+        clockGuard.beginSeek(targetPTS: 5094.0)
+        let landed = clockGuard.evaluateTick(mediaClock: 5094.03, pulledSamplePTS: 5094.80, isActivelyPlaying: true)
+        XCTAssertEqual(landed, .resetPipelineAndContinue(activeClockPTS: 5094.03, shouldSubmitSample: true))
+
+        let postSeekKeyframe = clockGuard.evaluateTick(mediaClock: 5094.03, pulledSamplePTS: 5094.03, isActivelyPlaying: true)
+        XCTAssertEqual(postSeekKeyframe, .normal(activeClockPTS: 5094.03, shouldSubmitSample: true), "Seek 后音频落地对齐关键帧时不得二次清空光流管线")
+
+        let genuineBackSeek = clockGuard.evaluateTick(mediaClock: 3200.0, pulledSamplePTS: 3200.0, isActivelyPlaying: true)
+        XCTAssertEqual(genuineBackSeek, .resetPipelineAndContinue(activeClockPTS: 3200.0, shouldSubmitSample: true))
     }
 }

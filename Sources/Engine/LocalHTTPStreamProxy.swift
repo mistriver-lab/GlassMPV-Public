@@ -994,7 +994,7 @@ private final class ProxyUpstreamSessionPool: NSObject, URLSessionDataDelegate, 
     private override init() {
         super.init()
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 1800
         config.httpMaximumConnectionsPerHost = 10
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -1273,9 +1273,6 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, CancellablePro
             cache.setKnownContentType(contentType)
             if let parsedTotal, parsedTotal >= 4 * 1024 * 1024 {
                 cache.setKnownTotalLength(parsedTotal)
-                if requestMethod == "GET", rangeHeader == "bytes=0-1" {
-                    cache.prefetchAhead(startingAfter: -1)
-                }
             }
         }
 
@@ -1509,17 +1506,46 @@ private final class UpstreamStreamRelay: ProxySessionTaskHandler, CancellablePro
     }
 }
 
+private final class ChunkStreamSubscriber: @unchecked Sendable {
+    let id: UUID
+    var cursorOffset: Int
+    let maxEndOffset: Int
+    var isFinished: Bool = false
+    let deliveryQueue: DispatchQueue
+    let onData: @Sendable (Data) -> Void
+    let onComplete: @Sendable (Result<Void, Error>) -> Void
+
+    init(
+        id: UUID = UUID(),
+        cursorOffset: Int,
+        maxEndOffset: Int,
+        deliveryQueue: DispatchQueue,
+        onData: @escaping @Sendable (Data) -> Void,
+        onComplete: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        self.id = id
+        self.cursorOffset = cursorOffset
+        self.maxEndOffset = maxEndOffset
+        self.deliveryQueue = deliveryQueue
+        self.onData = onData
+        self.onComplete = onComplete
+    }
+}
+
 private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked Sendable {
     private let headers: [String: String]
     private let rangeHeader: String
     private let expectRangeStart: Int64
+    private let expectedSize: Int
     private let onCookieResponse: @Sendable (HTTPURLResponse) -> Void
     private let onComplete: @Sendable (Result<Data, Error>) -> Void
     private let lock = NSLock()
     private var dataTask: URLSessionDataTask?
     private var buffer = Data()
+    private var subscribers: [ChunkStreamSubscriber] = []
     private var statusCode: Int = 0
     private var didComplete = false
+    private var terminalError: Error?
 
     init(
         headers: [String: String],
@@ -1532,6 +1558,7 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
         self.headers = headers
         self.rangeHeader = rangeHeader
         self.expectRangeStart = expectRangeStart
+        self.expectedSize = max(0, expectedSize)
         self.onCookieResponse = onCookieResponse
         self.onComplete = onComplete
         if expectedSize > 0 {
@@ -1552,6 +1579,63 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
         lock.unlock()
     }
 
+    func attachSubscriber(_ subscriber: ChunkStreamSubscriber) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !subscriber.isFinished else { return }
+        if didComplete {
+            if let terminalError {
+                subscriber.isFinished = true
+                let doneCB = subscriber.onComplete
+                subscriber.deliveryQueue.async {
+                    doneCB(.failure(terminalError))
+                }
+                return
+            }
+            enqueueSliceIfNeededLocked(for: subscriber, upTo: buffer.count)
+            if !subscriber.isFinished {
+                subscriber.isFinished = true
+                let doneCB = subscriber.onComplete
+                subscriber.deliveryQueue.async {
+                    doneCB(.success(()))
+                }
+            }
+            return
+        }
+        enqueueSliceIfNeededLocked(for: subscriber, upTo: buffer.count)
+        if !subscriber.isFinished {
+            subscribers.append(subscriber)
+        }
+    }
+
+    func detachSubscriber(id: UUID) {
+        lock.lock()
+        if let idx = subscribers.firstIndex(where: { $0.id == id }) {
+            subscribers[idx].isFinished = true
+            subscribers.remove(at: idx)
+        }
+        lock.unlock()
+    }
+
+    private func enqueueSliceIfNeededLocked(for subscriber: ChunkStreamSubscriber, upTo availableEnd: Int) {
+        let targetEnd = min(availableEnd, subscriber.maxEndOffset)
+        if targetEnd > subscriber.cursorOffset {
+            let slice = buffer.subdata(in: subscriber.cursorOffset..<targetEnd)
+            subscriber.cursorOffset = targetEnd
+            let dataCB = subscriber.onData
+            subscriber.deliveryQueue.async {
+                dataCB(slice)
+            }
+        }
+        if subscriber.cursorOffset >= subscriber.maxEndOffset && !subscriber.isFinished {
+            subscriber.isFinished = true
+            let doneCB = subscriber.onComplete
+            subscriber.deliveryQueue.async {
+                doneCB(.success(()))
+            }
+        }
+    }
+
     func cancel() {
         lock.lock()
         guard !didComplete else {
@@ -1559,15 +1643,18 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
             return
         }
         didComplete = true
+        let cancelErr = URLError(.cancelled)
+        terminalError = cancelErr
         let task = dataTask
         dataTask = nil
+        subscribers.removeAll()
         buffer.removeAll(keepingCapacity: false)
         lock.unlock()
         if let task {
             ProxyUpstreamSessionPool.shared.removeTask(withIdentifier: task.taskIdentifier)
             task.cancel()
         }
-        onComplete(.failure(URLError(.cancelled)))
+        onComplete(.failure(cancelErr))
     }
 
     func handleRedirect(
@@ -1620,6 +1707,21 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
             return
         }
         buffer.append(data)
+        let currentLen = buffer.count
+        var i = 0
+        while i < subscribers.count {
+            let sub = subscribers[i]
+            if sub.isFinished {
+                subscribers.remove(at: i)
+                continue
+            }
+            enqueueSliceIfNeededLocked(for: sub, upTo: currentLen)
+            if sub.isFinished {
+                subscribers.remove(at: i)
+            } else {
+                i += 1
+            }
+        }
         lock.unlock()
     }
 
@@ -1636,6 +1738,10 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
             finish(with: .failure(URLError(.badServerResponse)))
             return
         }
+        if expectedSize > 0 && out.count < expectedSize {
+            finish(with: .failure(URLError(.networkConnectionLost)))
+            return
+        }
         finish(with: .success(out))
     }
 
@@ -1647,7 +1753,22 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
         }
         didComplete = true
         dataTask = nil
-        if case .failure = result {
+        let activeSubs = subscribers
+        subscribers.removeAll()
+        switch result {
+        case .success(let out):
+            for sub in activeSubs where !sub.isFinished {
+                enqueueSliceIfNeededLocked(for: sub, upTo: out.count)
+                if !sub.isFinished {
+                    sub.isFinished = true
+                    let doneCB = sub.onComplete
+                    sub.deliveryQueue.async {
+                        doneCB(.success(()))
+                    }
+                }
+            }
+        case .failure(let err):
+            terminalError = err
             buffer.removeAll(keepingCapacity: false)
         }
         lock.unlock()
@@ -1656,9 +1777,9 @@ private final class UpstreamChunkFetchTask: ProxySessionTaskHandler, @unchecked 
 }
 
 private final class ProxyRouteChunkCache: @unchecked Sendable {
-    static let chunkSize: Int = 2 * 1024 * 1024
+    static let chunkSize: Int = 1 * 1024 * 1024
     static let maxCachedChunks: Int = 10
-    static let prefetchAheadCount: Int = 5
+    static let prefetchAheadCount: Int = 2
 
     private let upstreamURL: URL
     private let onCookieResponse: @Sendable (HTTPURLResponse) -> Void
@@ -1670,6 +1791,8 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
     private var chunks: [Int: Data] = [:]
     private var lruOrder: [Int] = []
     private var inFlightWaiters: [Int: [@Sendable (Result<Data, Error>) -> Void]] = [:]
+    private var inFlightSubscribers: [Int: [ChunkStreamSubscriber]] = [:]
+    private var prefetchOnlyIndices: Set<Int> = []
     private var activeTasks: [Int: UpstreamChunkFetchTask] = [:]
     private var isInvalidated = false
 
@@ -1719,6 +1842,13 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         lock.unlock()
     }
 
+    func hasCachedChunk(_ index: Int) -> Bool {
+        lock.lock()
+        let hit = (chunks[index] != nil)
+        lock.unlock()
+        return hit
+    }
+
     func invalidate() {
         lock.lock()
         isInvalidated = true
@@ -1726,6 +1856,9 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         activeTasks.removeAll()
         let pendingGroups = Array(inFlightWaiters.values)
         inFlightWaiters.removeAll()
+        let pendingSubGroups = Array(inFlightSubscribers.values)
+        inFlightSubscribers.removeAll()
+        prefetchOnlyIndices.removeAll()
         chunks.removeAll()
         lruOrder.removeAll()
         lock.unlock()
@@ -1739,6 +1872,36 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
                 waiter(.failure(err))
             }
         }
+        for group in pendingSubGroups {
+            for sub in group where !sub.isFinished {
+                sub.isFinished = true
+                let doneCB = sub.onComplete
+                sub.deliveryQueue.async {
+                    doneCB(.failure(err))
+                }
+            }
+        }
+    }
+
+    func pruneOutOfWindowTasks(around centerChunk: Int) {
+        let minKeep = centerChunk - 1
+        let maxKeep = centerChunk + Self.prefetchAheadCount + 1
+        lock.lock()
+        var staleTasks: [UpstreamChunkFetchTask] = []
+        for idx in prefetchOnlyIndices where idx < minKeep || idx > maxKeep {
+            let hasWaiters = !(inFlightWaiters[idx]?.isEmpty ?? true)
+            let hasSubs = !(inFlightSubscribers[idx]?.isEmpty ?? true)
+            if !hasWaiters && !hasSubs {
+                prefetchOnlyIndices.remove(idx)
+                if let task = activeTasks.removeValue(forKey: idx) {
+                    staleTasks.append(task)
+                }
+            }
+        }
+        lock.unlock()
+        for task in staleTasks {
+            task.cancel()
+        }
     }
 
     func prefetchAhead(startingAfter chunkIndex: Int) {
@@ -1747,19 +1910,117 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
             lock.unlock()
             return
         }
-        var toFetch: [Int] = []
+        var toFetch: [(index: Int, total: Int64)] = []
         for offset in 1...Self.prefetchAheadCount {
             let idx = chunkIndex + offset
             guard idx >= 0, Int64(idx) * Int64(Self.chunkSize) < totalLen else { break }
-            if chunks[idx] == nil && inFlightWaiters[idx] == nil {
-                toFetch.append(idx)
+            let alreadyDownloading = (activeTasks[idx] != nil || inFlightWaiters[idx] != nil || !(inFlightSubscribers[idx]?.isEmpty ?? true))
+            if chunks[idx] == nil && !alreadyDownloading {
+                prefetchOnlyIndices.insert(idx)
+                toFetch.append((idx, totalLen))
             }
         }
         lock.unlock()
 
-        for idx in toFetch {
-            fetchChunk(index: idx) { _ in }
+        for item in toFetch {
+            launchFetchTask(chunkIndex: item.index, totalLength: item.total, attempt: 0)
         }
+    }
+
+    func streamChunk(
+        index chunkIndex: Int,
+        offsetInChunk: Int,
+        maxBytes: Int,
+        subscriberID: UUID = UUID(),
+        deliveryQueue: DispatchQueue,
+        onData: @escaping @Sendable (Data) -> Void,
+        onComplete: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) -> UUID {
+        let sub = ChunkStreamSubscriber(
+            id: subscriberID,
+            cursorOffset: offsetInChunk,
+            maxEndOffset: offsetInChunk + maxBytes,
+            deliveryQueue: deliveryQueue,
+            onData: onData,
+            onComplete: onComplete
+        )
+
+        lock.lock()
+        if isInvalidated {
+            lock.unlock()
+            sub.isFinished = true
+            deliveryQueue.async {
+                onComplete(.failure(URLError(.cancelled)))
+            }
+            return sub.id
+        }
+        if let cached = chunks[chunkIndex] {
+            if chunkIndex != 0 {
+                lruOrder.removeAll { $0 == chunkIndex }
+                lruOrder.append(chunkIndex)
+            }
+            lock.unlock()
+            let clampedStart = max(0, min(cached.count, offsetInChunk))
+            let clampedEnd = max(clampedStart, min(cached.count, offsetInChunk + maxBytes))
+            let slice = (clampedEnd > clampedStart) ? cached.subdata(in: clampedStart..<clampedEnd) : Data()
+            sub.isFinished = true
+            deliveryQueue.async {
+                if !slice.isEmpty {
+                    onData(slice)
+                }
+                onComplete(.success(()))
+            }
+            return sub.id
+        }
+        guard let totalLen = knownTotalLengthStorage else {
+            lock.unlock()
+            sub.isFinished = true
+            deliveryQueue.async {
+                onComplete(.failure(URLError(.resourceUnavailable)))
+            }
+            return sub.id
+        }
+        let chunkStart = Int64(chunkIndex) * Int64(Self.chunkSize)
+        guard chunkIndex >= 0, chunkStart < totalLen else {
+            lock.unlock()
+            sub.isFinished = true
+            deliveryQueue.async {
+                onComplete(.failure(URLError(.dataLengthExceedsMaximum)))
+            }
+            return sub.id
+        }
+
+        prefetchOnlyIndices.remove(chunkIndex)
+        inFlightSubscribers[chunkIndex, default: []].append(sub)
+        if let existingTask = activeTasks[chunkIndex] {
+            lock.unlock()
+            existingTask.attachSubscriber(sub)
+            return sub.id
+        }
+        lock.unlock()
+
+        if let startedTask = launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLen, attempt: 0) {
+            startedTask.attachSubscriber(sub)
+        }
+        return sub.id
+    }
+
+    func cancelSubscriber(chunkIndex: Int, id: UUID) {
+        lock.lock()
+        if var list = inFlightSubscribers[chunkIndex] {
+            if let idx = list.firstIndex(where: { $0.id == id }) {
+                list[idx].isFinished = true
+                list.remove(at: idx)
+            }
+            if list.isEmpty {
+                inFlightSubscribers.removeValue(forKey: chunkIndex)
+            } else {
+                inFlightSubscribers[chunkIndex] = list
+            }
+        }
+        let task = activeTasks[chunkIndex]
+        lock.unlock()
+        task?.detachSubscriber(id: id)
     }
 
     func fetchChunk(
@@ -1781,6 +2042,7 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
             completion(.success(cached))
             return
         }
+        prefetchOnlyIndices.remove(chunkIndex)
         if var waiters = inFlightWaiters[chunkIndex] {
             waiters.append(completion)
             inFlightWaiters[chunkIndex] = waiters
@@ -1799,12 +2061,16 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
             return
         }
         inFlightWaiters[chunkIndex] = [completion]
+        let hasActiveTask = (activeTasks[chunkIndex] != nil)
         lock.unlock()
 
-        launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLen, attempt: 0)
+        if !hasActiveTask {
+            _ = launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLen, attempt: 0)
+        }
     }
 
-    private func launchFetchTask(chunkIndex: Int, totalLength: Int64, attempt: Int) {
+    @discardableResult
+    private func launchFetchTask(chunkIndex: Int, totalLength: Int64, attempt: Int) -> UpstreamChunkFetchTask? {
         let chunkStart = Int64(chunkIndex) * Int64(Self.chunkSize)
         let chunkEnd = min(totalLength - 1, chunkStart + Int64(Self.chunkSize) - 1)
         let expectedBytes = Int(chunkEnd - chunkStart + 1)
@@ -1813,17 +2079,26 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         lock.lock()
         guard !isInvalidated else {
             let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            let subs = inFlightSubscribers.removeValue(forKey: chunkIndex) ?? []
+            prefetchOnlyIndices.remove(chunkIndex)
             activeTasks.removeValue(forKey: chunkIndex)
             lock.unlock()
             for waiter in waiters {
                 waiter(.failure(URLError(.cancelled)))
             }
-            return
+            for sub in subs where !sub.isFinished {
+                sub.isFinished = true
+                let doneCB = sub.onComplete
+                sub.deliveryQueue.async {
+                    doneCB(.failure(URLError(.cancelled)))
+                }
+            }
+            return nil
         }
         let currentHeaders = headers
         lock.unlock()
 
-        var req = URLRequest(url: upstreamURL, timeoutInterval: 20)
+        var req = URLRequest(url: upstreamURL, timeoutInterval: 10)
         req.httpMethod = "GET"
         for (k, v) in currentHeaders {
             req.setValue(v, forHTTPHeaderField: k)
@@ -1842,16 +2117,26 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         lock.lock()
         guard !isInvalidated else {
             let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            let subs = inFlightSubscribers.removeValue(forKey: chunkIndex) ?? []
+            prefetchOnlyIndices.remove(chunkIndex)
             activeTasks.removeValue(forKey: chunkIndex)
             lock.unlock()
             for waiter in waiters {
                 waiter(.failure(URLError(.cancelled)))
             }
-            return
+            for sub in subs where !sub.isFinished {
+                sub.isFinished = true
+                let doneCB = sub.onComplete
+                sub.deliveryQueue.async {
+                    doneCB(.failure(URLError(.cancelled)))
+                }
+            }
+            return nil
         }
         activeTasks[chunkIndex] = fetchTask
         lock.unlock()
         fetchTask.start(with: req)
+        return fetchTask
     }
 
     private func handleFetchFinished(
@@ -1864,7 +2149,9 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
         case .success(let data):
             lock.lock()
             let invalidated = isInvalidated
+            prefetchOnlyIndices.remove(chunkIndex)
             let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+            inFlightSubscribers.removeValue(forKey: chunkIndex)
             activeTasks.removeValue(forKey: chunkIndex)
             if !invalidated {
                 chunks[chunkIndex] = data
@@ -1887,21 +2174,39 @@ private final class ProxyRouteChunkCache: @unchecked Sendable {
             let nsErr = error as NSError
             let isCancelled = (nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled)
             lock.lock()
-            let canRetry = !isInvalidated && !isCancelled && attempt == 0 && inFlightWaiters[chunkIndex] != nil
+            let hasActiveSubs = !(inFlightSubscribers[chunkIndex]?.filter { !$0.isFinished }.isEmpty ?? true)
+            let hasActiveWaiters = (inFlightWaiters[chunkIndex] != nil)
+            let canRetry = !isInvalidated && !isCancelled && attempt == 0 && (hasActiveSubs || hasActiveWaiters)
             if !canRetry {
+                prefetchOnlyIndices.remove(chunkIndex)
                 let waiters = inFlightWaiters.removeValue(forKey: chunkIndex) ?? []
+                let subs = inFlightSubscribers.removeValue(forKey: chunkIndex) ?? []
                 activeTasks.removeValue(forKey: chunkIndex)
                 lock.unlock()
-                if !isCancelled {
+                if !isCancelled && (hasActiveSubs || hasActiveWaiters) {
                     onLog(true, "[proxy][error] 并发分块 #\(chunkIndex) 失败: \(error.localizedDescription)")
                 }
                 for waiter in waiters {
                     waiter(.failure(error))
                 }
+                for sub in subs where !sub.isFinished {
+                    sub.isFinished = true
+                    let doneCB = sub.onComplete
+                    sub.deliveryQueue.async {
+                        doneCB(.failure(error))
+                    }
+                }
                 return
             }
+            let survivingSubs = (inFlightSubscribers[chunkIndex] ?? []).filter { !$0.isFinished }
+            inFlightSubscribers[chunkIndex] = survivingSubs.isEmpty ? nil : survivingSubs
             lock.unlock()
-            launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLength, attempt: 1)
+            onLog(true, "[proxy][retry] 并发分块 #\(chunkIndex) 自动重试: \(error.localizedDescription)")
+            if let retryTask = launchFetchTask(chunkIndex: chunkIndex, totalLength: totalLength, attempt: 1) {
+                for sub in survivingSubs where !sub.isFinished {
+                    retryTask.attachSubscriber(sub)
+                }
+            }
         }
     }
 }
@@ -1916,10 +2221,19 @@ private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecke
     private let upstreamHost: String
     private let enableMP4HEV1Patch: Bool
     private let onLog: @Sendable (Bool, String) -> Void
+    private let sendQueue = DispatchQueue(label: "com.glassmpv.localproxy.relay.send", qos: .userInitiated)
     private let lock = NSLock()
     private var isCancelled = false
     private var selfRetain: ParallelChunkedStreamRelay?
+    private var activeSubscription: (chunkIndex: Int, id: UUID)?
+
+    // 仅允许在 serial `sendQueue` 访问以下传输状态
     private var mp4Patcher: MP4HEV1StreamPatcher
+    private var bytesDeliveredInRelay: Int64 = 0
+    private var didPrefetchChunkIndex: Int = -1
+    private var currentChunkBytesReceived: Int = 0
+    private var inFlightSendBytes: Int = 0
+    private var pendingResumeCursor: Int64?
 
     init(
         connection: NWConnection,
@@ -1982,7 +2296,9 @@ private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecke
                 self.connection.cancel()
                 return
             }
-            self.sendNextChunk(at: self.rangeStart)
+            self.sendQueue.async {
+                self.sendNextChunk(at: self.rangeStart)
+            }
         })
     }
 
@@ -1990,7 +2306,12 @@ private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecke
         lock.lock()
         isCancelled = true
         selfRetain = nil
+        let subToCancel = activeSubscription
+        activeSubscription = nil
         lock.unlock()
+        if let subToCancel {
+            chunkCache.cancelSubscriber(chunkIndex: subToCancel.chunkIndex, id: subToCancel.id)
+        }
     }
 
     func cancelRelay() {
@@ -2005,14 +2326,19 @@ private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecke
         return cancelled
     }
 
+    private func clearActiveSubscription(chunkIndex: Int, id: UUID) {
+        lock.lock()
+        if let active = activeSubscription, active.chunkIndex == chunkIndex, active.id == id {
+            activeSubscription = nil
+        }
+        lock.unlock()
+    }
+
     private func sendNextChunk(at cursor: Int64) {
         guard !readCancelled() else { return }
 
         if cursor > rangeEnd {
-            let trailing: Data
-            lock.lock()
-            trailing = enableMP4HEV1Patch ? mp4Patcher.flush() : Data()
-            lock.unlock()
+            let trailing = enableMP4HEV1Patch ? mp4Patcher.flush() : Data()
             if !trailing.isEmpty {
                 connection.send(content: trailing, completion: .contentProcessed { [weak self] sendError in
                     guard let self else { return }
@@ -2032,56 +2358,92 @@ private final class ParallelChunkedStreamRelay: CancellableProxyRelay, @unchecke
         let chunkSize64 = Int64(ProxyRouteChunkCache.chunkSize)
         let chunkIdx = Int(cursor / chunkSize64)
         let chunkStart = Int64(chunkIdx) * chunkSize64
-        chunkCache.prefetchAhead(startingAfter: chunkIdx)
+        let sliceStart = Int(cursor - chunkStart)
+        let wantedBytes = Int(min(rangeEnd - cursor + 1, chunkSize64 - Int64(sliceStart)))
+        guard sliceStart >= 0, wantedBytes > 0 else {
+            finishConnection()
+            return
+        }
 
-        chunkCache.fetchChunk(index: chunkIdx) { [weak self] result in
-            guard let self, !self.readCancelled() else { return }
-            switch result {
-            case .failure(let error):
-                let nsErr = error as NSError
-                if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
-                    self.onLog(true, "[proxy][error] 并发分块直传终止 (#\(chunkIdx)): \(error.localizedDescription)")
-                }
-                self.markCancelledAndRelease()
-                self.connection.cancel()
+        currentChunkBytesReceived = 0
+        chunkCache.pruneOutOfWindowTasks(around: chunkIdx)
+        if bytesDeliveredInRelay >= 65_536 || chunkCache.hasCachedChunk(chunkIdx) {
+            didPrefetchChunkIndex = chunkIdx
+            chunkCache.prefetchAhead(startingAfter: chunkIdx)
+        }
 
-            case .success(let chunkData):
-                let sliceStart = Int(cursor - chunkStart)
-                let availableEndOffset = chunkStart + Int64(chunkData.count) - 1
-                let targetEnd = min(self.rangeEnd, availableEndOffset)
-                let sliceEnd = Int(targetEnd - chunkStart) + 1
-                guard sliceStart >= 0, sliceEnd > sliceStart, sliceEnd <= chunkData.count else {
-                    self.markCancelledAndRelease()
-                    self.connection.cancel()
-                    return
+        let issuedSubID = UUID()
+        _ = chunkCache.streamChunk(
+            index: chunkIdx,
+            offsetInChunk: sliceStart,
+            maxBytes: wantedBytes,
+            subscriberID: issuedSubID,
+            deliveryQueue: sendQueue,
+            onData: { [weak self] slice in
+                guard let self, !self.readCancelled(), !slice.isEmpty else { return }
+                self.currentChunkBytesReceived += slice.count
+                self.bytesDeliveredInRelay += Int64(slice.count)
+                if self.didPrefetchChunkIndex != chunkIdx && self.bytesDeliveredInRelay >= 65_536 {
+                    self.didPrefetchChunkIndex = chunkIdx
+                    self.chunkCache.prefetchAhead(startingAfter: chunkIdx)
                 }
-                let rawSlice: Data = (sliceStart == 0 && sliceEnd == chunkData.count)
-                    ? chunkData
-                    : chunkData.subdata(in: sliceStart..<sliceEnd)
-                let outgoing: Data
-                self.lock.lock()
-                if self.enableMP4HEV1Patch {
-                    outgoing = self.mp4Patcher.processChunk(rawSlice)
-                } else {
-                    outgoing = rawSlice
-                }
-                self.lock.unlock()
 
-                let nextCursor = targetEnd + 1
-                if outgoing.isEmpty {
-                    self.sendNextChunk(at: nextCursor)
-                } else {
-                    self.connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
-                        guard let self else { return }
+                let outgoing = self.enableMP4HEV1Patch ? self.mp4Patcher.processChunk(slice) : slice
+                guard !outgoing.isEmpty else { return }
+                let outCount = outgoing.count
+                self.inFlightSendBytes += outCount
+                self.connection.send(content: outgoing, completion: .contentProcessed { [weak self] sendError in
+                    guard let self else { return }
+                    self.sendQueue.async {
+                        guard !self.readCancelled() else { return }
                         if sendError != nil {
-                            self.markCancelledAndRelease()
-                            self.connection.cancel()
+                            self.cancelRelay()
                             return
                         }
+                        self.inFlightSendBytes = max(0, self.inFlightSendBytes - outCount)
+                        if let resumeCursor = self.pendingResumeCursor, self.inFlightSendBytes <= 1 * 1024 * 1024 {
+                            self.pendingResumeCursor = nil
+                            self.sendNextChunk(at: resumeCursor)
+                        }
+                    }
+                })
+            },
+            onComplete: { [weak self] result in
+                guard let self, !self.readCancelled() else { return }
+                self.clearActiveSubscription(chunkIndex: chunkIdx, id: issuedSubID)
+                switch result {
+                case .failure(let error):
+                    let nsErr = error as NSError
+                    if !(nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled) {
+                        self.onLog(true, "[proxy][error] 并发分块直传终止 (#\(chunkIdx)): \(error.localizedDescription)")
+                    }
+                    self.cancelRelay()
+
+                case .success:
+                    let received = self.currentChunkBytesReceived
+                    guard received >= wantedBytes else {
+                        self.onLog(true, "[proxy][warn] 并发分块直传提前结束 (#\(chunkIdx)): received=\(received)/\(wantedBytes)")
+                        self.cancelRelay()
+                        return
+                    }
+                    let nextCursor = cursor + Int64(received)
+                    if self.inFlightSendBytes > 1 * 1024 * 1024 {
+                        self.pendingResumeCursor = nextCursor
+                    } else {
                         self.sendNextChunk(at: nextCursor)
-                    })
+                    }
                 }
             }
+        )
+
+        lock.lock()
+        let cancelledNow = isCancelled
+        if !cancelledNow {
+            activeSubscription = (chunkIndex: chunkIdx, id: issuedSubID)
+        }
+        lock.unlock()
+        if cancelledNow {
+            chunkCache.cancelSubscriber(chunkIndex: chunkIdx, id: issuedSubID)
         }
     }
 

@@ -254,6 +254,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "highWaterBytes" in local_proxy_src
     assert "ProxyRouteChunkCache" in local_proxy_src
     assert "ParallelChunkedStreamRelay" in local_proxy_src
+    assert "streamChunk" in local_proxy_src
+    assert "pruneOutOfWindowTasks" in local_proxy_src
     assert "parseContentRangeTotalLength" in local_proxy_src
     assert "cancelActiveChunkCaches" in local_proxy_src
     assert "hlsManifestRewriter" in local_proxy_src
@@ -490,6 +492,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testMetalPyramidMidpointSplattingZeroGhostAcross120FPSPhases" in swift_test_src
     assert "testMemoryGuardsDrawableCapAndHLSSegment400RetryURL" in swift_test_src
     assert "testHDR10EightBitMetalPathAndLoadPreservesFallbackCallbacks" in swift_test_src
+    assert "testProgressiveChunkStreamingTTFBAndPostSeekKeyframeGrace" in swift_test_src
 
     enhancer_src = (ROOT / "Sources" / "Engine" / "MetalVideoEnhancer.swift").read_text(encoding="utf-8")
     assert "isPQTransferBuffer" in enhancer_src
@@ -498,6 +501,7 @@ def test_swift_sources_non_empty_and_balanced():
     assert "onRemoteStreamFailed" in engine_src
     assert "canUseMetalDirectPath" in engine_src
     assert "preservingCallbacks" in engine_src
+    assert "postSeekKeyframeGraceUntilPTS" in engine_src
     assert "recommendedFlowWarpMetalMaxLongSide" in engine_src
     assert "setRemoteInterpolationEnabled" in engine_src
     assert "preferredForwardBufferDuration" in engine_src

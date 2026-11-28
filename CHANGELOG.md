@@ -2,6 +2,18 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.18] - 2026-11-29
+
+### 原画光流统一、真流式代理与零掉帧重构 (Zero-Downsample 2× & Streaming Proxy)
+- **根治「4K 2× 降画质 + 异常掉帧 149 帧」(`RemoteStreamOpticalFlowWorker` + `VTOpticalFlowEngine`)**：
+  - 根因定位自真机日志 `GlassMPV-Log-20261129-022714.txt`：此前 `2×` 强制关闭混合 GPU 光流，导致 4K 片源退化为 `3840×2160 → 1920×1080` ANE 降采样（平均 `30.0ms` 耗时）+ `MetalFX 2560×1440` 缩放并伴随 149 帧迟到丢帧，而同片源切至 `60/96fps` GPU 原画直采平均耗时仅 `4.7–5.6ms` 且零掉帧。
+  - 修复：`shouldUseHybridFlowWarp` 对 `>1920px` 片源在 `2×` 档位全线启用零降采样原生 GPU 光流，并将 `2×` 加入高刷直绘层保持列表消除原帧/插帧图层切换；同时为 `≤1920px` 片源的 2× ANE 放宽 `recommendedPacerLagSeconds` 安全裕量。
+- **彻底解决大电影 `HTTP 206` 缓冲卡顿与 `-1001` 超时 (`LocalHTTPStreamProxy`)**：
+  - 将 `ProxyRouteChunkCache` + `ParallelChunkedStreamRelay` 从「整块拉完再吐」升级为**真边下边传订阅模型 (`streamChunk` + `ChunkStreamSubscriber`)**（1MB/块、10s 请求空闲超时快速重试），并移除 `bytes=0-1` 探测时盲目触发的多路下载。
+  - 新增反饥饿门控（首块吐出 65KB 后再开启 2 路前瞻预取）、`pruneOutOfWindowTasks` 自动剪除 Seek 遗留的窗外僵尸预取连接，并将 `AVPlayerItem.preferredForwardBufferDuration` 适度上调至 `15s`。
+- **消除 Seek 后双重重置卡顿 (`RemoteClockContinuityGuard`)**：
+  - 新增 1.5s `postSeekKeyframeGraceUntilPTS` 关键帧落地宽限窗口，避免音频同步到关键帧期间因 `samplePTS` 微幅前调而触发第二次整管线清空。
+
 ## [v0.1.0-beta.17] - 2026-11-29
 
 ### 算法升级与内存专项治理 (Algorithm Upgrade & Memory Fixes)

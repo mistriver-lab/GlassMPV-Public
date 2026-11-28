@@ -321,10 +321,11 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
         guard !isHDR, !isDolbyVision, is8BitSDRPixelFormat else {
             return false
         }
-        guard targetFPS != .x2 else {
-            return false
+        let longSide = max(sourceWidth, sourceHeight)
+        if targetFPS == .x2 {
+            return longSide > 1920
         }
-        return max(sourceWidth, sourceHeight) >= 1280
+        return longSide >= 1280
     }
 
     static func flowResolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
@@ -416,6 +417,9 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
             ? averageInterpolationMs
             : defaultInferMs
         let inferSec = max(0.015, min(0.095, rawInferMs / 1000.0))
+        if targetFPS == .x2 {
+            return min(0.210, max(0.110, frameInterval + inferSec + 0.055))
+        }
         return min(0.195, max(0.095, frameInterval + inferSec + 0.040))
     }
 
