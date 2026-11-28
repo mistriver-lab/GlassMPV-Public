@@ -477,6 +477,11 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    static func evaluateSceneCut(rawSAD: Float, warpedSAD: Float) -> Bool {
+        guard rawSAD.isFinite, warpedSAD.isFinite else { return false }
+        return rawSAD > 0.22 && warpedSAD > 0.16 && warpedSAD > rawSAD * 0.78
+    }
+
     func estimateFlow(prevBuffer: CVPixelBuffer, currBuffer: CVPixelBuffer) async -> MetalOpticalFlowResult? {
         guard let encoded = encodeFlowCommandBuffer(prevBuffer: prevBuffer, currBuffer: currBuffer) else {
             return nil
@@ -495,7 +500,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                 let statsPtr = statsBuffer.contents().assumingMemoryBound(to: Float.self)
                 let rawSAD = statsPtr[0]
                 let warpedSAD = statsPtr[1]
-                let isCut = rawSAD.isFinite && warpedSAD.isFinite && rawSAD > 0.16 && warpedSAD > 0.12
+                let isCut = Self.evaluateSceneCut(rawSAD: rawSAD, warpedSAD: warpedSAD)
                 continuation.resume(
                     returning: MetalOpticalFlowResult(
                         forwardFlow: SendableMetalTexture(texture: fwdTex),
@@ -735,7 +740,7 @@ final class MetalPyramidOpticalFlowEngine: @unchecked Sendable {
                 height: UInt32(l0Out.height),
                 coarseWidth: UInt32(l0Out.width),
                 coarseHeight: UInt32(l0Out.height),
-                searchRadius: 3,
+                searchRadius: 4,
                 levelIndex: 0,
                 outputNormalizedUV: 0,
                 patchStep: 1.0

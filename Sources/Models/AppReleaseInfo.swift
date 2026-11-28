@@ -9,7 +9,7 @@ struct ReleaseNoteEntry: Identifiable, Sendable {
 }
 
 enum AppReleaseInfo {
-    static let releaseTag = "0.1.0-beta.15"
+    static let releaseTag = "0.1.0-beta.16"
 
     static var shortVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
@@ -24,6 +24,15 @@ enum AppReleaseInfo {
     }
 
     static let changelog: [ReleaseNoteEntry] = [
+        ReleaseNoteEntry(
+            version: "v0.1.0-beta.16",
+            date: "2026-11-29",
+            highlights: [
+                "大幅提速 4K 原生光流呈现并稳住快速运动场景：精简 displayFlowWarpYUVFragment 无条件梯度全扫与惰性 UV 采样（将平滑/高速横移像素采样从 39 次压降至 5–10 次），同时将金字塔 L0 搜索半径扩至 ±4（覆盖 ±480px@4K）并收紧 isSceneCut 防快速横移误触发",
+                "根治「向后拖动进度条后补帧长期失效跌回 25fps」：新增 RemoteClockContinuityGuard 隔离异步 seek 落地前的陈旧 pre-seek 时钟，并在任何向后/跨段时钟跳变时立即清空队列、重置 Pacer 与重开光流批次",
+                "全面优化播放器视频信息 HUD 与标签透明度：明确区分「原画直采 (256×144仅计算矢量网格, 原画直采样4K YUV)」与 2× 档「降采样→MetalFX」，新增实时光流耗时/渲染耗时/队列深度/内存占用，并在网络缓冲停滞时自动将冻结 FPS 切换为「缓冲中」"
+            ]
+        ),
         ReleaseNoteEntry(
             version: "v0.1.0-beta.15",
             date: "2026-11-29",

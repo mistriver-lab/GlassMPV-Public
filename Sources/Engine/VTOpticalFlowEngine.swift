@@ -407,6 +407,102 @@ struct RemoteDisplayCadenceGuard: Sendable {
     }
 }
 
+/// 远端流时钟与 Seek 连续性守卫：隔离异步 AVPlayer.seek 完成前的陈旧 pre-seek 时钟，并在任何向后/跨段跳变时立即重置光流管线
+struct RemoteClockContinuityGuard: Sendable {
+    enum TickDecision: Equatable, Sendable {
+        case ignorePendingSeek
+        case normal(activeClockPTS: Double, shouldSubmitSample: Bool)
+        case resetPipelineAndContinue(activeClockPTS: Double, shouldSubmitSample: Bool)
+    }
+
+    private(set) var isSeekPending: Bool = false
+    private(set) var seekTargetPTS: Double = -1
+    private(set) var lastSamplePTS: Double = -1
+    private(set) var lastClockPTS: Double = -1
+
+    mutating func reset() {
+        isSeekPending = false
+        seekTargetPTS = -1
+        lastSamplePTS = -1
+        lastClockPTS = -1
+    }
+
+    mutating func beginSeek(targetPTS: Double) {
+        isSeekPending = true
+        seekTargetPTS = targetPTS.isFinite ? max(0, targetPTS) : 0
+        lastSamplePTS = -1
+        lastClockPTS = -1
+    }
+
+    mutating func completeSeek() {
+        isSeekPending = false
+        lastSamplePTS = -1
+        lastClockPTS = -1
+    }
+
+    mutating func evaluateTick(
+        mediaClock: Double,
+        pulledSamplePTS: Double?,
+        isActivelyPlaying: Bool
+    ) -> TickDecision {
+        let validClock = mediaClock.isFinite ? mediaClock : nil
+        let validSample = (pulledSamplePTS?.isFinite == true) ? pulledSamplePTS : nil
+
+        if isSeekPending {
+            let clockNearTarget = validClock.map { abs($0 - seekTargetPTS) <= 2.5 } ?? false
+            let sampleNearTarget = validSample.map { abs($0 - seekTargetPTS) <= 2.5 } ?? false
+            if clockNearTarget || sampleNearTarget {
+                isSeekPending = false
+                if let c = validClock {
+                    lastClockPTS = c
+                }
+                if let s = validSample {
+                    lastSamplePTS = s
+                }
+                return .resetPipelineAndContinue(
+                    activeClockPTS: max(0, validClock ?? seekTargetPTS),
+                    shouldSubmitSample: validSample != nil
+                )
+            }
+            return .ignorePendingSeek
+        }
+
+        let backwardClockJump = (lastClockPTS >= 0 && validClock.map { $0 < lastClockPTS - 0.50 } == true)
+        let forwardClockJump = (lastClockPTS >= 0 && validClock.map { $0 > lastClockPTS + 4.0 } == true)
+        let backwardSampleJump = (lastSamplePTS >= 0 && validSample.map { $0 < lastSamplePTS - 0.50 } == true)
+        let forwardSampleJump = (lastSamplePTS >= 0 && validSample.map { $0 > lastSamplePTS + 4.0 } == true)
+
+        if backwardClockJump || forwardClockJump || backwardSampleJump || forwardSampleJump {
+            lastClockPTS = validClock ?? -1
+            lastSamplePTS = validSample ?? -1
+            let resolvedClock = max(0, validClock ?? validSample ?? 0)
+            return .resetPipelineAndContinue(
+                activeClockPTS: resolvedClock,
+                shouldSubmitSample: validSample != nil
+            )
+        }
+
+        let activeClockPTS: Double
+        if !isActivelyPlaying && validSample == nil && lastClockPTS >= 0 {
+            activeClockPTS = lastClockPTS
+        } else if let validClock {
+            lastClockPTS = max(lastClockPTS, validClock)
+            activeClockPTS = lastClockPTS
+        } else {
+            activeClockPTS = max(0, lastClockPTS)
+        }
+
+        let shouldSubmit: Bool
+        if let validSample, validSample > lastSamplePTS + 0.002 {
+            lastSamplePTS = validSample
+            shouldSubmit = true
+        } else {
+            shouldSubmit = false
+        }
+        return .normal(activeClockPTS: max(0, activeClockPTS), shouldSubmitSample: shouldSubmit)
+    }
+}
+
 struct OpticalFlowSendableFrame: @unchecked Sendable {
     let pts: CMTime
     let buffer: CVPixelBuffer
@@ -1799,6 +1895,9 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @Published @MainActor var qualityCompareMode: VideoEnhancementCompareMode = .off
     @Published @MainActor var activeQualityPipelineLabel: String = "关闭"
     @Published @MainActor var averageQualityEnhanceMs: Double = 0
+    @Published @MainActor var publishedQueueDepth: Int = 0
+    @Published @MainActor var publishedMemoryMB: Double = 0
+    @Published @MainActor var isRemoteOutputStalled: Bool = false
     @Published @MainActor var displayTitle: String = ""
     @Published @MainActor var activeStreamLabel: String = ""
     @Published @MainActor var isRemoteStream: Bool = false
@@ -1816,6 +1915,7 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor private var rawLatestAVDeltaMs: Double? = nil
     @MainActor private var rawQualityEnhanceMs: Double = 0
     @MainActor private var lastTelemetryPublishTimestamp: CFTimeInterval = 0
+    @MainActor private var lastMemorySampleTimestamp: CFTimeInterval = 0
     private var lastRawPresentedBuffer: CVPixelBuffer?
     private var lastRawPresentedPTS: Double = 0
     private var currentHTTPHeaders: [String: String] = [:]
@@ -1826,6 +1926,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
     @MainActor private var remotePacerLagSeconds: Double = 0.110
     @MainActor private var lastRemotePresentedHostTime: CFTimeInterval = 0
     @MainActor private var remoteCadenceGuard = RemoteDisplayCadenceGuard()
+    @MainActor private var remoteClockGuard = RemoteClockContinuityGuard()
+    @MainActor private var remoteSeekGeneration: UInt64 = 0
     private var remoteStatusObserver: NSKeyValueObservation?
     var onRemoteCookieRefresh: (@Sendable (String) -> Void)?
     var onRemoteVideoTrackUnplayable: (@MainActor (String) -> Void)?
@@ -2020,6 +2122,17 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         (0.004...0.5).contains(deltaSeconds)
     }
 
+    static func shouldDecayStaleOutputFPS(
+        isRemoteStream: Bool,
+        isPaused: Bool,
+        lastPresentedHostTime: CFTimeInterval,
+        now: CFTimeInterval,
+        stallThresholdSeconds: CFTimeInterval = 1.2
+    ) -> Bool {
+        guard isRemoteStream, !isPaused, lastPresentedHostTime > 0 else { return false }
+        return (now - lastPresentedHostTime) > stallThresholdSeconds
+    }
+
     @MainActor
     func flushPublishedTelemetryIfNeeded(force: Bool = false) {
         let now = CACurrentMediaTime()
@@ -2027,6 +2140,35 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
             return
         }
         lastTelemetryPublishTimestamp = now
+
+        let stalled = Self.shouldDecayStaleOutputFPS(
+            isRemoteStream: isRemoteStream,
+            isPaused: isPaused,
+            lastPresentedHostTime: lastRemotePresentedHostTime,
+            now: now
+        )
+        if stalled {
+            presentedTimestamps.removeAll { now - $0 > 1.0 }
+            if presentedTimestamps.count < 2 {
+                rawActualOutputFPS = 0
+            }
+        }
+        if isRemoteOutputStalled != stalled {
+            isRemoteOutputStalled = stalled
+        }
+
+        let depth = queuedCount()
+        if publishedQueueDepth != depth {
+            publishedQueueDepth = depth
+        }
+        if force || lastMemorySampleTimestamp == 0 || (now - lastMemorySampleTimestamp) >= 1.0 {
+            lastMemorySampleTimestamp = now
+            let memMB = DeviceDiagnosticsSampler.currentMemoryFootprintMB()
+            if abs(publishedMemoryMB - memMB) >= 0.5 {
+                publishedMemoryMB = memMB
+            }
+        }
+
         if droppedFrames != rawDroppedFrames {
             droppedFrames = rawDroppedFrames
         }
@@ -2064,6 +2206,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         rawLatestAVDeltaMs = nil
         rawQualityEnhanceMs = 0
         lastTelemetryPublishTimestamp = 0
+        publishedQueueDepth = 0
+        isRemoteOutputStalled = false
     }
 
     @MainActor
@@ -2820,33 +2964,72 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         currentTime = clamped
         updateLatestAudioTime(clamped)
 
+        if isRemoteStream {
+            let token = currentSessionToken()
+            remoteSeekGeneration &+= 1
+            let seekGen = remoteSeekGeneration
+            remoteClockGuard.beginSeek(targetPTS: clamped)
+            lastRemoteSamplePTS = -1
+            lastRemoteClockPTS = -1
+            lastRemotePresentedHostTime = 0
+            remoteCadenceGuard.reset()
+            didLogFirstRemoteFrame = false
+            isRemoteOutputStalled = false
+            presentedTimestamps.removeAll()
+            rawActualOutputFPS = 0
+            clearBufferedFrames()
+            remoteFlowWorker?.reset()
+            displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+
+            if usesSyntheticClock {
+                syntheticClock.pause()
+                syntheticClock.seek(to: clamped)
+                remoteClockGuard.completeSeek()
+            } else if let audioPlayer {
+                audioPlayer.rate = 0
+                let targetCM = CMTime(seconds: clamped, preferredTimescale: 600)
+                let seekTolerance = CMTime(seconds: 0.5, preferredTimescale: 600)
+                audioPlayer.seek(to: targetCM, toleranceBefore: seekTolerance, toleranceAfter: seekTolerance) { [weak self] finished in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.remoteSeekGeneration == seekGen,
+                              self.isTokenValid(token) else { return }
+                        if finished || self.remoteClockGuard.isSeekPending {
+                            self.remoteClockGuard.completeSeek()
+                        }
+                        self.lastRemoteSamplePTS = -1
+                        self.lastRemoteClockPTS = -1
+                        self.lastRemotePresentedHostTime = 0
+                        self.clearBufferedFrames()
+                        self.remoteCadenceGuard.reset()
+                        self.remoteFlowWorker?.reset()
+                        self.flushPublishedTelemetryIfNeeded(force: true)
+                    }
+                }
+            } else {
+                remoteClockGuard.completeSeek()
+            }
+
+            isLoadingPipeline = false
+            pipelineStatusText = ""
+            isPipelineReadyToPlay = true
+            startActiveClockIfNeeded()
+            scheduleRemoteVideoWatchdog(token: token)
+            flushPublishedTelemetryIfNeeded(force: true)
+            return
+        }
+
         if usesSyntheticClock {
             syntheticClock.pause()
             syntheticClock.seek(to: clamped)
         } else if let audioPlayer {
             audioPlayer.rate = 0
             let targetCM = CMTime(seconds: clamped, preferredTimescale: 600)
-            let seekTolerance = isRemoteStream ? CMTime(seconds: 0.5, preferredTimescale: 600) : .zero
-            audioPlayer.seek(to: targetCM, toleranceBefore: seekTolerance, toleranceAfter: seekTolerance)
+            audioPlayer.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
         }
 
         clearBufferedFrames()
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
-
-        if isRemoteStream {
-            lastRemoteSamplePTS = -1
-            lastRemoteClockPTS = -1
-            lastRemotePresentedHostTime = 0
-            remoteCadenceGuard.reset()
-            didLogFirstRemoteFrame = false
-            remoteFlowWorker?.reset()
-            isLoadingPipeline = false
-            pipelineStatusText = ""
-            isPipelineReadyToPlay = true
-            startActiveClockIfNeeded()
-            scheduleRemoteVideoWatchdog(token: currentSessionToken())
-            return
-        }
 
         let token = rotateToken()
         let interpEnabled = self.isInterpolationEnabled
@@ -3005,6 +3188,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         remotePacerLagSeconds = 0.110
         lastRemotePresentedHostTime = 0
         remoteCadenceGuard.reset()
+        remoteClockGuard.reset()
+        remoteSeekGeneration &+= 1
         didLogFirstRemoteFrame = false
         onRemoteVideoTrackUnplayable = nil
         onRemoteStreamFailed = nil
@@ -4305,26 +4490,54 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         guard samplePTS.isFinite else { return }
 
         if !isInterpolationEnabled || remoteFlowWorker == nil {
-            if let pb = pulledBuffer, abs(samplePTS - lastRemoteSamplePTS) > 0.002 {
+            if remoteClockGuard.isSeekPending {
+                if remoteClockGuard.seekTargetPTS >= 0,
+                   abs(samplePTS - remoteClockGuard.seekTargetPTS) <= 2.5 {
+                    remoteClockGuard.completeSeek()
+                } else {
+                    return
+                }
+            }
+            if let pb = pulledBuffer,
+               (samplePTS < lastRemoteSamplePTS - 0.50 || abs(samplePTS - lastRemoteSamplePTS) > 0.002) {
                 lastRemoteSamplePTS = samplePTS
+                lastRemotePresentedHostTime = hostTime
                 presentFrame(pb, ptsSeconds: samplePTS, on: layer)
             }
             return
         }
 
-        if let pb = pulledBuffer, samplePTS > lastRemoteSamplePTS + 0.002, let worker = remoteFlowWorker {
-            lastRemoteSamplePTS = samplePTS
-            worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
-        }
-
         let mediaClock = (hostItemTime.isValid && hostItemTime.seconds.isFinite) ? hostItemTime.seconds : currentItemTime.seconds
         let isActivelyPlaying = (player.timeControlStatus == .playing)
+        let tickDecision = remoteClockGuard.evaluateTick(
+            mediaClock: mediaClock,
+            pulledSamplePTS: pulledBuffer != nil ? samplePTS : nil,
+            isActivelyPlaying: isActivelyPlaying
+        )
+
         let activeClockPTS: Double
-        if !isActivelyPlaying && pulledBuffer == nil && lastRemoteClockPTS >= 0 {
-            activeClockPTS = lastRemoteClockPTS
-        } else {
-            lastRemoteClockPTS = max(lastRemoteClockPTS, mediaClock)
-            activeClockPTS = lastRemoteClockPTS
+        switch tickDecision {
+        case .ignorePendingSeek:
+            return
+        case .resetPipelineAndContinue(let resolvedClockPTS, let shouldSubmitSample):
+            clearBufferedFrames()
+            remoteCadenceGuard.reset()
+            remoteFlowWorker?.reset()
+            lastRemotePresentedHostTime = 0
+            lastRemoteClockPTS = resolvedClockPTS
+            lastRemoteSamplePTS = (shouldSubmitSample && pulledBuffer != nil) ? samplePTS : -1
+            appendLog("[remote][seek] 检测到播放时钟跳变，已重置光流管线 (clock=\(String(format: "%.2f", resolvedClockPTS))s)")
+            if shouldSubmitSample, let pb = pulledBuffer, let worker = remoteFlowWorker {
+                worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
+            }
+            activeClockPTS = resolvedClockPTS
+        case .normal(let resolvedClockPTS, let shouldSubmitSample):
+            lastRemoteClockPTS = resolvedClockPTS
+            if shouldSubmitSample, let pb = pulledBuffer, let worker = remoteFlowWorker {
+                lastRemoteSamplePTS = samplePTS
+                worker.submitFrame(pts: samplePTS, box: RemoteSendablePixelBuffer(buffer: pb))
+            }
+            activeClockPTS = resolvedClockPTS
         }
         let pacerNow = max(0, activeClockPTS - remotePacerLagSeconds)
 
@@ -4962,6 +5175,8 @@ final class OpticalFlowPlayerController: ObservableObject, @unchecked Sendable {
         lastRemoteClockPTS = -1
         lastRemotePresentedHostTime = 0
         remoteCadenceGuard.reset()
+        remoteClockGuard.reset()
+        remoteSeekGeneration &+= 1
         remoteFlowWorker = makeRemoteFlowWorker(
             targetFPS: targetFPS,
             sourceFPS: safeSrc,

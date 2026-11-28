@@ -498,30 +498,38 @@ final class MetalVideoEnhancer {
         float2 uv = in.uv;
         float t = clamp(u.phase, 0.0f, 1.0f);
 
-        half nearestY = (t < 0.5f)
-            ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
-            : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
-        half2 nearestUV = (t < 0.5f)
-            ? inPrevUV.sample(linearSampler, uv).rg
-            : inCurrUV.sample(linearSampler, uv).rg;
-
-        if (u.compareMode == 2u || u.isSceneCut != 0u) {
-            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
-        }
         float invWidth = 1.0f / max(1.0f, float(inCurrY.get_width()));
         float invHeight = 1.0f / max(1.0f, float(inCurrY.get_height()));
+
+        if (u.compareMode == 2u || u.isSceneCut != 0u) {
+            half refY = (t < 0.5f)
+                ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
+                : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+            half2 refUV = (t < 0.5f)
+                ? inPrevUV.sample(linearSampler, uv).rg
+                : inCurrUV.sample(linearSampler, uv).rg;
+            return half4(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), half(1.0h));
+        }
+
         float splitRatio = clamp(u.splitX, 0.1f, 0.9f);
         if (u.compareMode == 1u) {
             if (abs(uv.x - splitRatio) <= max(0.0022f, invWidth * 1.5f)) {
                 return half4(half(0.25h), half(0.96h), half(0.98h), half(1.0h));
             }
             if (uv.x < splitRatio) {
-                return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+                half refY = (t < 0.5f)
+                    ? toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange)
+                    : toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+                half2 refUV = (t < 0.5f)
+                    ? inPrevUV.sample(linearSampler, uv).rg
+                    : inCurrUV.sample(linearSampler, uv).rg;
+                return half4(yuvSampleToRGBH(refY, refUV, u.isVideoRange, u.isBT601), half(1.0h));
             }
         }
 
         half rawPrevCenter = toUnitLumaH(inPrevY.sample(linearSampler, uv).r, u.isVideoRange);
         half rawCurrCenter = toUnitLumaH(inCurrY.sample(linearSampler, uv).r, u.isVideoRange);
+        half nearestY = (t < 0.5f) ? rawPrevCenter : rawCurrCenter;
         float staticDiff = abs(float(rawPrevCenter) - float(rawCurrCenter));
 
         float2 flowScale = float2(u.flowScaleX, u.flowScaleY);
@@ -531,18 +539,13 @@ final class MetalVideoEnhancer {
         if (!isfinite(f0.x) || !isfinite(f0.y)) { f0 = float2(0.0f); }
         if (!isfinite(b0.x) || !isfinite(b0.y)) { b0 = float2(0.0f); }
 
-        // 测量局部光流离散梯度：识别人物轮廓或前背景交界，防止线性插值光流拉伸撕裂边缘
-        float2 fC_n = inForwardFlow.sample(nearestSampler, uv).rg * flowScale;
-        float2 fL_n = inForwardFlow.sample(nearestSampler, clamp(uv - float2(flowStep.x, 0.0f), float2(0.0f), float2(1.0f))).rg * flowScale;
-        float2 fR_n = inForwardFlow.sample(nearestSampler, clamp(uv + float2(flowStep.x, 0.0f), float2(0.0f), float2(1.0f))).rg * flowScale;
-        float2 fU_n = inForwardFlow.sample(nearestSampler, clamp(uv - float2(0.0f, flowStep.y), float2(0.0f), float2(1.0f))).rg * flowScale;
-        float2 fD_n = inForwardFlow.sample(nearestSampler, clamp(uv + float2(0.0f, flowStep.y), float2(0.0f), float2(1.0f))).rg * flowScale;
-        if (!isfinite(fC_n.x) || !isfinite(fC_n.y)) { fC_n = f0; }
-        if (!isfinite(fL_n.x) || !isfinite(fL_n.y)) { fL_n = fC_n; }
-        if (!isfinite(fR_n.x) || !isfinite(fR_n.y)) { fR_n = fC_n; }
-        if (!isfinite(fU_n.x) || !isfinite(fU_n.y)) { fU_n = fC_n; }
-        if (!isfinite(fD_n.x) || !isfinite(fD_n.y)) { fD_n = fC_n; }
-        float flowGrad = length(fR_n - fL_n) + length(fD_n - fU_n);
+        // 零运动快速路径：静止区 5 次采样直出原画，跳过中点与遮挡搜索
+        if (dot(f0, f0) < 1.6e-7f && dot(b0, b0) < 1.6e-7f) {
+            half2 nearestUV = (t < 0.5f)
+                ? inPrevUV.sample(linearSampler, uv).rg
+                : inCurrUV.sample(linearSampler, uv).rg;
+            return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
+        }
 
         float2 uv0Rough = clamp(uv - t * f0, float2(0.0f), float2(1.0f));
         float2 uv1Rough = clamp(uv - (1.0f - t) * b0, float2(0.0f), float2(1.0f));
@@ -562,63 +565,133 @@ final class MetalVideoEnhancer {
         half bestY1 = toUnitLumaH(inCurrY.sample(linearSampler, bestUV1).r, u.isVideoRange);
         float bestDiff = abs(float(bestY0) - float(bestY1));
 
-        // 离散边界矢量锐选（仅在光流边缘/高光度差/一致性异常处触发，且显式候选静态零矢量消除人物边缘晕影）
-        if (flowGrad >= 0.0025f || bestDiff > 0.022f || fbErr > 0.003f) {
-            float2 offsets[5] = {
-                float2(0.0f, 0.0f),
-                float2(-flowStep.x, 0.0f),
-                float2( flowStep.x, 0.0f),
-                float2(0.0f, -flowStep.y),
-                float2(0.0f,  flowStep.y)
-            };
-            for (int k = 0; k < 6; ++k) {
-                float2 candFlow;
-                float candFBErr;
-                if (k == 5) {
-                    candFlow = float2(0.0f);
-                    candFBErr = 0.0f;
-                } else {
-                    float2 nUV = clamp(uv + offsets[k], float2(0.0f), float2(1.0f));
+        // 仅在真正的高光度误差/双向不一致遮挡边缘触发离散候选（平顺高速运动零额外开销）
+        if (bestDiff > 0.026f || fbErr > 0.0045f) {
+            // 1. 静态零矢量候选（复用 center Y，0 额外采样）
+            if (staticDiff + 0.003f < bestDiff) {
+                bestDiff = staticDiff;
+                bestFlow = float2(0.0f);
+                bestUV0Raw = uv;
+                bestUV1Raw = uv;
+                bestUV0 = uv;
+                bestUV1 = uv;
+                bestY0 = rawPrevCenter;
+                bestY1 = rawCurrCenter;
+                fbErr = 0.0f;
+            }
+
+            // 2. 单侧 fRef / -bRef 候选（0 额外光流采样，拯救单侧可见遮挡边）
+            if (bestDiff > 0.026f) {
+                float2 oneSided[2] = { fRef, -bRef };
+                for (int s = 0; s < 2; ++s) {
+                    float2 candFlow = oneSided[s];
+                    if (dot(candFlow, candFlow) > 0.0256f) { continue; }
+                    float2 cuv0Raw = uv - t * candFlow;
+                    float2 cuv1Raw = uv + (1.0f - t) * candFlow;
+                    float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
+                    float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
+                    half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
+                    half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
+                    float candDiff = abs(float(cy0) - float(cy1));
+                    if (candDiff + 0.003f < bestDiff) {
+                        bestDiff = candDiff;
+                        bestFlow = candFlow;
+                        bestUV0Raw = cuv0Raw;
+                        bestUV1Raw = cuv1Raw;
+                        bestUV0 = cuv0;
+                        bestUV1 = cuv1;
+                        bestY0 = cy0;
+                        bestY1 = cy1;
+                    }
+                }
+            }
+
+            // 3. 中心 nearest 离散光流（避免线性过滤混叠前背景向量）
+            if (bestDiff > 0.032f) {
+                float2 fn = inForwardFlow.sample(nearestSampler, uv).rg * flowScale;
+                float2 bn = inBackwardFlow.sample(nearestSampler, uv).rg * flowScale;
+                if (isfinite(fn.x) && isfinite(fn.y)) {
+                    if (!isfinite(bn.x) || !isfinite(bn.y)) { bn = -fn; }
+                    float2 candFlow = 0.5f * (fn - bn);
+                    if (dot(candFlow, candFlow) <= 0.0256f) {
+                        float2 cuv0Raw = uv - t * candFlow;
+                        float2 cuv1Raw = uv + (1.0f - t) * candFlow;
+                        float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
+                        float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
+                        half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
+                        half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
+                        float candDiff = abs(float(cy0) - float(cy1));
+                        if (candDiff + 0.003f < bestDiff) {
+                            bestDiff = candDiff;
+                            bestFlow = candFlow;
+                            bestUV0Raw = cuv0Raw;
+                            bestUV1Raw = cuv1Raw;
+                            bestUV0 = cuv0;
+                            bestUV1 = cuv1;
+                            bestY0 = cy0;
+                            bestY1 = cy1;
+                            fbErr = length(fn + bn);
+                        }
+                    }
+                }
+            }
+
+            // 4. 主运动轴两侧 nearest 邻域锐选（仅极高误差边界执行）
+            if (bestDiff > 0.040f) {
+                float2 dom = (dot(bestFlow, bestFlow) > 1e-8f) ? bestFlow : f0;
+                float2 axisStep = (abs(dom.x) >= abs(dom.y))
+                    ? float2(flowStep.x, 0.0f)
+                    : float2(0.0f, flowStep.y);
+                for (int k = -1; k <= 1; k += 2) {
+                    float2 nUV = clamp(uv + float(k) * axisStep, float2(0.0f), float2(1.0f));
                     float2 fn = inForwardFlow.sample(nearestSampler, nUV).rg * flowScale;
                     float2 bn = inBackwardFlow.sample(nearestSampler, nUV).rg * flowScale;
                     if (!isfinite(fn.x) || !isfinite(fn.y)) { continue; }
                     if (!isfinite(bn.x) || !isfinite(bn.y)) { bn = -fn; }
-                    candFlow = 0.5f * (fn - bn);
-                    candFBErr = length(fn + bn);
-                }
-                if (length(candFlow) > 0.14f) { continue; }
-                float2 cuv0Raw = uv - t * candFlow;
-                float2 cuv1Raw = uv + (1.0f - t) * candFlow;
-                float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
-                float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
-                half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
-                half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
-                float candDiff = abs(float(cy0) - float(cy1));
-                if (candDiff + 0.003f < bestDiff) {
-                    bestDiff = candDiff;
-                    bestFlow = candFlow;
-                    bestUV0Raw = cuv0Raw;
-                    bestUV1Raw = cuv1Raw;
-                    bestUV0 = cuv0;
-                    bestUV1 = cuv1;
-                    bestY0 = cy0;
-                    bestY1 = cy1;
-                    fbErr = candFBErr;
+                    float2 candFlow = 0.5f * (fn - bn);
+                    if (dot(candFlow, candFlow) > 0.0256f) { continue; }
+                    float2 cuv0Raw = uv - t * candFlow;
+                    float2 cuv1Raw = uv + (1.0f - t) * candFlow;
+                    float2 cuv0 = clamp(cuv0Raw, float2(0.0f), float2(1.0f));
+                    float2 cuv1 = clamp(cuv1Raw, float2(0.0f), float2(1.0f));
+                    half cy0 = toUnitLumaH(inPrevY.sample(linearSampler, cuv0).r, u.isVideoRange);
+                    half cy1 = toUnitLumaH(inCurrY.sample(linearSampler, cuv1).r, u.isVideoRange);
+                    float candDiff = abs(float(cy0) - float(cy1));
+                    if (candDiff + 0.003f < bestDiff) {
+                        bestDiff = candDiff;
+                        bestFlow = candFlow;
+                        bestUV0Raw = cuv0Raw;
+                        bestUV1Raw = cuv1Raw;
+                        bestUV0 = cuv0;
+                        bestUV1 = cuv1;
+                        bestY0 = cy0;
+                        bestY1 = cy1;
+                        fbErr = length(fn + bn);
+                    }
                 }
             }
         }
 
         // 静态背景零模糊保护：前景运动掠过导致误差高于原地静态差时，直接无损直出静态原始像素
         if (staticDiff < 0.018f && bestDiff > 0.024f) {
+            half2 nearestUV = (t < 0.5f)
+                ? inPrevUV.sample(linearSampler, uv).rg
+                : inCurrUV.sample(linearSampler, uv).rg;
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
 
         float flowMag = length(bestFlow);
         if (flowMag < 0.00025f) {
+            half2 nearestUV = (t < 0.5f)
+                ? inPrevUV.sample(linearSampler, uv).rg
+                : inCurrUV.sample(linearSampler, uv).rg;
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
         // 转场/极端运动保护：避免整帧撕裂重影，直接输出最近原生高分辨率参考帧
-        if (flowMag > 0.14f || (fbErr > 0.025f && bestDiff > 0.08f)) {
+        if (flowMag > 0.16f || (fbErr > 0.025f && bestDiff > 0.08f)) {
+            half2 nearestUV = (t < 0.5f)
+                ? inPrevUV.sample(linearSampler, uv).rg
+                : inCurrUV.sample(linearSampler, uv).rg;
             return half4(yuvSampleToRGBH(nearestY, nearestUV, u.isVideoRange, u.isBT601), half(1.0h));
         }
 

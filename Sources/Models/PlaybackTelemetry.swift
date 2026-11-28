@@ -84,6 +84,12 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
     let decoderBadge: String
     let droppedFrames: Int64
     let thermalLevel: ThermalLevel
+    var resolutionModeBadge: String = ""
+    var flowAvgMs: Double = 0
+    var renderAvgMs: Double = 0
+    var queueDepth: Int = 0
+    var memoryMB: Double = 0
+    var isStalled: Bool = false
 
     var videoStreamSummary: String {
         let codecText = Self.formatCodecName(codec)
@@ -104,6 +110,9 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
 
     var fpsSummary: String {
         let srcText = Self.formatSourceFPS(sourceFPS)
+        if isStalled {
+            return "\(srcText) → 缓冲中"
+        }
         let effectiveOut = outputFPS > 0 ? outputFPS : sourceFPS
         let outText = Self.formatOutputFPS(effectiveOut)
         return "\(srcText) → \(outText) fps"
@@ -111,6 +120,44 @@ struct PlaybackHUDMetrics: Equatable, Sendable {
 
     var pipelineSummary: String {
         [decoderBadge, interpolationBadge].joined(separator: " · ")
+    }
+
+    var performanceSummary: String {
+        var parts: [String] = []
+        if flowAvgMs > 0.05 {
+            parts.append(String(format: "光流 %.1fms", flowAvgMs))
+        }
+        if renderAvgMs > 0.05 {
+            parts.append(String(format: "渲染 %.1fms", renderAvgMs))
+        }
+        if engineBadge != "PASS" {
+            parts.append("队列 \(queueDepth)")
+        }
+        if memoryMB > 1.0 {
+            parts.append(String(format: "%.0fMB", memoryMB))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static func resolveEngineBadge(isInterpolationEnabled: Bool, backendLabel: String) -> String {
+        guard isInterpolationEnabled else { return "PASS" }
+        let lower = backendLabel.lowercased()
+        if lower.contains("gpu") {
+            return "GPU"
+        }
+        return "ANE"
+    }
+
+    static func resolveResolutionModeBadge(isInterpolationEnabled: Bool, backendLabel: String) -> String {
+        guard isInterpolationEnabled else { return "原画直通" }
+        let lower = backendLabel.lowercased()
+        if lower.contains("gpu") {
+            return "原画直采"
+        }
+        if lower.contains("metalfx") || lower.contains("lowlatency") {
+            return "降采样→MetalFX"
+        }
+        return "原画输出"
     }
 
     // MARK: - Formatting & Parsing Helpers

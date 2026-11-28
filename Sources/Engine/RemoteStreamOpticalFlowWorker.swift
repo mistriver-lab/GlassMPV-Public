@@ -726,8 +726,8 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                 let maxSlots = max(1, targetFPS.maxInterpolatedFramesPerPair(sourceFPS: sourceFPS))
                 let step = phaseScheduler.planStep(previousPTS: prev.pts, currentPTS: currPTS, maxAllowedSlots: maxSlots)
                 let dims = MetalPyramidOpticalFlowEngine.recommendedFlowDimensions(sourceWidth: srcW, sourceHeight: srcH)
-                let flowLabelPrefix = max(srcW, srcH) >= 3000 ? "远程·4K原生GPU光流" : "远程·原生GPU光流"
-                let emittedLabel = "\(flowLabelPrefix) \(dims.width)×\(dims.height)→\(srcW)×\(srcH)"
+                let flowLabelPrefix = max(srcW, srcH) >= 3000 ? "原生4K GPU光流" : "原生GPU光流"
+                let emittedLabel = "\(flowLabelPrefix) (矢量\(dims.width)×\(dims.height))"
 
                 if step.interpolatedSlots.isEmpty {
                     previousFrame = (pts: currPTS, rawBuffer: currBuffer, preparedBuffer: nil, preparedWidth: 0, preparedHeight: 0, preparedFormat: 0)
@@ -742,7 +742,7 @@ final class RemoteStreamOpticalFlowWorker: @unchecked Sendable {
                     batchCount += 1
                     let avgMs = totalInterpolationMs / Double(max(1, batchCount))
                     if batchCount == 1 {
-                        onLog?("[remote][gpu] 已激活零降采样 Metal 金字塔光流 (\(flowResult.flowWidth)×\(flowResult.flowHeight)→\(srcW)×\(srcH), 耗时=\(String(format: "%.1f", flowResult.elapsedMs))ms)")
+                        onLog?("[remote][gpu] 已激活零降采样 Metal 金字塔光流 (矢量网格=\(flowResult.flowWidth)×\(flowResult.flowHeight), 原画直采=\(srcW)×\(srcH), 耗时=\(String(format: "%.1f", flowResult.elapsedMs))ms)")
                     }
 
                     var outFrames: [RemoteOpticalFlowOutputFrame] = []

@@ -2,6 +2,18 @@
 
 本项目采用初始 Beta 语义版本规范（`v0.1.0-beta.x`，Bundle 内部短版本号 `0.1.0` + 递增 Build 号）。
 
+## [v0.1.0-beta.16] - 2026-11-29
+
+### 修复与体验优化 (Fixed & Optimized)
+- **消除「快速运动镜头波动、队列积压与跟不上」(`MetalVideoEnhancer` + `MetalPyramidOpticalFlow`)**：
+  - 根因定位自真机日志 `GlassMPV-Log-20261129-003610.txt`：`displayFlowWarpYUVFragment` 均值耗时 `4.79ms`（120Hz 预算仅 `8.33ms`），在高速运动画面因每像素 39 次采样与无条件梯度预扫突破 `8.33ms` 引发 `.skippedBusy`、队列胀至 `21–22` 帧、实测帧率跌至 `105–113fps`。
+  - 修复：惰性化 `nearestUV` 采样、静止零位移 5-tap 直出、删除无条件 5-tap `flowGrad` 预扫、将边缘候选改为仅针对高 `bestDiff / fbErr` 遮挡边缘；同时将 `L0 (32×18)` `searchRadius` 从 `3` 拓宽至 `4`（覆盖 ±480px@4K）并强化 `evaluateSceneCut`（仅 `warpedSAD > rawSAD * 0.78` 时触发切镜），防止高速横移误触发切镜跌回 25fps。
+- **彻底修复「向后拖动进度条后补帧失效跌至 25fps」(`VTOpticalFlowEngine`)**：
+  - 根因：异步 `audioPlayer.seek` 落地前，下一帧 VSync 立即读取 pre-seek 陈旧 `mediaClock`（如 `2940.3s`）并永久锁死 `lastRemoteClockPTS`，导致落地 `1601.6s` 后的 120fps 批次被 `OpticalFlowFramePacer` 判定延迟上千秒而批量丢帧。
+  - 修复：引入 `RemoteClockContinuityGuard` 与 `audioPlayer.seek` 完成回调代数锁，彻底阻断 pre-seek 时钟污染，并在任何向后/跨段跳变时自动重置 `remoteFrameQueue`、`RemoteDisplayCadenceGuard` 与 `RemoteStreamOpticalFlowWorker`。
+- **最优化视频信息 HUD 与消除「降分辨率再升分辨率」误导标签 (`PlaybackTelemetry` + `LiquidGlassPlayerView` + `RemoteStreamOpticalFlowWorker`)**：
+  - 60/96/120fps 重命名为「原生4K GPU光流 (矢量256×144)」与「原画直采」绿标（明确标注仅光流矢量场为 256×144，视频像素全程原画直采样），区分于 2× 档「降采样→MetalFX」；HUD 新增实时引擎角标（GPU/ANE/PASS）、流信息、光流/渲染耗时、队列深度、内存 MB 与缓冲停滞 FPS 自衰减（「缓冲中」）。
+
 ## [v0.1.0-beta.15] - 2026-11-29
 
 ### 修复与性能画质双突破 (Fixed & Optimized)

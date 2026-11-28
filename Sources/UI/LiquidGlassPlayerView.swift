@@ -209,9 +209,14 @@ final class PlayerCoordinator: ObservableObject {
 
     var hudMetrics: PlaybackHUDMetrics {
         let thermal = ThermalLevel(state: thermalState)
-        if interpolationMode == .off {
+        let isInterp = (interpolationMode != .off)
+        let backend = opticalFlowController.activeBackendLabel
+        let engineBadge = PlaybackHUDMetrics.resolveEngineBadge(isInterpolationEnabled: isInterp, backendLabel: backend)
+        let resModeBadge = PlaybackHUDMetrics.resolveResolutionModeBadge(isInterpolationEnabled: isInterp, backendLabel: backend)
+
+        if !isInterp {
             return PlaybackHUDMetrics(
-                engineBadge: "PASS",
+                engineBadge: engineBadge,
                 interpolationBadge: "原帧率",
                 codec: opticalFlowController.videoCodec,
                 width: opticalFlowController.videoWidth,
@@ -223,18 +228,24 @@ final class PlayerCoordinator: ObservableObject {
                 isHDRActive: opticalFlowController.isHDRActive,
                 decoderBadge: "硬解 VT直通",
                 droppedFrames: opticalFlowController.droppedFrames,
-                thermalLevel: thermal
+                thermalLevel: thermal,
+                resolutionModeBadge: resModeBadge,
+                flowAvgMs: 0,
+                renderAvgMs: opticalFlowController.averageQualityEnhanceMs,
+                queueDepth: opticalFlowController.publishedQueueDepth,
+                memoryMB: opticalFlowController.publishedMemoryMB,
+                isStalled: opticalFlowController.isRemoteOutputStalled
             )
         }
         let targetBadge = opticalFlowController.targetSummaryBadge
         let interpBadge = opticalFlowController.enableSpatial2xUpscale
             ? "光流\(targetBadge)+超分2×"
             : "光流\(targetBadge)"
-        let aneDecoderBadge = opticalFlowController.activeBackendLabel != "--"
-            ? "VT+\(opticalFlowController.activeBackendLabel)"
+        let activeDecoderBadge = backend != "--"
+            ? backend
             : "硬解 VT+ANE"
         return PlaybackHUDMetrics(
-            engineBadge: "ANE",
+            engineBadge: engineBadge,
             interpolationBadge: interpBadge,
             codec: opticalFlowController.videoCodec,
             width: opticalFlowController.videoWidth,
@@ -244,9 +255,15 @@ final class PlayerCoordinator: ObservableObject {
             bitDepth: opticalFlowController.bitDepthLabel,
             hdrTag: opticalFlowController.hdrLabel,
             isHDRActive: opticalFlowController.isHDRActive,
-            decoderBadge: aneDecoderBadge,
+            decoderBadge: activeDecoderBadge,
             droppedFrames: opticalFlowController.droppedFrames,
-            thermalLevel: thermal
+            thermalLevel: thermal,
+            resolutionModeBadge: resModeBadge,
+            flowAvgMs: opticalFlowController.averageInterpolationMs,
+            renderAvgMs: opticalFlowController.averageQualityEnhanceMs,
+            queueDepth: opticalFlowController.publishedQueueDepth,
+            memoryMB: opticalFlowController.publishedMemoryMB,
+            isStalled: opticalFlowController.isRemoteOutputStalled
         )
     }
 
@@ -2904,58 +2921,99 @@ struct LiquidGlassPlayerView: View {
     }
 
     private func compactStatsHUD(metrics: PlaybackHUDMetrics) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let engineColor: Color = {
+            switch metrics.engineBadge {
+            case "GPU": return .cyan
+            case "PASS": return .green
+            default: return .blue
+            }
+        }()
+        let isNativeRes = metrics.resolutionModeBadge.contains("原画")
+
+        return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(metrics.engineBadge)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(engineColor)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1.5)
                     .background(
-                        Color.cyan.opacity(0.18),
+                        engineColor.opacity(0.18),
                         in: RoundedRectangle(cornerRadius: 4, style: .continuous)
                     )
 
                 Text(metrics.videoStreamSummary)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced).monospacedDigit())
                     .foregroundStyle(metrics.isHDRActive ? .yellow : .white)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(thermalColor(metrics.thermalLevel))
+                        .frame(width: 6, height: 6)
+                    Text(metrics.thermalLevel.rawValue)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(thermalColor(metrics.thermalLevel))
+                }
             }
 
-            Text("FPS \(metrics.fpsSummary) · 丢帧 \(metrics.droppedFrames)")
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.92))
-                .lineLimit(1)
+            HStack(spacing: 6) {
+                Text("FPS \(metrics.fpsSummary)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced).monospacedDigit())
+                    .foregroundStyle(metrics.isStalled ? .yellow : .white.opacity(0.95))
+                    .lineLimit(1)
 
-            Text(metrics.pipelineSummary)
-                .font(.system(size: 10.5, weight: .regular, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.78))
-                .lineLimit(1)
-
-            if optical.videoEnhancementPreset != .off {
-                Text("画质 \(optical.activeQualityPipelineLabel) · \(String(format: "%.1f", optical.averageQualityEnhanceMs))ms")
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.purple.opacity(0.95))
+                Text("· 丢帧 \(metrics.droppedFrames)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced).monospacedDigit())
+                    .foregroundStyle(metrics.droppedFrames > 0 ? .orange : .white.opacity(0.75))
                     .lineLimit(1)
             }
 
             HStack(spacing: 5) {
-                Circle()
-                    .fill(thermalColor(metrics.thermalLevel))
-                    .frame(width: 6, height: 6)
-                Text("温度 \(metrics.thermalLevel.rawValue)")
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundStyle(thermalColor(metrics.thermalLevel))
+                if !metrics.resolutionModeBadge.isEmpty {
+                    Text(metrics.resolutionModeBadge)
+                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(isNativeRes ? .green : .orange)
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1)
+                        .background(
+                            (isNativeRes ? Color.green : Color.orange).opacity(0.18),
+                            in: RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                        )
+                }
+
+                Text(metrics.pipelineSummary)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.82))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+            }
+
+            if !metrics.performanceSummary.isEmpty {
+                Text(metrics.performanceSummary)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced).monospacedDigit())
+                    .foregroundStyle(.cyan.opacity(0.90))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+
+            if optical.videoEnhancementPreset != .off {
+                Text("画质 \(optical.videoEnhancementPreset.rawValue) (\(optical.videoEnhancementStrength.rawValue))")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.purple.opacity(0.95))
+                    .lineLimit(1)
             }
         }
+        .frame(maxWidth: 360, alignment: .leading)
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.black.opacity(0.62))
+                .fill(Color.black.opacity(0.64))
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.8)
+                        .strokeBorder(Color.white.opacity(0.15), lineWidth: 0.8)
                 )
         )
     }

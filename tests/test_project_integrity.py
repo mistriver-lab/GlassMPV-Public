@@ -481,6 +481,9 @@ def test_swift_sources_non_empty_and_balanced():
     assert "testRemoteSourceNormalizationAndVariantSwitchMetalFlow" in swift_test_src
     assert "testNonInterpolatedDisplayRatePreventsLTPOFrameDrop" in swift_test_src
     assert "testMetalPyramidAntiGhostingAndSharpMovingEdge" in swift_test_src
+    assert "testRemoteBackwardSeekResetsClockAndPreserves120FPS" in swift_test_src
+    assert "testMetalPyramidFastPanNoFalseSceneCutAndWarpSharpness" in swift_test_src
+    assert "testOptimizedVideoInfoHUDFormattingAndStallDecay" in swift_test_src
 
     engine_src = (ROOT / "Sources" / "Engine" / "VTOpticalFlowEngine.swift").read_text(encoding="utf-8")
     assert "onRemoteStreamFailed" in engine_src
@@ -489,6 +492,10 @@ def test_swift_sources_non_empty_and_balanced():
     assert "presentFlowWarpedFrame" in engine_src
     assert "presentMetalFlowWarpedFrame" in engine_src
     assert "RemoteDisplayCadenceGuard" in engine_src
+    assert "RemoteClockContinuityGuard" in engine_src
+    assert "shouldDecayStaleOutputFPS" in engine_src
+    assert "evaluateSceneCut" in metal_flow_src
+    assert "256×144→" not in remote_worker_src
     player_view_src = (ROOT / "Sources" / "UI" / "LiquidGlassPlayerView.swift").read_text(encoding="utf-8")
     assert "reResolveCurrentCloudStream" in player_view_src
     assert "PlayerOverlayLayoutPolicy" in player_view_src
@@ -526,6 +533,8 @@ def test_swift_sources_non_empty_and_balanced():
     assert "task_self_trap()" in telemetry_src
     assert "mach_task_self_" not in telemetry_src
     assert "SessionDiagnosticSummary" in telemetry_src
+    assert "resolveResolutionModeBadge" in telemetry_src
+    assert "performanceSummary" in telemetry_src
 
 
 def test_lessons_learned_and_research_documented():
