@@ -4177,7 +4177,10 @@ final class GlassMPVTests: XCTestCase {
         let controller = OpticalFlowPlayerController()
         var streamFailedFired = false
         var trackUnplayableFired = false
-        controller.onRemoteStreamFailed = { _ in streamFailedFired = true }
+        controller.onRemoteStreamFailed = { _ in
+            streamFailedFired = true
+            return true
+        }
         controller.onRemoteVideoTrackUnplayable = { _ in trackUnplayableFired = true }
 
         controller.load(
@@ -4189,7 +4192,8 @@ final class GlassMPVTests: XCTestCase {
         )
         XCTAssertNotNil(controller.onRemoteStreamFailed, "load() 切换清晰度时必须保留 onRemoteStreamFailed 自动降级回调")
         XCTAssertNotNil(controller.onRemoteVideoTrackUnplayable, "load() 切换清晰度时必须保留 onRemoteVideoTrackUnplayable 回调")
-        controller.onRemoteStreamFailed?("probe")
+        let handledFailure = controller.onRemoteStreamFailed?("probe")
+        XCTAssertEqual(handledFailure, true)
         controller.onRemoteVideoTrackUnplayable?("probe")
         XCTAssertTrue(streamFailedFired)
         XCTAssertTrue(trackUnplayableFired)
