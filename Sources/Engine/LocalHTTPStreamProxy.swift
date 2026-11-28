@@ -355,14 +355,17 @@ final class LocalHTTPStreamProxy: @unchecked Sendable {
             return
         }
 
-        let manifestRewriter: (@Sendable (String, URL) -> String)? = (isManifest && parsed.method != "HEAD")
-            ? { [weak self] rawManifest, resolvedBaseURL in
+        let manifestRewriter: (@Sendable (String, URL) -> String)?
+        if isManifest && parsed.method != "HEAD" {
+            manifestRewriter = { [weak self] (rawManifest: String, resolvedBaseURL: URL) -> String in
                 guard let self else { return rawManifest }
                 return Self.rewriteHLSManifest(rawManifest, baseURL: resolvedBaseURL) { childURL in
                     self.registerSubResource(url: childURL, inheritingFrom: matchedRoute, port: activePort)
                 }
             }
-            : nil
+        } else {
+            manifestRewriter = nil
+        }
         let matchedCache = isManifest ? nil : chunkCache(for: matchedRoute)
         let streamRelay = UpstreamStreamRelay(
             connection: connection,
