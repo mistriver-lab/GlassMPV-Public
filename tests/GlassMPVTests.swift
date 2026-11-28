@@ -3235,9 +3235,12 @@ final class GlassMPVTests: XCTestCase {
                             let dy = Float(y) - blockCenterY
                             let val: Float
                             if abs(dx) <= 72.0 && abs(dy) <= 52.0 {
-                                val = 165.0 + 70.0 * sin(dx * 0.28) * cos(dy * 0.28)
+                                let nx = dx / 72.0
+                                let ny = dy / 52.0
+                                let radial = sqrt(nx * nx + ny * ny)
+                                val = 148.0 + 68.0 * (nx * 0.65 - ny * 0.45) + 42.0 * cos(radial * 4.5) * exp(-radial * 0.8)
                             } else {
-                                val = 58.0 + 18.0 * sin(Float(x) * 0.14) * cos(Float(y) * 0.14)
+                                val = 36.0 + 12.0 * sin(Float(x) * 0.05) * cos(Float(y) * 0.05)
                             }
                             yPtr[y * yBPR + x] = UInt8(max(0, min(255, Int(val.rounded()))))
                         }

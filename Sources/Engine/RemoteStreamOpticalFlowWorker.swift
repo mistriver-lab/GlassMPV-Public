@@ -357,7 +357,7 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
 
     static func resolutionCaps(forMaxInterpolatedFrames maxInterp: Int) -> [(Int, Int)] {
         if maxInterp <= 1 {
-            return [(1920, 1080), (1440, 810), (1280, 720)]
+            return [(1920, 1080), (1440, 810)]
         }
         if maxInterp <= 3 {
             return [(1440, 810), (1280, 720)]
@@ -446,6 +446,24 @@ enum RemoteOpticalFlowBudgetPlanner: Sendable {
             )
             if !plan.contains(candidate) {
                 plan.append(candidate)
+            }
+        }
+        if safeMaxInterp <= 1 && safeW < 1920 && !plan.contains(where: { $0.height <= 720 }) {
+            let safe720 = OpticalFlowResolutionPlanner.fitProportionally(
+                width: safeW,
+                height: safeH,
+                maxLongSide: 1280,
+                maxShortSide: 720
+            )
+            let fallback720 = OpticalFlowCandidate(
+                backend: .lowLatency,
+                width: safe720.width,
+                height: safe720.height,
+                spatial2x: false,
+                maxInterpolatedFrames: safeMaxInterp
+            )
+            if !plan.contains(fallback720) {
+                plan.append(fallback720)
             }
         }
         return plan
